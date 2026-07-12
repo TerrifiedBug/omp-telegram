@@ -1,0 +1,56 @@
+{
+  "name": "omp-telegram",
+  "version": "0.1.0",
+  "description": "Owner-controlled Telegram bridge and herdr control plane for omp sessions",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TerrifiedBug/omp-telegram.git"
+  },
+  "homepage": "https://github.com/TerrifiedBug/omp-telegram#readme",
+  "bugs": {
+    "url": "https://github.com/TerrifiedBug/omp-telegram/issues"
+  },
+  "keywords": [
+    "omp",
+    "telegram",
+    "herdr",
+    "coding-agent",
+    "telegram-bot"
+  ],
+  "files": [
+    "src/index.ts",
+    "src/access.ts",
+    "src/api.ts",
+    "src/control.ts",
+    "src/inbox.ts",
+    "src/markdown.ts",
+    "src/outbound.ts",
+    "src/prompts.ts",
+    "src/topics.ts",
+    "docs",
+    "CONTEXT.md",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run test"
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^16.3.12",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  },
+  "overrides": {
+    "@opentelemetry/core": "2.8.0"
+  }
+}
