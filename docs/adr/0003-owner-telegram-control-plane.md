@@ -6,8 +6,10 @@ global command results and interactive pickers live there instead of inside an
 agent conversation. The poll-lock-holding omp process handles those commands
 before session-topic routing: `/spawn` lists open herdr spaces and starts omp in
 a new unfocused tab; `/sessions` compares herdr processes with Telegram topic
-claims; `/status` reports bridge health. `/stop` remains session-topic-local so
-it aborts the correct in-process agent turn.
+claims; `/cleanup` removes stale and same-process duplicate topics after explicit
+confirmation while preserving live sibling sessions; `/status` reports bridge
+health. `/stop` remains session-topic-local so it aborts the correct in-process
+agent turn.
 
 This control plane is distinct from omp slash-command or skill invocation.
 Normal Telegram messages still become user turns, and skills still trigger from

@@ -30,6 +30,7 @@ import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import {
   type ThreadEntry,
+  type ThreadRegistry,
   claimThread,
   decideRoute,
   findAdoptableThread,
@@ -37,6 +38,7 @@ import {
   isResumedOwner,
   loadRegistry,
   releaseThread,
+  saveRegistry,
   watchRoute,
   writeRouted,
 } from "./topics";
@@ -84,6 +86,7 @@ const BOT_COMMANDS = [
   { command: "start", description: "Pairing instructions" },
   { command: "spawn", description: "Start omp in a herdr space" },
   { command: "sessions", description: "List active omp sessions" },
+  { command: "cleanup", description: "Delete stale and duplicate omp topics" },
   { command: "stop", description: "Abort this topic's omp task" },
   { command: "compact", description: "Compact this session's context" },
   { command: "model", description: "Show or change this session's model" },
@@ -94,7 +97,15 @@ const BOT_COMMANDS = [
   { command: "whoami", description: "Show your Telegram IDs" },
 ];
 const KNOWN_COMMANDS = new Set(BOT_COMMANDS.map((c) => c.command));
-const GLOBAL_COMMANDS = new Set(["start", "spawn", "sessions", "status", "help", "whoami"]);
+const GLOBAL_COMMANDS: Record<string, true> = {
+  start: true,
+  spawn: true,
+  sessions: true,
+  cleanup: true,
+  status: true,
+  help: true,
+  whoami: true,
+};
 
 /** Known bot commands are control-plane input and never become group agent turns. */
 export function consumeOutsidePrivateChat(chatType: string, command: string): boolean {
@@ -104,6 +115,34 @@ export function consumeOutsidePrivateChat(chatType: string, command: string): bo
 /** Telegram's definitive signal that a locally saved forum topic was deleted. */
 export function isMissingThreadError(err: unknown): boolean {
   return err instanceof TgError && err.code === 400 && /message thread not found/i.test(err.message);
+}
+
+/** Task sessions are headless and always carry the required yield tool. */
+export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): boolean {
+  return !hasUI && activeTools.includes("yield");
+}
+
+/** Delete stale topics and same-process extras while preserving live sibling sessions. */
+export async function cleanupRegisteredTopics(
+  registry: ThreadRegistry,
+  keepThreadId: number,
+  selfPid: number,
+  alive: (pid: number) => boolean,
+  deleteTopic: (threadId: number) => Promise<void>,
+): Promise<{ deletedThreadIds: number[]; failed: number }> {
+  const deletedThreadIds: number[] = [];
+  let failed = 0;
+  for (const [threadIdText, entry] of Object.entries(registry.threads)) {
+    const threadId = Number(threadIdText);
+    if (threadId === keepThreadId || (entry.pid !== selfPid && alive(entry.pid))) continue;
+    try {
+      await deleteTopic(threadId);
+      deletedThreadIds.push(threadId);
+    } catch {
+      failed++;
+    }
+  }
+  return { deletedThreadIds, failed };
 }
 const SUBCOMMANDS = ["status", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
 const BATCH_WINDOW_MS = 800;
@@ -711,7 +750,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
     const parsed = parseBotCommand(msg.text ?? "");
     if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name)) return;
-    if (msg.chat.type === "private" && parsed && GLOBAL_COMMANDS.has(parsed.name) && (await handleCommand(msg, parsed))) return;
+    if (msg.chat.type === "private" && parsed && GLOBAL_COMMANDS[parsed.name] && (await handleCommand(msg, parsed))) return;
 
     // Topics routing: gate topic-chat traffic here, then hand it to the owning
     // session (this one, a sibling process, or an exact saved session to resume).
@@ -814,7 +853,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       await commandReply(
         msg,
         owner
-          ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/sessions — list active omp sessions and topic attachment\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
+          ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/sessions — list active omp sessions and topic attachment\n/cleanup — delete all other omp topics\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
           : "/start — pairing instructions\n/status — pairing state\n/whoami — show Telegram IDs",
       );
     } else if (cmd === "whoami") {
@@ -834,6 +873,47 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           await commandReply(msg, formatSessions(spaces, loadRegistry(warn), isAlive));
         } catch (err) {
           await commandReply(msg, `Cannot list omp sessions: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    } else if (cmd === "cleanup") {
+      if (!owner) {
+        await commandReply(msg, "Pair this DM locally before using cleanup.");
+      } else if (!ownTopic) {
+        await commandReply(msg, "No main omp topic is attached, so cleanup was skipped.");
+      } else {
+        const registry = loadRegistry(warn);
+        const otherCount = Object.keys(registry.threads).filter((threadId) => Number(threadId) !== ownTopic?.threadId).length;
+        const protectedCount = Object.entries(registry.threads).filter(
+          ([threadId, entry]) => Number(threadId) !== ownTopic?.threadId && entry.pid !== process.pid && isAlive(entry.pid),
+        ).length;
+        const count = otherCount - protectedCount;
+        const protectedText = protectedCount
+          ? ` ${protectedCount} topic${protectedCount === 1 ? "" : "s"} owned by other live omp sessions will stay.`
+          : "";
+        if (count === 0) {
+          await commandReply(msg, `Nothing stale or duplicated to clean up. The main omp topic and omp control remain.${protectedText}`);
+        } else if (args !== "confirm") {
+          await commandReply(
+            msg,
+            `This permanently deletes ${count} stale or duplicate omp topic${count === 1 ? "" : "s"} and all messages in ${count === 1 ? "it" : "them"}. The main omp topic and omp control stay.${protectedText}\n\nRun /cleanup confirm to continue.`,
+          );
+        } else {
+          const topicsChat = registry.chatId || access.topicsChat!;
+          const result = await cleanupRegisteredTopics(registry, ownTopic.threadId, process.pid, isAlive, async (threadId) => {
+            try {
+              await tg(token, "deleteForumTopic", { chat_id: topicsChat, message_thread_id: threadId });
+            } catch (err) {
+              if (!isMissingThreadError(err)) throw err;
+            }
+          });
+          const currentRegistry = loadRegistry(warn);
+          for (const threadId of result.deletedThreadIds) delete currentRegistry.threads[String(threadId)];
+          saveRegistry(currentRegistry);
+          const deleted = result.deletedThreadIds.length;
+          await commandReply(
+            msg,
+            `Deleted ${deleted} stale or duplicate omp topic${deleted === 1 ? "" : "s"}. The main omp topic and omp control remain.${protectedText}${result.failed ? ` ${result.failed} could not be deleted and remain registered.` : ""}`,
+          );
         }
       }
     } else if (cmd === "stop") {
@@ -1511,6 +1591,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_e, ctx) => {
+    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
     lastCtx = ctx;
     await promptController.pruneExpired().catch((err) => warn(`prompt cleanup failed: ${String(err)}`));
     access = loadAccess(warn);

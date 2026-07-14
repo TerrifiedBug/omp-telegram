@@ -9,7 +9,7 @@ chat access remains separately configured from the terminal, never by the model.
 
 - **Inbound:** DMs / group mentions → injected as `<telegram-message …>` user turns (photos attached inline; other files downloaded to an inbox).
 - **Outbound:** assistant output streams live — native message **drafts** for DMs (Bot API 9.3+), **edited-message** previews for groups — then one finalized MarkdownV2 message per turn.
-- **Control:** local `/telegram` configuration, owner-only Telegram commands (`/spawn`, `/sessions`, `/stop`, `/status`), and two model tools (`telegram_send`, `telegram_react`).
+- **Control:** local `/telegram` configuration, owner-only Telegram commands (`/spawn`, `/sessions`, `/cleanup`, `/stop`, `/status`), and three model tools (`telegram_send`, `telegram_react`, `telegram_ask`).
 - **Zero runtime dependencies** — the raw Bot API over Bun's `fetch`/`FormData`.
 
 ## How it fits together
@@ -119,16 +119,17 @@ These commands are accepted only in the paired owner's private DM. Known bot
 commands typed in a group are consumed and never become omp user turns.
 
 With owner-DM topics enabled, the bridge creates one persistent **omp control**
-topic. Use it for `/spawn`, `/sessions`, `/status`, `/help`, and `/whoami`; use
-session topics for agent conversations and session-local `/stop`, `/compact`,
-`/model`, `/switch`, and `/thinking` commands. A global command entered elsewhere
-posts its result in omp control and leaves a short redirect notice in the
-originating topic.
+topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
+`/whoami`; use session topics for agent conversations and session-local `/stop`,
+`/compact`, `/model`, `/switch`, and `/thinking` commands. A global command
+entered elsewhere posts its result in omp control and leaves a short redirect
+notice in the originating topic.
 
 | Command | Effect |
 |---|---|
 | `/spawn [space]` | List open herdr spaces with inline buttons, or confirm an exact label. A space with live omp sessions requires confirmation before starting another. |
 | `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
+| `/cleanup [confirm]` | Permanently delete stale topics and extra topics created by this omp process, including pre-fix task-subagent spam. The current main session, control topic, and topics owned by other live omp processes remain. The bare command previews the count; `/cleanup confirm` performs the deletion. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
@@ -264,6 +265,8 @@ operator-chosen chat.
   its existing topic instead of creating a duplicate; a second live session in the same
   directory gets a `<name>-<pid>` topic. Sessions already running when topics are first
   enabled must reload or restart before they claim one.
+- Task subagents run inside their parent omp process and do not claim their own
+  topics; their progress and final result stay in the parent session topic.
 - A message typed **inside a topic** is routed to the session that owns it — even a
   different omp process — and that session's replies, streaming previews, and typing
   indicator all land **inside that topic**. Cross-process delivery goes through the
@@ -273,7 +276,7 @@ operator-chosen chat.
   exact saved omp session in its original revalidated herdr space. Legacy topics
   or sessions created outside herdr need one local resume before that identity exists.
 - `/stop` is topic-local and reaches the owning session. Global commands such as
-  `/spawn`, `/sessions`, and `/status` are handled centrally by the poll-lock holder.
+  `/spawn`, `/sessions`, `/cleanup`, and `/status` are handled centrally by the poll-lock holder.
 - In an owner DM, the poll-lock holder creates one persistent **omp control**
   topic for global commands. It is reused across restarts and is not a session
   topic. Commands entered in another topic are redirected there.
@@ -296,12 +299,13 @@ configured group) like any other outbound target. If topic creation fails (mode 
 missing admin right), the session logs a warning and runs untopiced — the bridge
 never blocks.
 
-**Why topics persist (no auto-clean).** Topics are **not** closed or deleted when a
-session exits; they stay and are **re-adopted** on restart. In a DM the Bot API only
-lets a bot *delete* a topic (destructive — it also deletes all its messages);
-`closeForumTopic`/`reopenForumTopic` (park without deleting) are **forum-supergroup
-only**. So rather than destroy your history, an exited session's topic is simply left
-in place for the next omp run in that directory to reclaim.
+**Why topics persist (no automatic cleanup).** Topics are **not** closed or deleted
+when a session exits; they stay and are **re-adopted** on restart. In a DM the Bot
+API only lets a bot *delete* a topic (destructive — it also deletes all its
+messages); `closeForumTopic`/`reopenForumTopic` (park without deleting) are
+**forum-supergroup only**. `/cleanup` therefore requires `/cleanup confirm`,
+deletes stale and same-process duplicate topics, and preserves the current main
+session, `omp control`, and topics owned by other live omp processes.
 
 ## Security
 
@@ -309,9 +313,9 @@ in place for the next omp run in that directory to reclaim.
   Every message and inline-button callback revalidates both the sender ID and
   private chat ID. Callback controls expire after five minutes and are consumed
   before starting a process.
-- **DM-only control:** `/spawn`, `/sessions`, `/stop`, `/compact`, `/model`,
-  `/switch`, `/thinking`, and `/status` never execute from groups. Group policies
-  grant chat delivery only, not operator authority.
+- **DM-only control:** `/spawn`, `/sessions`, `/cleanup`, `/stop`, `/compact`,
+  `/model`, `/switch`, `/thinking`, and `/status` never execute from groups.
+  Group policies grant chat delivery only, not operator authority.
 - **Configured groups are trusted prompt sources:** an allowed group member still
   sends normal omp user turns with the session's workspace and tool access. Use
   sender allowlists; do not connect untrusted or public groups.

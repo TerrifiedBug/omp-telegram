@@ -2,8 +2,9 @@
 
 Use Telegram to chat with your omp sessions and start new ones from your phone.
 
-Each omp session gets its own Telegram topic. A separate **omp control** topic is
-where you run commands like `/spawn`, `/sessions`, and `/status`.
+Each top-level omp session gets its own Telegram topic; task subagents stay in
+their parent session's topic. A separate **omp control** topic is where you run
+commands like `/spawn`, `/sessions`, `/cleanup`, and `/status`.
 
 ## What you need
 
@@ -77,6 +78,7 @@ Inside **omp control**:
 ```text
 /spawn       Choose a herdr space and start another omp session
 /sessions    See live, unattached, and stale sessions
+/cleanup     Delete stale and duplicate topics after explicit confirmation
 /status      Check the bridge
 /help        Show Telegram commands
 ```
