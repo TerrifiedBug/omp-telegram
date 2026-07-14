@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { TgError, type TgMessage } from "./api";
-import { canAutoResumeTopic, consumeOutsidePrivateChat, isMissingThreadError, parseTelegramPromptTarget } from "./index";
+import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat, isMissingThreadError, isTaskSubagent, parseTelegramPromptTarget } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -12,8 +12,48 @@ describe("Telegram bot command scope", () => {
     expect(consumeOutsidePrivateChat("supergroup", "model")).toBe(true);
     expect(consumeOutsidePrivateChat("supergroup", "switch")).toBe(true);
     expect(consumeOutsidePrivateChat("supergroup", "thinking")).toBe(true);
+    expect(consumeOutsidePrivateChat("supergroup", "cleanup")).toBe(true);
     expect(consumeOutsidePrivateChat("private", "spawn")).toBe(false);
     expect(consumeOutsidePrivateChat("supergroup", "not-a-bot-command")).toBe(false);
+  });
+});
+
+describe("Telegram session ownership", () => {
+  test("does not attach the bridge to task subagents", () => {
+    expect(isTaskSubagent(false, ["read", "yield"])).toBe(true);
+    expect(isTaskSubagent(true, ["read", "yield"])).toBe(false);
+    expect(isTaskSubagent(false, ["read"])).toBe(false);
+  });
+});
+
+describe("Telegram topic cleanup", () => {
+  test("removes same-process and stale topics without touching live sibling sessions", async () => {
+    const registry = {
+      version: 1 as const,
+      chatId: "42",
+      threads: {
+        "1": { pid: 1, cwd: "/main", name: "main", claimedAt: 1 },
+        "2": { pid: 1, cwd: "/child", name: "child", claimedAt: 2 },
+        "3": { pid: 3, cwd: "/stale", name: "stale", claimedAt: 3 },
+        "4": { pid: 2, cwd: "/sibling", name: "sibling", claimedAt: 4 },
+      },
+    };
+    const attempted: number[] = [];
+
+    const result = await cleanupRegisteredTopics(
+      registry,
+      1,
+      1,
+      (pid) => pid === 2,
+      async (threadId) => {
+        attempted.push(threadId);
+        if (threadId === 3) throw new Error("transient Telegram failure");
+      },
+    );
+
+    expect(result).toEqual({ deletedThreadIds: [2], failed: 1 });
+    expect(attempted).toEqual([2, 3]);
+    expect(Object.keys(registry.threads)).toEqual(["1", "2", "3", "4"]);
   });
 });
 
