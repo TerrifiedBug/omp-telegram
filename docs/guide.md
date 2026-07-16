@@ -42,7 +42,7 @@ Clone the repository, then link it into omp:
 git clone https://github.com/TerrifiedBug/omp-telegram.git
 cd omp-telegram
 omp plugin link .
-omp plugin list        # → omp-telegram@0.1.0
+omp plugin list        # → omp-telegram@0.1.1
 ```
 
 `omp plugin link` needs no build or install step: the extension has zero runtime
