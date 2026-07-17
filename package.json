@@ -23,6 +23,8 @@
     "src/index.ts",
     "src/access.ts",
     "src/api.ts",
+    "src/bridge.ts",
+    "src/daemon.ts",
     "src/control.ts",
     "src/inbox.ts",
     "src/markdown.ts",

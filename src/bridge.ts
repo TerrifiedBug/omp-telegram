@@ -98,6 +98,8 @@ export interface BridgeHost {
   promptController: TelegramPromptController;
   handleSessionCommand?(msg: TgMessage, parsed: { name: string; args: string }): Promise<boolean>;
   deliverLocal?(msg: TgMessage): Promise<void>;
+  /** Test seam for the external herdr resume side effect. */
+  resumeTopic?(msg: TgMessage, threadId: number, entry: ThreadEntry): Promise<void>;
 }
 
 export function parseBotCommand(text: string): { name: string; args: string } | undefined {
@@ -195,10 +197,10 @@ async function waitForResumedOwner(threadId: number, previous: ThreadEntry): Pro
   while (Date.now() < deadline) {
     const owner = loadRegistry().threads[String(threadId)];
     if (isResumedOwner(previous, owner, isAlive)) return true;
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 250);
-      timer.unref?.();
-    });
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const timer = setTimeout(resolve, 250);
+    timer.unref?.();
+    await promise;
   }
   return false;
 }
@@ -229,8 +231,6 @@ async function resumeStaleTopic(host: BridgeHost, msg: TgMessage, threadId: numb
     await report("Session resumed. Delivering queued messages.");
   } catch (err) {
     await report(`Could not resume this session: ${err instanceof Error ? err.message : String(err)}`);
-  } finally {
-    resumingTopics.delete(threadId);
   }
 }
 
@@ -455,7 +455,10 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
         }
         if (!resumingTopics.has(route.threadId)) {
           resumingTopics.add(route.threadId);
-          void resumeStaleTopic(host, msg, route.threadId, entry);
+          const resume = host.resumeTopic
+            ? host.resumeTopic(msg, route.threadId, entry)
+            : resumeStaleTopic(host, msg, route.threadId, entry);
+          void resume.finally(() => resumingTopics.delete(route.threadId));
         }
         return;
       }

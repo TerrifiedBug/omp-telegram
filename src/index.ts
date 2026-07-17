@@ -27,6 +27,7 @@ import {
 import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg } from "./api";
 import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand } from "./bridge";
 import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
+import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
@@ -77,7 +78,7 @@ export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): 
   return !hasUI && activeTools.includes("yield");
 }
 
-const SUBCOMMANDS = ["status", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
+const SUBCOMMANDS = ["status", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
 const BATCH_WINDOW_MS = 800;
 const THINKING_LEVELS: Record<string, true> = {
   inherit: true,
@@ -216,6 +217,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   async function acquireAndLaunch(ctx: ExtensionContext | undefined, announce: boolean): Promise<boolean> {
     if (poller.running) return true;
+    if (daemonAlive(readDaemonState())) return false;
     const lock = acquireLock(lockPath);
     if (!lock.ok) {
       notifyOnce(ctx, `telegram: bot lock held by pid ${lock.holder} — waiting (another omp session polls this token)`, "warning");
@@ -251,9 +253,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       notifyOnce(ctx, "telegram: no bot token — run /telegram token <token>", "warning");
       return;
     }
+    const daemon = ensureDaemon(warn);
     outbound.setToken(token); // outbound (telegram_send/react, idle pings) works even when another session holds the poll lock
     await ensureTopic(ctx);
-    const launched = await acquireAndLaunch(ctx, announce);
+    const launched = daemon === "alive" || daemon === "spawned" ? false : await acquireAndLaunch(ctx, announce);
     if (!launched && !lockRetryTimer) {
       lockRetryTimer = setInterval(() => {
         if (poller.running) return;
@@ -761,6 +764,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     access = a;
     const lines = [
       `Telegram bridge: ${poller.running ? `running as @${botUsername || "?"}` : "stopped"}`,
+      `Daemon: ${daemonStatus(loadAccess(warn))}`,
       `DM policy: ${a.dmPolicy} · autostart: ${a.enabled ? "on" : "off"}`,
       `Owner: ${pairedOwnerId(a) ?? (a.allowFrom.length > 1 ? `ambiguous (${a.allowFrom.join(", ")})` : "unpaired")}`,
       `Pending codes: ${Object.keys(a.pending).length ? Object.keys(a.pending).join(", ") : "none"}`,
@@ -785,6 +789,53 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ctx.ui.notify(lines.join("\n"), "info");
   }
 
+  function daemonStatus(currentAccess: Access): string {
+    const state = readDaemonState();
+    if (state && daemonAlive(state)) {
+      const uptime = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
+      return `pid ${state.pid} · v${state.version} · up ${uptime}s`;
+    }
+    return daemonDisableReason(currentAccess, resolveToken()) ?? (state ? `stale pid ${state.pid}` : "not running");
+  }
+
+  async function waitForDaemonExit(pid: number): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const timer = setTimeout(resolve, 50);
+      timer.unref?.();
+      await promise;
+    }
+  }
+
+  async function cmdDaemon(ctx: ExtensionContext, arg: string): Promise<void> {
+    const action = arg.trim() || "status";
+    const state = readDaemonState();
+    if (action === "status") {
+      ctx.ui.notify(`telegram daemon: ${daemonStatus(loadAccess(warn))}\nLog: ${statePath("daemon.log")}`, "info");
+      return;
+    }
+    if (action !== "restart" && action !== "stop") {
+      ctx.ui.notify("usage: /telegram daemon status | restart | stop", "warning");
+      return;
+    }
+    if (state && daemonAlive(state)) {
+      try {
+        process.kill(state.pid, "SIGTERM");
+      } catch (err) {
+        ctx.ui.notify(`telegram: could not stop daemon pid ${state.pid} — ${String(err)}`, "error");
+        return;
+      }
+      if (action === "restart") await waitForDaemonExit(state.pid);
+    }
+    if (action === "stop") {
+      ctx.ui.notify(state ? `telegram: daemon pid ${state.pid} stopping; session fallback will take over` : "telegram: daemon is not running", "info");
+      return;
+    }
+    const result = ensureDaemon(warn);
+    ctx.ui.notify(`telegram: daemon restart ${result} — ${daemonStatus(loadAccess(warn))}`, result === "failed" ? "error" : "info");
+  }
+
   async function cmdToken(ctx: ExtensionContext, arg: string): Promise<void> {
     const tok = arg.trim();
     if (!tok) {
@@ -798,6 +849,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       botUsername = me.username;
       botHasTopics = me.has_topics_enabled;
       outbound.setToken(tok);
+      ensureDaemon(warn);
       ctx.ui.notify(`telegram: @${me.username} ok — run /telegram on to start`, "info");
     } catch (err) {
       ctx.ui.notify(`telegram: token rejected — ${err instanceof TgError ? `${err.code} ${err.message}` : String(err)}`, "error");
@@ -821,6 +873,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     a.allowFrom = [entry.senderId];
     a.pending = {};
     saveAccess(a);
+    ensureDaemon(warn);
     access = a;
     ctx.ui.notify(`telegram: paired owner ${entry.senderId}`, "info");
     if (token) {
@@ -899,11 +952,13 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const allowFrom = ai >= 0 && flags[ai + 1] ? flags[ai + 1].split(",").map((s) => s.trim()).filter(Boolean) : [];
       a.groups[id] = { requireMention, allowFrom };
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: group ${id} added (requireMention: ${requireMention}, allowFrom: ${allowFrom.length})`, "info");
     } else if (action === "rm" && id) {
       delete a.groups[id];
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: group ${id} removed`, "info");
     } else {
@@ -1018,6 +1073,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       ownTopic = undefined;
       a.topicsChat = undefined;
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify("telegram: topics off", "info");
       return;
@@ -1026,6 +1082,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const enable = async (chatId: string, where: string): Promise<void> => {
       a.topicsChat = chatId;
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: topics on in ${where} — claiming this session's topic`, "info");
       if (!token) {
@@ -1188,17 +1245,22 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         case "status":
           showStatus(ctx);
           break;
+        case "daemon":
+          await cmdDaemon(ctx, arg);
+          break;
         case "token":
           await cmdToken(ctx, arg);
           break;
         case "on":
           access.enabled = true;
           saveAccess(access);
+          ensureDaemon(warn);
           await startBot(ctx, true);
           break;
         case "off":
           access.enabled = false;
           saveAccess(access);
+          ensureDaemon(warn);
           stopBot();
           ctx.ui.notify("telegram: bridge stopped", "info");
           break;
