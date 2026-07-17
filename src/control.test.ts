@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultAccess } from "./access";
 import type { TgCallbackQuery, TgMessage } from "./api";
-import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp } from "./control";
+import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
 import type { ThreadRegistry } from "./topics";
 
 const workspaceList = (items: unknown[]): string => JSON.stringify({ result: { workspaces: items } });
@@ -148,6 +151,57 @@ describe("spawnOmp", () => {
 
     await expect(spawnOmp(activeSpace, run)).rejects.toThrow("run failed");
     expect(calls).toContain("tab close w1:t3");
+  });
+});
+
+describe("new herdr destinations", () => {
+  test("validates worktree branch names and local workspace directories", () => {
+    expect(validWorktreeBranch("tg/smoke-2026.07")).toBe(true);
+    expect(validWorktreeBranch("-bad")).toBe(false);
+    expect(validWorktreeBranch("bad branch")).toBe(false);
+    expect(validWorktreeBranch("a".repeat(101))).toBe(false);
+    expect(workspaceDirectoryError("relative/path")).toContain("absolute");
+    const dir = mkdtempSync(join(tmpdir(), "omp-tg-workspace-"));
+    try {
+      expect(workspaceDirectoryError(dir)).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("finds the created worktree root pane when create omits it", async () => {
+    const calls: string[] = [];
+    let workspaceLists = 0;
+    let paneLists = 0;
+    const run: RunHerdr = async (args) => {
+      const command = args.join(" ");
+      calls.push(command);
+      if (command === "workspace list") {
+        workspaceLists++;
+        return workspaceLists === 1
+          ? workspaceList([{ workspace_id: "w1", label: "active-space", agent_status: "working" }])
+          : workspaceList([
+              { workspace_id: "w1", label: "active-space", agent_status: "working" },
+              { workspace_id: "w2", label: "tg-smoke", agent_status: "unknown" },
+            ]);
+      }
+      if (command === "pane list") {
+        paneLists++;
+        return paneLists === 1
+          ? paneList([{ workspace_id: "w1", terminal_id: "term-a", agent_status: "working" }])
+          : paneList([{ workspace_id: "w2", pane_id: "w2:p1", terminal_id: "term-b", agent_status: "unknown" }]);
+      }
+      if (command === "worktree create --workspace w1 --branch tg/smoke --no-focus --json") {
+        return JSON.stringify({ result: {} });
+      }
+      if (command === "pane run w2:p1 omp") return "";
+      throw new Error(`unexpected command: ${command}`);
+    };
+
+    await expect(createWorktreeOmp({ ...activeSpace, ompCount: 0, terminalIds: ["term-a"] }, "tg/smoke", run)).resolves.toEqual({
+      paneId: "w2:p1",
+    });
+    expect(calls).toContain("pane run w2:p1 omp");
   });
 });
 
@@ -368,6 +422,56 @@ describe("SpawnController", () => {
     expect(calls.filter((call) => call.payload.text === "This picker expired. Run /spawn again.")).toHaveLength(2);
   });
 
+
+  test("consumes a worktree confirmation before creating it", async () => {
+    const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    const created: Array<{ space: string; branch: string }> = [];
+    const controller = new SpawnController({
+      getAccess: () => ownerAccess,
+      callTelegram: telegramRecorder(calls),
+      listSpaces: async () => [activeSpace],
+      createWorktree: async (space, branch) => {
+        created.push({ space: space.workspaceId, branch });
+        return { paneId: "w2:p1" };
+      },
+      nonce: () => "worktree",
+      now: () => 1_000,
+    });
+    const confirmation: TgCallbackQuery = {
+      id: "worktree-confirm",
+      from: ownerMessage.from!,
+      message: { message_id: 100, chat: ownerMessage.chat },
+      data: "sp:y:worktree",
+    };
+
+    await controller.start(ownerMessage, "new tg/smoke active-space");
+    expect(await controller.handleCallback(confirmation)).toBe(true);
+    expect(await controller.handleCallback({ ...confirmation, id: "worktree-duplicate" })).toBe(true);
+
+    expect(created).toEqual([{ space: "w1", branch: "tg/smoke" }]);
+    expect(calls.some((call) => call.payload.text === "Create worktree tg/smoke from active-space and start omp?")).toBe(true);
+    expect(calls.some((call) => String(call.payload.text).includes("Started omp in new worktree tg/smoke (w2:p1)"))).toBe(true);
+  });
+
+  test("rejects invalid branches and non-absolute directory targets before listing spaces", async () => {
+    const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    let listed = 0;
+    const controller = new SpawnController({
+      getAccess: () => ownerAccess,
+      callTelegram: telegramRecorder(calls),
+      listSpaces: async () => {
+        listed++;
+        return [activeSpace];
+      },
+    });
+
+    await controller.start(ownerMessage, "new -bad");
+    await controller.start(ownerMessage, "dir relative/path");
+
+    expect(listed).toBe(0);
+    expect(calls.some((call) => call.payload.text === "usage: /spawn new <branch> [space-label]")).toBe(true);
+    expect(calls.some((call) => String(call.payload.text).includes("usage: /spawn dir <absolute-path>"))).toBe(true);
+  });
   test("does not open a picker outside the owner's private DM", async () => {
     const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
     const controller = new SpawnController({

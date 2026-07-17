@@ -4,6 +4,8 @@
 
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import type { Access } from "./access";
 import { controlTopicTarget, isPairedOwnerDm, pairedOwnerId } from "./access";
 import type { TgCallbackQuery, TgMessage } from "./api";
@@ -29,6 +31,7 @@ interface WorkspaceWire {
 
 interface PaneWire {
   workspace_id?: unknown;
+  pane_id?: unknown;
   agent?: unknown;
   agent_status?: unknown;
   cwd?: unknown;
@@ -164,6 +167,118 @@ export async function spawnOmp(
   return { paneId: created.paneId };
 }
 
+export function validWorktreeBranch(branch: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(branch);
+}
+
+export function workspaceDirectoryError(cwd: string): string | undefined {
+  if (!isAbsolute(cwd)) return "the directory must be an absolute path";
+  try {
+    if (!statSync(cwd).isDirectory()) return "the path is not a directory";
+  } catch {
+    return "the directory does not exist";
+  }
+  return undefined;
+}
+
+interface CreatedWorkspaceRefs {
+  workspaceId?: string;
+  paneId?: string;
+}
+
+function createdWorkspaceRefs(raw: string, operation: string): CreatedWorkspaceRefs {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`herdr returned invalid JSON for ${operation}`);
+  }
+  if (!parsed || typeof parsed !== "object" || !("result" in parsed) || !parsed.result || typeof parsed.result !== "object") {
+    throw new Error(`herdr ${operation} response is missing result`);
+  }
+  const result = parsed.result;
+  const workspace =
+    "workspace" in result && result.workspace && typeof result.workspace === "object" ? result.workspace : undefined;
+  const rootPane =
+    "root_pane" in result && result.root_pane && typeof result.root_pane === "object" ? result.root_pane : undefined;
+  const nestedWorkspaceId =
+    workspace && "workspace_id" in workspace && typeof workspace.workspace_id === "string" ? workspace.workspace_id : undefined;
+  const directWorkspaceId =
+    "workspace_id" in result && typeof result.workspace_id === "string" ? result.workspace_id : undefined;
+  const paneId = rootPane && "pane_id" in rootPane && typeof rootPane.pane_id === "string" ? rootPane.pane_id : undefined;
+  return { workspaceId: nestedWorkspaceId ?? directWorkspaceId, paneId };
+}
+
+async function resolveCreatedPane(
+  raw: string,
+  operation: string,
+  previousWorkspaceIds: ReadonlySet<string>,
+  run: RunHerdr,
+): Promise<string> {
+  const refs = createdWorkspaceRefs(raw, operation);
+  if (refs.paneId) return refs.paneId;
+  let workspaceId = refs.workspaceId;
+  if (!workspaceId) {
+    for (const item of resultArray(await run(["workspace", "list"]), "workspaces")) {
+      if (!item || typeof item !== "object" || !("workspace_id" in item) || typeof item.workspace_id !== "string") continue;
+      if (!previousWorkspaceIds.has(item.workspace_id)) {
+        workspaceId = item.workspace_id;
+        break;
+      }
+    }
+  }
+  if (!workspaceId) throw new Error(`herdr ${operation} response did not identify the created workspace`);
+  for (const item of resultArray(await run(["pane", "list"]), "panes")) {
+    if (!item || typeof item !== "object") continue;
+    if (!("workspace_id" in item) || item.workspace_id !== workspaceId) continue;
+    if ("pane_id" in item && typeof item.pane_id === "string" && item.pane_id.length > 0) return item.pane_id;
+  }
+  throw new Error(`herdr ${operation} response did not identify the created root pane`);
+}
+
+/** Create a git worktree from a revalidated source space and start omp in it. */
+export async function createWorktreeOmp(
+  source: HerdrSpaceRef,
+  branch: string,
+  run: RunHerdr = runHerdr,
+): Promise<{ paneId: string }> {
+  if (!validWorktreeBranch(branch)) throw new Error("invalid worktree branch");
+  const spaces = await listControlSpaces(run);
+  const current = spaces.find(
+    (candidate) =>
+      candidate.workspaceId === source.workspaceId &&
+      candidate.label === source.label &&
+      (source.terminalIds.length === 0 ||
+        candidate.terminalIds.length === 0 ||
+        source.terminalIds.some((terminalId) => candidate.terminalIds.includes(terminalId))),
+  );
+  if (!current) throw new Error("that herdr space changed or closed; run /spawn new again");
+  const raw = await run([
+    "worktree",
+    "create",
+    "--workspace",
+    current.workspaceId,
+    "--branch",
+    branch,
+    "--no-focus",
+    "--json",
+  ]);
+  const paneId = await resolveCreatedPane(raw, "worktree create", new Set(spaces.map((space) => space.workspaceId)), run);
+  await run(["pane", "run", paneId, "omp"]);
+  return { paneId };
+}
+
+/** Create a herdr workspace rooted at one local directory and start omp in it. */
+export async function createWorkspaceOmp(cwd: string, run: RunHerdr = runHerdr): Promise<{ paneId: string }> {
+  const invalid = workspaceDirectoryError(cwd);
+  if (invalid) throw new Error(invalid);
+  const spaces = await listControlSpaces(run);
+  const raw = await run(["workspace", "create", "--cwd", cwd, "--no-focus"]);
+  const paneId = await resolveCreatedPane(raw, "workspace create", new Set(spaces.map((space) => space.workspaceId)), run);
+  await run(["pane", "run", paneId, "omp"]);
+  return { paneId };
+}
+
 /** Single-quote one local value for herdr's shell-command interface. */
 function shellArg(value: string): string {
   return `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -287,6 +402,9 @@ interface SpawnPicker {
   messageId: number;
   spaces: ControlSpace[];
   selected?: ControlSpace;
+  mode: "space" | "worktree";
+  branch?: string;
+  directory?: string;
   expiresAt: number;
 }
 
@@ -296,6 +414,8 @@ export interface SpawnControllerOptions {
   warn?: (message: string) => void;
   listSpaces?: () => Promise<ControlSpace[]>;
   spawn?: (space: ControlSpace) => Promise<{ paneId: string }>;
+  createWorktree?: (space: ControlSpace, branch: string) => Promise<{ paneId: string }>;
+  createWorkspace?: (cwd: string) => Promise<{ paneId: string }>;
   nonce?: () => string;
   now?: () => number;
 }
@@ -310,6 +430,8 @@ export class SpawnController {
   readonly #warn: (message: string) => void;
   readonly #listSpaces: () => Promise<ControlSpace[]>;
   readonly #spawn: (space: ControlSpace) => Promise<{ paneId: string }>;
+  readonly #createWorktree: (space: ControlSpace, branch: string) => Promise<{ paneId: string }>;
+  readonly #createWorkspace: (cwd: string) => Promise<{ paneId: string }>;
   readonly #nonce: () => string;
   readonly #now: () => number;
   readonly #pickers = new Map<string, SpawnPicker>();
@@ -320,6 +442,8 @@ export class SpawnController {
     this.#warn = options.warn ?? (() => undefined);
     this.#listSpaces = options.listSpaces ?? (() => listControlSpaces());
     this.#spawn = options.spawn ?? ((space) => spawnOmp(space));
+    this.#createWorktree = options.createWorktree ?? ((space, branch) => createWorktreeOmp(space, branch));
+    this.#createWorkspace = options.createWorkspace ?? ((cwd) => createWorkspaceOmp(cwd));
     this.#nonce = options.nonce ?? (() => randomBytes(6).toString("base64url"));
     this.#now = options.now ?? Date.now;
   }
@@ -328,6 +452,44 @@ export class SpawnController {
     const access = this.#getAccess();
     const ownerId = pairedOwnerId(access);
     if (!isPairedOwnerDm(String(msg.from?.id ?? ""), String(msg.chat.id), msg.chat.type, access) || !ownerId) return;
+
+    const request = requestedLabel.trim();
+    if (request === "dir" || request.startsWith("dir ")) {
+      const directory = request.slice(3).trim();
+      const invalid = workspaceDirectoryError(directory);
+      if (invalid) {
+        await this.#send(msg, `usage: /spawn dir <absolute-path> (${invalid})`);
+        return;
+      }
+      this.#prune();
+      const nonce = this.#nonce();
+      const sent = await this.#send(msg, `Create workspace at ${directory} and start omp?`, this.#confirmationKeyboard(nonce));
+      if (!sent) return;
+      this.#pickers.set(nonce, {
+        ownerId,
+        chatId: String(msg.chat.id),
+        messageId: sent.message_id,
+        spaces: [],
+        mode: "space",
+        directory,
+        expiresAt: this.#now() + 5 * 60_000,
+      });
+      return;
+    }
+
+    let mode: "space" | "worktree" = "space";
+    let branch: string | undefined;
+    let spaceLabel = request;
+    if (request === "new" || request.startsWith("new ")) {
+      mode = "worktree";
+      const [requestedBranch, ...labelParts] = request.slice(3).trim().split(/\s+/);
+      branch = requestedBranch;
+      spaceLabel = labelParts.join(" ");
+      if (!branch || !validWorktreeBranch(branch)) {
+        await this.#send(msg, "usage: /spawn new <branch> [space-label]");
+        return;
+      }
+    }
 
     let spaces: ControlSpace[];
     try {
@@ -343,30 +505,36 @@ export class SpawnController {
 
     this.#prune();
     const nonce = this.#nonce();
-    const exact = requestedLabel
-      ? spaces.filter((space) => space.label.toLowerCase() === requestedLabel.toLowerCase())
+    const exact = spaceLabel
+      ? spaces.filter((space) => space.label.toLowerCase() === spaceLabel.toLowerCase())
       : [];
     const selected = exact.length === 1 ? exact[0] : undefined;
-    const safeRequested = requestedLabel.replace(/[\r\n]/g, " ");
+    const safeRequested = spaceLabel.replace(/[\r\n]/g, " ");
+    const picker: SpawnPicker = {
+      ownerId,
+      chatId: String(msg.chat.id),
+      messageId: 0,
+      spaces,
+      selected,
+      mode,
+      branch,
+      expiresAt: this.#now() + 5 * 60_000,
+    };
     const text = selected
-      ? this.#confirmationText(selected)
-      : requestedLabel
-        ? `No unique open space named "${safeRequested}". Choose a herdr space:`
-        : "Choose a herdr space:";
+      ? this.#confirmationText(picker, selected)
+      : mode === "worktree"
+        ? `Choose the source space for worktree ${branch}:`
+        : spaceLabel
+          ? `No unique open space named "${safeRequested}". Choose a herdr space:`
+          : "Choose a herdr space:";
     const sent = await this.#send(
       msg,
       text,
       selected ? this.#confirmationKeyboard(nonce) : this.#pickerKeyboard(nonce, spaces, 0),
     );
     if (!sent) return;
-    this.#pickers.set(nonce, {
-      ownerId,
-      chatId: String(msg.chat.id),
-      messageId: sent.message_id,
-      spaces,
-      selected,
-      expiresAt: this.#now() + 5 * 60_000,
-    });
+    picker.messageId = sent.message_id;
+    this.#pickers.set(nonce, picker);
   }
 
   /** Returns false only for callbacks not owned by this controller. */
@@ -409,7 +577,7 @@ export class SpawnController {
       await this.#answer(query.id);
       await this.#edit(
         query,
-        "Choose a herdr space:",
+        picker.mode === "worktree" ? `Choose the source space for worktree ${picker.branch}:` : "Choose a herdr space:",
         this.#pickerKeyboard(nonce, picker.spaces, Number.isFinite(page) ? page : 0),
       );
       return true;
@@ -422,10 +590,10 @@ export class SpawnController {
       }
       picker.selected = selected;
       await this.#answer(query.id);
-      await this.#edit(query, this.#confirmationText(selected), this.#confirmationKeyboard(nonce));
+      await this.#edit(query, this.#confirmationText(picker, selected), this.#confirmationKeyboard(nonce));
       return true;
     }
-    if (action !== "y" || !picker.selected) {
+    if (action !== "y" || (!picker.selected && !picker.directory)) {
       await this.#answer(query.id);
       return true;
     }
@@ -433,19 +601,30 @@ export class SpawnController {
     // Consume before the process side effect. Duplicate delivery sees an expired picker.
     this.#pickers.delete(nonce);
     const selected = picker.selected;
-    await this.#answer(query.id, `Starting omp in ${selected.label}`);
-    await this.#edit(query, `Starting omp in ${selected.label}...`, { inline_keyboard: [] });
+    const destination = picker.directory ?? selected?.label ?? "new workspace";
+    await this.#answer(query.id, `Starting omp in ${destination}`);
+    await this.#edit(query, `Starting omp in ${destination}...`, { inline_keyboard: [] });
     try {
-      const result = await this.#spawn(selected);
-      await this.#edit(
-        query,
-        `Started omp in ${selected.label} (${result.paneId}). Its Telegram topic will appear after extension startup.`,
-        { inline_keyboard: [] },
-      );
+      let result: { paneId: string };
+      let text: string;
+      if (picker.directory) {
+        result = await this.#createWorkspace(picker.directory);
+        text = `Started omp in new workspace ${picker.directory} (${result.paneId}). Its Telegram topic will appear after extension startup.`;
+      } else if (!selected) {
+        throw new Error("the selected herdr space is unavailable");
+      } else if (picker.mode === "worktree") {
+        if (!picker.branch) throw new Error("the worktree branch is missing");
+        result = await this.#createWorktree(selected, picker.branch);
+        text = `Started omp in new worktree ${picker.branch} (${result.paneId}). Its Telegram topic will appear after extension startup.`;
+      } else {
+        result = await this.#spawn(selected);
+        text = `Started omp in ${selected.label} (${result.paneId}). Its Telegram topic will appear after extension startup.`;
+      }
+      await this.#edit(query, text, { inline_keyboard: [] });
     } catch (err) {
       await this.#edit(
         query,
-        `Could not start omp in ${selected.label}: ${err instanceof Error ? err.message : String(err)}`,
+        `Could not start omp in ${destination}: ${err instanceof Error ? err.message : String(err)}`,
         { inline_keyboard: [] },
       );
     }
@@ -485,7 +664,8 @@ export class SpawnController {
     };
   }
 
-  #confirmationText(space: ControlSpace): string {
+  #confirmationText(picker: SpawnPicker, space: ControlSpace): string {
+    if (picker.mode === "worktree") return `Create worktree ${picker.branch} from ${space.label} and start omp?`;
     if (space.ompCount === 0) return `Start omp in ${space.label}?`;
     return `${space.label} already has ${space.ompCount} live omp session${space.ompCount === 1 ? "" : "s"}.\n\nStarting another creates a parallel agent and another Telegram topic.`;
   }

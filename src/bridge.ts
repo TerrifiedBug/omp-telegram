@@ -32,7 +32,7 @@ import {
 
 export const BOT_COMMANDS = [
   { command: "start", description: "Pairing instructions" },
-  { command: "spawn", description: "Start omp in a herdr space" },
+  { command: "spawn", description: "Start omp in a herdr space, new worktree, or directory" },
   { command: "sessions", description: "List active omp sessions" },
   { command: "cleanup", description: "Delete stale and duplicate omp topics" },
   { command: "stop", description: "Abort this topic's omp task" },
@@ -179,7 +179,7 @@ export async function ensureControlTopic(host: BridgeHost): Promise<void> {
     await host.callTelegram("sendMessage", {
       chat_id: ownerId,
       message_thread_id: topic.message_thread_id,
-      text: "OMP control\n\nUse this topic for bridge commands:\n/spawn — start omp in a herdr space\n/sessions — inspect session and topic state\n/status — bridge health\n/help — command reference\n\nUse the other topics for conversations with individual omp sessions.",
+      text: "OMP control\n\nUse this topic for bridge commands:\n/spawn — start omp in a herdr space, new worktree, or directory\n/sessions — inspect session and topic state\n/status — bridge health\n/help — command reference\n\nUse the other topics for conversations with individual omp sessions.",
     });
     host.log.info(`[telegram] control topic #${topic.message_thread_id} created in owner DM ${ownerId}`);
   })();
@@ -273,7 +273,7 @@ export async function handleGlobalCommand(
       access,
       msg,
       owner
-        ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/sessions — list active omp sessions and topic attachment\n/cleanup — delete all other omp topics\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
+        ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/spawn new <branch> [space] — create a worktree and start omp\n/spawn dir <absolute-path> — create a workspace and start omp\n/sessions — list active omp sessions and topic attachment\n/cleanup — delete all other omp topics\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
         : "/start — pairing instructions\n/status — pairing state\n/whoami — show Telegram IDs",
     );
   } else if (command === "whoami") {
