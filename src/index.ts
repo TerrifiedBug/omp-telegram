@@ -3,8 +3,8 @@
 // back via draft/edit streaming. Access control (pairing, allowlists, groups)
 // is user-managed through the /telegram command and never via the model.
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { type Dirent, readFileSync, writeFileSync } from "node:fs";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -88,7 +88,7 @@ export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): 
   return !hasUI && activeTools.includes("yield");
 }
 
-const SUBCOMMANDS = ["status", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
+const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
 const BATCH_WINDOW_MS = 800;
 const THINKING_LEVELS: Record<string, true> = {
   inherit: true,
@@ -880,6 +880,79 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ctx.ui.notify(`telegram: daemon restart ${result} — ${daemonStatus(loadAccess(warn))}`, result === "failed" ? "error" : "info");
   }
 
+  async function cmdDoctor(ctx: ExtensionContext): Promise<void> {
+    const currentAccess = loadAccess(warn);
+    const currentToken = resolveToken();
+    const lines = ["Telegram doctor"];
+
+    if (!currentToken) {
+      lines.push("Token: missing", "Webhook: skipped (token missing)");
+    } else {
+      try {
+        const me = await tg<{ username: string; has_topics_enabled?: boolean }>(currentToken, "getMe");
+        const topicMode = me.has_topics_enabled === undefined ? "unknown" : me.has_topics_enabled ? "on" : "off";
+        lines.push(`Token: present · getMe ok @${me.username} · DM topics ${topicMode}`);
+      } catch (err) {
+        lines.push(`Token: present · getMe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      try {
+        lines.push(`Webhook: ${(await webhookConflictHint(currentToken)) ?? "none"}`);
+      } catch (err) {
+        lines.push(`Webhook: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    try {
+      const rawPid = readFileSync(lockPath, "utf8").trim();
+      const pid = Number(rawPid);
+      lines.push(Number.isInteger(pid) && pid > 1 ? `Poll lock: pid ${pid} · ${isAlive(pid) ? "alive" : "dead"}` : `Poll lock: malformed (${rawPid || "empty"})`);
+    } catch (err) {
+      lines.push(err && typeof err === "object" && "code" in err && err.code === "ENOENT" ? "Poll lock: none" : `Poll lock: probe failed: ${String(err)}`);
+    }
+
+    try {
+      const state = readDaemonState();
+      lines.push(`Daemon: ${state && daemonAlive(state) ? `pid ${state.pid} · v${state.version} · alive` : daemonDisableReason(currentAccess, currentToken) ?? (state ? `pid ${state.pid} · dead` : "not running")}`);
+    } catch (err) {
+      lines.push(`Daemon: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    try {
+      const registry = loadRegistry(warn);
+      const liveOwners = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
+      lines.push(
+        `Topics: chat ${currentAccess.topicsChat ?? "off"} · control ${currentAccess.controlThreadId != null ? `#${currentAccess.controlThreadId}` : "none"} · ${Object.keys(registry.threads).length} topics, ${liveOwners} live owners`,
+      );
+    } catch (err) {
+      lines.push(`Topics: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    try {
+      const spaces = await listControlSpaces();
+      lines.push(`Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · ${spaces.length} spaces`);
+    } catch (err) {
+      lines.push(`Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    try {
+      const inbox = statePath("inbox");
+      let entries: Dirent[];
+      try {
+        entries = await readdir(inbox, { withFileTypes: true });
+      } catch (err) {
+        if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) throw err;
+        entries = [];
+      }
+      const files = entries.filter((entry) => entry.isFile());
+      const sizes = await Promise.all(files.map((entry) => stat(join(inbox, entry.name))));
+      lines.push(`Inbox: ${files.length} files · ${sizes.reduce((total, info) => total + info.size, 0)} bytes`);
+    } catch (err) {
+      lines.push(`Inbox: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
   async function cmdToken(ctx: ExtensionContext, arg: string): Promise<void> {
     const tok = arg.trim();
     if (!tok) {
@@ -1288,6 +1361,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       switch (sub) {
         case "status":
           showStatus(ctx);
+          break;
+        case "doctor":
+          await cmdDoctor(ctx);
           break;
         case "daemon":
           await cmdDaemon(ctx, arg);
