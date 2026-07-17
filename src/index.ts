@@ -3,6 +3,7 @@
 // back via draft/edit streaming. Access control (pairing, allowlists, groups)
 // is user-managed through the /telegram command and never via the model.
 
+import { execFile } from "node:child_process";
 import { type Dirent, readFileSync, writeFileSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -40,6 +41,7 @@ interface Media {
   attachmentKind?: string;
   imageBase64?: string;
   imageMime?: string;
+  transcript?: string;
 }
 
 interface Batch {
@@ -126,6 +128,38 @@ export function approvalPingTarget(
   awayTarget: { chatId: string; threadId?: number } | undefined,
 ): { chatId: string; threadId?: number } | undefined {
   return telegramActive ? activeTarget : awayTarget;
+}
+
+/** Replace every `{file}` placeholder without invoking a shell. */
+export function substituteFileArg(argv: readonly string[], file: string): string[] {
+  return argv.map((arg) => arg.replaceAll("{file}", file));
+}
+
+type RunTranscriber = (executable: string, args: readonly string[]) => Promise<string>;
+
+function runTranscriber(executable: string, args: readonly string[]): Promise<string> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  execFile(executable, [...args], { encoding: "utf8", timeout: 120_000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    if (err) reject(err);
+    else resolve(stdout);
+  });
+  return promise;
+}
+
+export async function transcribeVoice(
+  command: readonly string[],
+  file: string,
+  run: RunTranscriber = runTranscriber,
+): Promise<string> {
+  try {
+    const [executable, ...args] = substituteFileArg(command, file);
+    if (!executable) throw new Error("transcribeCommand is empty");
+    const transcript = (await run(executable, args)).trim();
+    if (!transcript) throw new Error("command produced no output");
+    return `[Voice transcript: ${transcript}]`;
+  } catch (err) {
+    return `[Voice transcription failed: ${err instanceof Error ? err.message : String(err)}]`;
+  }
 }
 function promptTargetFromMessage(message: TgMessage): PromptTarget | undefined {
   if (!message.from) return undefined;
@@ -740,7 +774,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (edited) attrs.push('edited="true"');
     if (media.attachmentPath) attrs.push(`attachment="${safeName(media.attachmentPath)}"`);
     if (media.attachmentKind) attrs.push(`attachment_kind="${safeName(media.attachmentKind)}"`);
-    const body = (text.length > 0 ? text : "(no text)").replace(/<\/telegram-message>/gi, "<\\/telegram-message>");
+    const messageText = [text, media.transcript].filter((part) => part && part.length > 0).join("\n\n");
+    const body = (messageText.length > 0 ? messageText : "(no text)").replace(/<\/telegram-message>/gi, "<\\/telegram-message>");
     let wrapper = `<telegram-message ${attrs.join(" ")}>\n${body}\n</telegram-message>`;
     if (!hintSent) {
       hintSent = true;
@@ -767,7 +802,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!doc) return {};
       if (doc.size != null && doc.size > INBOX_MAX_FILE_BYTES) return { attachmentKind: doc.kind }; // over the bot-download cap
       const path = await fetchToInbox(doc.file_id, doc.uniqueId, doc.name);
-      return path ? { attachmentPath: path, attachmentKind: doc.kind } : { attachmentKind: doc.kind };
+      if (!path) return { attachmentKind: doc.kind };
+      const transcript = doc.kind === "voice" && access.transcribeCommand
+        ? await transcribeVoice(access.transcribeCommand, path)
+        : undefined;
+      return { attachmentPath: path, attachmentKind: doc.kind, transcript };
     } catch (err) {
       log.debug(`[telegram] media download failed: ${String(err)}`);
       return {};
@@ -815,6 +854,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       `Groups: ${Object.keys(a.groups).length ? Object.keys(a.groups).join(", ") : "none"}`,
       `Streaming: ${a.streaming === false ? "off" : "on"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
       `Notify chat: ${a.notifyChat ?? "off"}`,
+      `Voice transcription: ${a.transcribeCommand?.length ? a.transcribeCommand.join(" ") : "off"}`,
       `Away: ${a.away ? "on" : "off"}`,
       `Control topic: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`,
     ];
@@ -1113,8 +1153,20 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     } else if (key === "streaming") {
       if (value !== "true" && value !== "false") return ctx.ui.notify("streaming: true | false", "warning");
       a.streaming = value === "true";
+    } else if (key === "transcribeCommand") {
+      if (!value) {
+        a.transcribeCommand = undefined;
+      } else {
+        try {
+          const arr: unknown = JSON.parse(value);
+          if (!Array.isArray(arr) || arr.length === 0 || !arr.every((arg) => typeof arg === "string")) throw new Error("not a command");
+          a.transcribeCommand = arr;
+        } catch {
+          return ctx.ui.notify('transcribeCommand: JSON argv array, e.g. ["whisper-cli","-f","{file}"] (empty value clears)', "warning");
+        }
+      }
     } else {
-      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming`, "warning");
+      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming, transcribeCommand`, "warning");
     }
     saveAccess(a);
     access = a;

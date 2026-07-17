@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
-import { approvalPingTarget, isTaskSubagent, parseTelegramPromptTarget } from "./index";
+import { approvalPingTarget, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -36,6 +36,25 @@ describe("approval ping targeting", () => {
     expect(approvalPingTarget(false, active, away)).toEqual(away);
     expect(approvalPingTarget(true, undefined, away)).toBeUndefined();
     expect(approvalPingTarget(false, undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe("voice transcription", () => {
+  test("substitutes every file placeholder in argv", () => {
+    expect(substituteFileArg(["transcribe", "--input={file}", "{file}"], "/tmp/voice note.ogg")).toEqual([
+      "transcribe",
+      "--input=/tmp/voice note.ogg",
+      "/tmp/voice note.ogg",
+    ]);
+  });
+
+  test("executes argv directly and returns visible success or failure text", async () => {
+    await expect(transcribeVoice(["/bin/echo", "{file}", "$(echo injected)"], "/tmp/voice note.ogg")).resolves.toBe(
+      "[Voice transcript: /tmp/voice note.ogg $(echo injected)]",
+    );
+    await expect(transcribeVoice(["missing", "{file}"], "/tmp/note.ogg", async () => {
+      throw new Error("transcriber offline");
+    })).resolves.toBe("[Voice transcription failed: transcriber offline]");
   });
 });
 

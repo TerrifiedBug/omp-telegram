@@ -44,6 +44,8 @@ export type Access = {
   deliverAs?: "steer" | "followUp";
   /** Stream partial output to Telegram (draft/edit). Default true. */
   streaming?: boolean;
+  /** Optional argv template for voice-note transcription. Each `{file}` substring is replaced with the downloaded path. */
+  transcribeCommand?: string[];
   /** Chat to ping when a locally-started run goes idle. Unset = off. Set via `/telegram notify`. */
   notifyChat?: string;
   /** Chat hosting per-session topics (a DM with the bot's forum-topic mode enabled, or a forum supergroup). Presence enables topics mode. Set via `/telegram topics`. */
@@ -189,6 +191,9 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       chunkMode: parsed.chunkMode,
       deliverAs: parsed.deliverAs,
       streaming: parsed.streaming,
+      transcribeCommand: Array.isArray(parsed.transcribeCommand) && parsed.transcribeCommand.every((arg) => typeof arg === "string")
+        ? parsed.transcribeCommand
+        : undefined,
       notifyChat: parsed.notifyChat,
       topicsChat: parsed.topicsChat,
       controlThreadId: parsed.controlThreadId,

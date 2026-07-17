@@ -51,13 +51,21 @@ describe("loadAccess field preservation", () => {
 
   // Regression: optional state once vanished during field-by-field rebuilds;
   // every persistent target/control field must survive the same load path.
-  test("round-trips notifyChat, topicsChat, controlThreadId, and away", () => {
-    saveAccess({ ...defaultAccess(), notifyChat: "1", topicsChat: "2", controlThreadId: 42, away: true });
+  test("round-trips notify, topic, control, away, and transcription fields", () => {
+    saveAccess({
+      ...defaultAccess(),
+      notifyChat: "1",
+      topicsChat: "2",
+      controlThreadId: 42,
+      away: true,
+      transcribeCommand: ["whisper-cli", "-f", "{file}"],
+    });
     const a = loadAccess();
     expect(a.notifyChat).toBe("1");
     expect(a.topicsChat).toBe("2");
     expect(a.controlThreadId).toBe(42);
     expect(a.away).toBe(true);
+    expect(a.transcribeCommand).toEqual(["whisper-cli", "-f", "{file}"]);
   });
 
   test("absent optional fields load as undefined", () => {
@@ -67,5 +75,6 @@ describe("loadAccess field preservation", () => {
     expect(a.topicsChat).toBeUndefined();
     expect(a.controlThreadId).toBeUndefined();
     expect(a.away).toBeUndefined();
+    expect(a.transcribeCommand).toBeUndefined();
   });
 });
