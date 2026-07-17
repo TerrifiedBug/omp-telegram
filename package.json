@@ -1,7 +1,7 @@
 {
   "name": "omp-telegram",
-  "version": "0.1.1",
-  "description": "Owner-controlled Telegram bridge and herdr control plane for omp sessions",
+  "version": "0.2.0",
+  "description": "Standalone Telegram bridge, session topics, and herdr control plane for omp",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -48,7 +48,7 @@
     ]
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "^16.3.12",
+    "@oh-my-pi/pi-coding-agent": "^17.0.0",
     "typescript": "^5.7.0",
     "@types/node": "^22.0.0"
   },

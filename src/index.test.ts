@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
-import { approvalPingTarget, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
+import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -55,6 +55,25 @@ describe("voice transcription", () => {
     await expect(transcribeVoice(["missing", "{file}"], "/tmp/note.ogg", async () => {
       throw new Error("transcriber offline");
     })).resolves.toBe("[Voice transcription failed: transcriber offline]");
+  });
+});
+
+describe("Telegram doctor", () => {
+  test("reports degraded checks without hiding later sections", async () => {
+    const report = await collectDoctorReport([
+      { label: "Token", run: async () => { throw new Error("offline"); } },
+      { label: "Daemon", run: () => "Daemon: pid 42 · dead" },
+      { label: "Herdr", run: () => { throw new Error("not installed"); } },
+      { label: "Inbox", run: () => "Inbox: 3 files · 99 bytes" },
+    ]);
+
+    expect(report).toEqual([
+      "Telegram doctor",
+      "Token: probe failed: offline",
+      "Daemon: pid 42 · dead",
+      "Herdr: probe failed: not installed",
+      "Inbox: 3 files · 99 bytes",
+    ]);
   });
 });
 

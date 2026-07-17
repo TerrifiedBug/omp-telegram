@@ -4,9 +4,9 @@
 // is user-managed through the /telegram command and never via the model.
 
 import { execFile } from "node:child_process";
-import { type Dirent, readFileSync, writeFileSync } from "node:fs";
-import { readFile, readdir, stat } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { constants, type Dirent, readFileSync, writeFileSync } from "node:fs";
+import { access as fsAccess, readFile, readdir, stat } from "node:fs/promises";
+import { basename, delimiter, extname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
   type Access,
@@ -160,6 +160,61 @@ export async function transcribeVoice(
   } catch (err) {
     return `[Voice transcription failed: ${err instanceof Error ? err.message : String(err)}]`;
   }
+}
+
+export interface DoctorCheck {
+  label: string;
+  run: () => string | readonly string[] | Promise<string | readonly string[]>;
+}
+
+/** Run every diagnostic independently so one broken subsystem cannot hide the rest. */
+export async function collectDoctorReport(checks: readonly DoctorCheck[]): Promise<string[]> {
+  const lines = ["Telegram doctor"];
+  for (const check of checks) {
+    try {
+      const result = await check.run();
+      lines.push(...(typeof result === "string" ? [result] : result));
+    } catch (err) {
+      lines.push(`${check.label}: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return lines;
+}
+
+async function inspectStateFile(name: string, parseJson: boolean): Promise<string> {
+  const file = statePath(name);
+  try {
+    const info = await stat(file);
+    const mode = info.mode & 0o777;
+    let suffix = `mode 0${mode.toString(8)}${mode & 0o077 ? " INSECURE" : " ok"}`;
+    if (parseJson) {
+      try {
+        JSON.parse(await readFile(file, "utf8"));
+        suffix += " · JSON ok";
+      } catch {
+        suffix += " · INVALID JSON";
+      }
+    }
+    return `${name}: ${suffix}`;
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return `${name}: missing`;
+    throw err;
+  }
+}
+
+async function executableAvailable(executable: string): Promise<boolean> {
+  const candidates = isAbsolute(executable) || executable.includes("/")
+    ? [resolve(executable)]
+    : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, executable));
+  for (const candidate of candidates) {
+    try {
+      await fsAccess(candidate, constants.X_OK);
+      return true;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return false;
 }
 function promptTargetFromMessage(message: TgMessage): PromptTarget | undefined {
   if (!message.from) return undefined;
@@ -921,76 +976,99 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   }
 
   async function cmdDoctor(ctx: ExtensionContext): Promise<void> {
-    const currentAccess = loadAccess(warn);
+    const currentAccess = access;
     const currentToken = resolveToken();
-    const lines = ["Telegram doctor"];
-
-    if (!currentToken) {
-      lines.push("Token: missing", "Webhook: skipped (token missing)");
-    } else {
-      try {
-        const me = await tg<{ username: string; has_topics_enabled?: boolean }>(currentToken, "getMe");
-        const topicMode = me.has_topics_enabled === undefined ? "unknown" : me.has_topics_enabled ? "on" : "off";
-        lines.push(`Token: present · getMe ok @${me.username} · DM topics ${topicMode}`);
-      } catch (err) {
-        lines.push(`Token: present · getMe failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      try {
-        lines.push(`Webhook: ${(await webhookConflictHint(currentToken)) ?? "none"}`);
-      } catch (err) {
-        lines.push(`Webhook: probe failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    try {
-      const rawPid = readFileSync(lockPath, "utf8").trim();
-      const pid = Number(rawPid);
-      lines.push(Number.isInteger(pid) && pid > 1 ? `Poll lock: pid ${pid} · ${isAlive(pid) ? "alive" : "dead"}` : `Poll lock: malformed (${rawPid || "empty"})`);
-    } catch (err) {
-      lines.push(err && typeof err === "object" && "code" in err && err.code === "ENOENT" ? "Poll lock: none" : `Poll lock: probe failed: ${String(err)}`);
-    }
-
-    try {
-      const state = readDaemonState();
-      lines.push(`Daemon: ${state && daemonAlive(state) ? `pid ${state.pid} · v${state.version} · alive` : daemonDisableReason(currentAccess, currentToken) ?? (state ? `pid ${state.pid} · dead` : "not running")}`);
-    } catch (err) {
-      lines.push(`Daemon: probe failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    try {
-      const registry = loadRegistry(warn);
-      const liveOwners = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
-      lines.push(
-        `Topics: chat ${currentAccess.topicsChat ?? "off"} · control ${currentAccess.controlThreadId != null ? `#${currentAccess.controlThreadId}` : "none"} · ${Object.keys(registry.threads).length} topics, ${liveOwners} live owners`,
-      );
-    } catch (err) {
-      lines.push(`Topics: probe failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    try {
-      const spaces = await listControlSpaces();
-      lines.push(`Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · ${spaces.length} spaces`);
-    } catch (err) {
-      lines.push(`Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · probe failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    try {
-      const inbox = statePath("inbox");
-      let entries: Dirent[];
-      try {
-        entries = await readdir(inbox, { withFileTypes: true });
-      } catch (err) {
-        if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) throw err;
-        entries = [];
-      }
-      const files = entries.filter((entry) => entry.isFile());
-      const sizes = await Promise.all(files.map((entry) => stat(join(inbox, entry.name))));
-      lines.push(`Inbox: ${files.length} files · ${sizes.reduce((total, info) => total + info.size, 0)} bytes`);
-    } catch (err) {
-      lines.push(`Inbox: probe failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    ctx.ui.notify(lines.join("\n"), "info");
+    const checks: DoctorCheck[] = [
+      {
+        label: "Token",
+        run: async () => {
+          if (!currentToken) return "Token: missing";
+          const me = await tg<{ username: string; has_topics_enabled?: boolean }>(currentToken, "getMe");
+          const topicMode = me.has_topics_enabled === undefined ? "unknown" : me.has_topics_enabled ? "on" : "off";
+          return `Token: present · getMe ok @${me.username} · DM topics ${topicMode}`;
+        },
+      },
+      {
+        label: "Webhook",
+        run: async () => currentToken ? `Webhook: ${(await webhookConflictHint(currentToken)) ?? "none"}` : "Webhook: skipped (token missing)",
+      },
+      {
+        label: "Poll lock",
+        run: () => {
+          try {
+            const rawPid = readFileSync(lockPath, "utf8").trim();
+            const pid = Number(rawPid);
+            return Number.isInteger(pid) && pid > 1
+              ? `Poll lock: pid ${pid} · ${isAlive(pid) ? "alive" : "dead"}`
+              : `Poll lock: malformed (${rawPid || "empty"})`;
+          } catch (err) {
+            if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return "Poll lock: none";
+            throw err;
+          }
+        },
+      },
+      {
+        label: "Daemon",
+        run: () => {
+          const state = readDaemonState();
+          return `Daemon: ${state && daemonAlive(state)
+            ? `pid ${state.pid} · v${state.version} · alive`
+            : daemonDisableReason(currentAccess, currentToken) ?? (state ? `pid ${state.pid} · dead` : "not running")}`;
+        },
+      },
+      {
+        label: "State",
+        run: async () => {
+          const files = await Promise.all([
+            inspectStateFile(".env", false),
+            inspectStateFile("access.json", true),
+            inspectStateFile("threads.json", true),
+            inspectStateFile("daemon.json", true),
+          ]);
+          return [`State: ${statePath(".")}`, ...files.map((line) => `  ${line}`)];
+        },
+      },
+      {
+        label: "Topics",
+        run: () => {
+          const registry = loadRegistry(warn);
+          const liveOwners = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
+          return `Topics: chat ${currentAccess.topicsChat ?? "off"} · control ${currentAccess.controlThreadId != null ? `#${currentAccess.controlThreadId}` : "none"} · ${Object.keys(registry.threads).length} topics, ${liveOwners} live owners`;
+        },
+      },
+      {
+        label: "Transcriber",
+        run: async () => {
+          const executable = currentAccess.transcribeCommand?.[0];
+          if (!executable) return "Transcriber: off";
+          return `Transcriber: ${executable} · ${await executableAvailable(executable) ? "available" : "not found"}`;
+        },
+      },
+      {
+        label: "Herdr",
+        run: async () => {
+          const spaces = await listControlSpaces();
+          return `Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · ${spaces.length} spaces`;
+        },
+      },
+      {
+        label: "Inbox",
+        run: async () => {
+          const inbox = statePath("inbox");
+          let entries: Dirent[];
+          try {
+            entries = await readdir(inbox, { withFileTypes: true });
+          } catch (err) {
+            if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) throw err;
+            entries = [];
+          }
+          const files = entries.filter((entry) => entry.isFile());
+          const sizes = await Promise.all(files.map((entry) => stat(join(inbox, entry.name))));
+          return `Inbox: ${files.length} files · ${sizes.reduce((total, info) => total + info.size, 0)} bytes`;
+        },
+      },
+    ];
+    ctx.ui.notify((await collectDoctorReport(checks)).join("\n"), "info");
   }
 
   async function cmdToken(ctx: ExtensionContext, arg: string): Promise<void> {
@@ -1524,7 +1602,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       void outbound
         .send(
           pending.chatId,
-          `⏳ omp is waiting for approval: ${event.toolName}${reason}\nApprove at the terminal — remote approval isn't supported.`,
+          `[WAIT] omp is waiting for approval: ${event.toolName}${reason}\nApprove at the terminal — remote approval isn't supported.`,
           { threadId: pending.threadId },
         )
         .then(async (ids) => {
@@ -1534,7 +1612,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
             await tg(token, "editMessageText", {
               chat_id: pending.chatId,
               message_id: pending.messageId,
-              text: `${pending.approved ? "✔" : "✖"} ${pending.toolName} ${pending.approved ? "approved" : "denied"}`,
+              text: `${pending.approved ? "[APPROVED]" : "[DENIED]"} ${pending.toolName}`,
             }).catch(() => {});
             pendingApprovals.delete(event.toolCallId);
           }
@@ -1565,7 +1643,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     void tg(token, "editMessageText", {
       chat_id: pending.chatId,
       message_id: pending.messageId,
-      text: `${event.approved ? "✔" : "✖"} ${event.toolName} ${event.approved ? "approved" : "denied"}`,
+      text: `${event.approved ? "[APPROVED]" : "[DENIED]"} ${event.toolName}`,
     }).catch(() => {});
   });
   pi.on("message_update", (e, ctx) => {
