@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { TgError, downloadFileBytes, tg } from "./api";
+import { Poller, TgError, downloadFileBytes, tg, webhookConflictHint } from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -49,5 +49,61 @@ describe("Telegram Bot API transport", () => {
 
     globalThis.fetch = (async () => new Response("missing", { status: 404 })) as typeof fetch;
     await expect(downloadFileBytes("secret", "documents/missing.bin")).rejects.toMatchObject({ code: 404 });
+  });
+
+  test("reports a configured webhook as the likely polling conflict", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, result: { url: "https://example.test/hook" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+
+    await expect(webhookConflictHint("secret")).resolves.toContain("https://example.test/hook");
+  });
+
+  test("returns no conflict hint when webhook delivery is disabled", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, result: { url: "" } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+
+    await expect(webhookConflictHint("secret")).resolves.toBeUndefined();
+  });
+
+  test("polls edited messages and advances the update offset", async () => {
+    const payloads: Array<Record<string, unknown>> = [];
+    const poller = new Poller();
+    globalThis.fetch = (async (_url, init) => {
+      payloads.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (payloads.length > 1) {
+        poller.stop();
+        return new Response(JSON.stringify({ ok: true, result: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: [{ update_id: 12, edited_message: { message_id: 1, date: 1, chat: { id: 42, type: "private" }, text: "edited" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+    let handled = false;
+
+    poller.start(
+      "secret",
+      (update) => {
+        handled = update.edited_message?.text === "edited";
+      },
+      () => {},
+    );
+    await poller.done();
+
+    expect(handled).toBe(true);
+    expect(payloads[0].allowed_updates).toEqual(["message", "edited_message", "callback_query"]);
+    expect(payloads[1].offset).toBe(13);
   });
 });

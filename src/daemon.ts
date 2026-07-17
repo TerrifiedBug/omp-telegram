@@ -17,7 +17,7 @@ import {
   resolveToken,
   statePath,
 } from "./access";
-import { acquireLock, type Logger, Poller, releaseLock, tg } from "./api";
+import { acquireLock, type Logger, Poller, releaseLock, tg, webhookConflictHint } from "./api";
 import { BOT_COMMANDS, type BridgeHost, ensureControlTopic, handleUpdate } from "./bridge";
 import { SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
@@ -175,7 +175,7 @@ export async function runDaemon(): Promise<void> {
   const lockPath = statePath("bot.lock");
   let poller: Poller | undefined;
   let stopping = false;
-  let fatalReason: string | undefined;
+  let fatalState: { reason?: string } = {};
   let fatalBackoff = 60_000;
 
   const cleanup = (): void => {
@@ -245,12 +245,12 @@ export async function runDaemon(): Promise<void> {
       await callTelegram("setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } }).catch(() => {});
       await ensureControlTopic(host).catch((err) => log.warn(`[telegram daemon] control topic creation failed: ${String(err)}`));
       poller = new Poller();
-      fatalReason = undefined;
+      fatalState = {};
       poller.start(
         token,
         (update) => handleUpdate(host, update),
         (reason) => {
-          fatalReason = reason;
+          fatalState.reason = reason;
           releaseLock(lockPath);
         },
         log,
@@ -267,8 +267,17 @@ export async function runDaemon(): Promise<void> {
       clearInterval(gateTimer);
       releaseLock(lockPath);
       if (stopping) break;
-      if (fatalReason) {
-        log.warn(`[telegram daemon] poller stopped: ${fatalReason}; retrying in ${fatalBackoff}ms`);
+      const stoppedReason = fatalState.reason;
+      if (stoppedReason) {
+        if (stoppedReason.includes("409")) {
+          try {
+            const hint = await webhookConflictHint(token);
+            if (hint) log.warn(`[telegram daemon] ${hint}`);
+          } catch (err) {
+            log.debug(`[telegram daemon] webhook diagnosis failed: ${String(err)}`);
+          }
+        }
+        log.warn(`[telegram daemon] poller stopped: ${stoppedReason}; retrying in ${fatalBackoff}ms`);
         await sleep(fatalBackoff);
         fatalBackoff = Math.min(fatalBackoff * 2, 300_000);
       } else {

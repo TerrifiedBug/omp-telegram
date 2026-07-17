@@ -93,4 +93,56 @@ describe("Outbound Telegram delivery", () => {
     expect(outbound.isActive()).toBe(false);
     outbound.shutdown();
   });
+
+  test("retries a tool send once in a replacement topic", async () => {
+    const threads: number[] = [];
+    globalThis.fetch = (async (_url, init) => {
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      threads.push(Number(payload.message_thread_id));
+      if (payload.message_thread_id === 9) {
+        return new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 30 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"] }));
+    outbound.setToken("secret");
+    const recovered: number[] = [];
+    outbound.setMissingThreadHandler(async (_chatId, threadId) => {
+      recovered.push(threadId);
+      return 10;
+    });
+
+    await expect(outbound.send("42", "answer", { threadId: 9 })).resolves.toEqual([30]);
+    expect(recovered).toEqual([9]);
+    expect(threads).toEqual([9, 10]);
+    outbound.shutdown();
+  });
+
+  test("rekeys active turn state before retrying final output", async () => {
+    const threads: number[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") {
+        threads.push(Number(payload.message_thread_id));
+        if (payload.message_thread_id === 9) {
+          return new Response(JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), { status: 200 });
+        }
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 31 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }));
+    outbound.setToken("secret");
+    outbound.setMissingThreadHandler(async () => 10);
+    outbound.markActive("42", 9);
+
+    await outbound.onTurnEnd(assistant("done"));
+
+    expect(threads).toEqual([9, 10]);
+    expect(outbound.lastTarget()).toEqual({ chatId: "42", threadId: 10 });
+    await outbound.onAgentEnd();
+    outbound.shutdown();
+  });
 });

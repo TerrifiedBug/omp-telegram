@@ -403,15 +403,17 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
     await host.spawnController.handleCallback(update.callback_query);
     return;
   }
-  const msg = update.message;
-  if (!msg || msg.from?.is_bot) return;
+  const source = update.message ?? update.edited_message;
+  if (!source || source.from?.is_bot) return;
+  const edited = update.message == null;
+  const msg = edited ? { ...source, edited_flag: true as const } : source;
   const access = loadAccess(host.warn);
   if (access.controlThreadId == null && access.topicsChat === pairedOwnerId(access)) {
     await ensureControlTopic(host).catch((err) => host.warn(`could not create control topic: ${String(err)}`));
   }
   if (await host.promptController.handleMessage(msg)) return;
 
-  const parsed = parseBotCommand(msg.text ?? "");
+  const parsed = edited ? undefined : parseBotCommand(msg.text ?? "");
   if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name)) return;
   if (msg.chat.type === "private" && parsed && Object.hasOwn(GLOBAL_COMMANDS, parsed.name) && (await handleGlobalCommand(host, msg, parsed))) return;
 

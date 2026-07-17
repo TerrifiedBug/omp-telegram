@@ -7,7 +7,7 @@
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { type Access, assertSendable } from "./access";
-import { type Logger, TgError, tg, tgUpload } from "./api";
+import { isMissingThreadError, type Logger, TgError, tg, tgUpload } from "./api";
 import { MARKDOWN_HEADROOM, TELEGRAM_MAX_CHARS, chunk, mdToMarkdownV2 } from "./markdown";
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
@@ -86,6 +86,7 @@ export class Outbound {
   readonly #active = new Set<string>();
   #draftUnsupported = false;
   #lastTarget: { chatId: string; threadId?: number } | undefined;
+  #missingThreadHandler?: (chatId: string, threadId: number) => Promise<number | undefined>;
 
   constructor(getAccess: () => Access, log?: Logger) {
     this.#getAccess = getAccess;
@@ -94,6 +95,10 @@ export class Outbound {
 
   setToken(token: string): void {
     this.#token = token;
+  }
+
+  setMissingThreadHandler(handler: (chatId: string, threadId: number) => Promise<number | undefined>): void {
+    this.#missingThreadHandler = handler;
   }
 
   hasToken(): boolean {
@@ -193,9 +198,20 @@ export class Outbound {
     const replyMode = access.replyToMode ?? "first";
     const useMd = (opts?.format ?? "markdown") === "markdown";
     const ids: number[] = [];
+    let threadId = opts?.threadId;
+    let recovered = false;
     for (let i = 0; i < parts.length; i++) {
-      const thread = this.#threadTarget(opts?.replyTo, replyMode, i);
-      ids.push(await this.#sendOne(chatId, parts[i], useMd, thread, opts?.threadId));
+      const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
+      try {
+        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+      } catch (err) {
+        if (recovered || threadId == null || !isMissingThreadError(err)) throw err;
+        const replacement = await this.#recoverMissingThread(chatId, threadId);
+        if (replacement == null) throw err;
+        recovered = true;
+        threadId = replacement;
+        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+      }
     }
     return ids;
   }
@@ -204,25 +220,38 @@ export class Outbound {
   async sendFiles(chatId: string, files: string[], replyTo?: number, threadId?: number): Promise<number[]> {
     const replyMode = this.#getAccess().replyToMode ?? "first";
     const ids: number[] = [];
+    let targetThreadId = threadId;
+    let recovered = false;
     for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      assertSendable(f);
-      const info = await stat(f);
+      const file = files[i];
+      assertSendable(file);
+      const info = await stat(file);
       if (info.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`file too large: ${f} (${(info.size / 1048576).toFixed(1)}MB, max 50MB)`);
+        throw new Error(`file too large: ${file} (${(info.size / 1048576).toFixed(1)}MB, max 50MB)`);
       }
-      const isPhoto = PHOTO_EXTS.has(extname(f).toLowerCase());
-      const fields: Record<string, string | number | undefined> = { chat_id: chatId };
-      if (threadId != null) fields.message_thread_id = threadId;
-      const thread = this.#threadTarget(replyTo, replyMode, i);
-      if (thread != null) fields.reply_parameters = JSON.stringify({ message_id: thread });
-      const sent = await tgUpload<{ message_id: number }>(
-        this.#token,
-        isPhoto ? "sendPhoto" : "sendDocument",
-        fields,
-        { field: isPhoto ? "photo" : "document", path: f },
-      );
-      ids.push(sent.message_id);
+      const isPhoto = PHOTO_EXTS.has(extname(file).toLowerCase());
+      const upload = async (destinationThreadId: number | undefined): Promise<{ message_id: number }> => {
+        const fields: Record<string, string | number | undefined> = { chat_id: chatId };
+        if (destinationThreadId != null) fields.message_thread_id = destinationThreadId;
+        const reply = this.#threadTarget(replyTo, replyMode, i);
+        if (reply != null) fields.reply_parameters = JSON.stringify({ message_id: reply });
+        return tgUpload<{ message_id: number }>(
+          this.#token,
+          isPhoto ? "sendPhoto" : "sendDocument",
+          fields,
+          { field: isPhoto ? "photo" : "document", path: file },
+        );
+      };
+      try {
+        ids.push((await upload(targetThreadId)).message_id);
+      } catch (err) {
+        if (recovered || targetThreadId == null || !isMissingThreadError(err)) throw err;
+        const replacement = await this.#recoverMissingThread(chatId, targetThreadId);
+        if (replacement == null) throw err;
+        recovered = true;
+        targetThreadId = replacement;
+        ids.push((await upload(targetThreadId)).message_id);
+      }
     }
     return ids;
   }
@@ -331,14 +360,14 @@ export class Outbound {
         await tg(this.#token, "editMessageText", { chat_id: st.chatId, message_id: id, text: mdToMarkdownV2(text), parse_mode: "MarkdownV2" });
         return;
       } catch (err) {
-        if (!(err instanceof TgError && err.code === 400)) throw err;
+        if (isMissingThreadError(err) || !(err instanceof TgError && err.code === 400)) throw err;
       }
     }
     await tg(this.#token, "editMessageText", { chat_id: st.chatId, message_id: id, text });
   }
 
   /** Finalize one turn into real message(s), then reset per-turn state. */
-  async #finalize(st: ChatState, fullText: string): Promise<void> {
+  async #finalize(st: ChatState, fullText: string, allowRecovery = true): Promise<void> {
     if (st.inflight) await st.inflight.catch(() => {}); // barrier: let any in-flight push settle
     const access = this.#getAccess();
     const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
@@ -361,10 +390,41 @@ export class Outbound {
         }
       }
     } catch (err) {
+      if (allowRecovery && st.threadId != null && isMissingThreadError(err)) {
+        try {
+          const replacement = await this.#recoverMissingThread(st.chatId, st.threadId, st);
+          if (replacement != null) {
+            st.previewMsgId = undefined;
+            st.draftId = undefined;
+            st.sentUpTo = 0;
+            await this.#finalize(st, fullText, false);
+            return;
+          }
+        } catch (recoveryError) {
+          this.#log?.warn(`[telegram] topic recovery failed ${st.chatId}: ${String(recoveryError)}`);
+        }
+      }
       this.#log?.warn(`[telegram] finalize failed ${st.chatId}: ${String(err)}`);
     } finally {
       this.#resetTurn(st);
     }
+  }
+
+  async #recoverMissingThread(chatId: string, threadId: number, state?: ChatState): Promise<number | undefined> {
+    const replacement = await this.#missingThreadHandler?.(chatId, threadId);
+    if (replacement == null) return undefined;
+    const oldKey = targetKey(chatId, threadId);
+    const current = state ?? this.#chats.get(oldKey);
+    if (current) {
+      if (this.#chats.get(oldKey) === current) this.#chats.delete(oldKey);
+      current.threadId = replacement;
+      this.#chats.set(targetKey(chatId, replacement), current);
+    }
+    if (this.#active.delete(oldKey)) this.#active.add(targetKey(chatId, replacement));
+    if (this.#lastTarget?.chatId === chatId && this.#lastTarget.threadId === threadId) {
+      this.#lastTarget = { chatId, threadId: replacement };
+    }
+    return replacement;
   }
 
   async #sendOne(chatId: string, text: string, useMd: boolean, replyTo: number | undefined, threadId?: number): Promise<number> {
@@ -381,7 +441,7 @@ export class Outbound {
         });
         return sent.message_id;
       } catch (err) {
-        if (!(err instanceof TgError && err.code === 400)) throw err;
+        if (isMissingThreadError(err) || !(err instanceof TgError && err.code === 400)) throw err;
       }
     }
     const sent = await tg<{ message_id: number }>(this.#token, "sendMessage", { chat_id: chatId, text, ...thread, ...reply });

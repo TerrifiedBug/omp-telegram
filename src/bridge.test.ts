@@ -125,4 +125,24 @@ describe("shared bridge routing", () => {
 
     expect(calls.at(-1)?.payload.text).toBe("Run /stop inside a session topic.");
   });
+
+  test("delivers edited commands as agent turns instead of executing them", async () => {
+    const sessionCommands: string[] = [];
+    const delivered: TgMessage[] = [];
+    const host = makeHost({
+      isDaemon: false,
+      selfPid: process.pid,
+      handleSessionCommand: async (_msg, parsed) => {
+        sessionCommands.push(parsed.name);
+        return true;
+      },
+      deliverLocal: async (msg) => void delivered.push(msg),
+    });
+
+    await handleUpdate(host, { update_id: 6, edited_message: message("/stop") });
+
+    expect(sessionCommands).toEqual([]);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].edited_flag).toBe(true);
+  });
 });

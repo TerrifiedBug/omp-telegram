@@ -24,7 +24,7 @@ import {
   saveAccess,
   statePath,
 } from "./access";
-import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg } from "./api";
+import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg, webhookConflictHint } from "./api";
 import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand } from "./bridge";
 import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
@@ -188,6 +188,15 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       await deliver(msg);
     },
   };
+  outbound.setMissingThreadHandler(async (_chatId, threadId) => {
+    if (!ownTopic || threadId !== ownTopic.threadId) return undefined;
+    releaseThread(threadId, process.pid, warn);
+    ownTopic = undefined;
+    stopWatch?.();
+    stopWatch = undefined;
+    await ensureTopic(lastCtx);
+    return bridgeHost.ownThreadId();
+  });
 
   function notifyOnce(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error"): void {
     if (notified.has(message)) return;
@@ -213,6 +222,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     warn(`poller stopped: ${reason}`);
     lastCtx?.ui.notify(`telegram: ${reason}`, "error");
     releaseLock(lockPath);
+    if (reason.includes("409")) {
+      void webhookConflictHint(token)
+        .then((hint) => {
+          if (!hint) return;
+          warn(hint);
+          lastCtx?.ui.notify(`telegram: ${hint}`, "warning");
+        })
+        .catch((err) => log.debug(`[telegram] webhook diagnosis failed: ${String(err)}`));
+    }
+    armLockRetry(lastCtx, false, 60_000);
   }
 
   async function acquireAndLaunch(ctx: ExtensionContext | undefined, announce: boolean): Promise<boolean> {
@@ -246,6 +265,15 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     return true;
   }
 
+  function armLockRetry(ctx: ExtensionContext | undefined, announce: boolean, intervalMs = 30_000): void {
+    if (lockRetryTimer) return;
+    lockRetryTimer = setInterval(() => {
+      if (poller.running) return;
+      void acquireAndLaunch(ctx, announce).catch((err) => warn(`lock retry failed: ${String(err)}`));
+    }, intervalMs);
+    lockRetryTimer.unref?.();
+  }
+
   async function startBot(ctx: ExtensionContext | undefined, announce = false): Promise<void> {
     if (poller.running) return;
     token = resolveToken();
@@ -257,13 +285,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     outbound.setToken(token); // outbound (telegram_send/react, idle pings) works even when another session holds the poll lock
     await ensureTopic(ctx);
     const launched = daemon === "alive" || daemon === "spawned" ? false : await acquireAndLaunch(ctx, announce);
-    if (!launched && !lockRetryTimer) {
-      lockRetryTimer = setInterval(() => {
-        if (poller.running) return;
-        void acquireAndLaunch(ctx, announce).catch((e) => warn(`lock retry failed: ${String(e)}`));
-      }, 30_000);
-      lockRetryTimer.unref?.();
-    }
+    if (!launched) armLockRetry(ctx, announce);
   }
 
   function stopBot(): void {
@@ -635,9 +657,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
     // Media messages inject immediately; text-only messages batch (Telegram splits
     // long pastes into consecutive messages within a moment of each other).
-    if (media.attachmentKind || media.imageBase64) {
+    if (msg.edited_flag || media.attachmentKind || media.imageBase64) {
       flushBatch(key);
-      await injectMessage(chatId, threadId, msg.chat.type, msg.from, msg.message_id, msg.date, rawText, media);
+      await injectMessage(chatId, threadId, msg.chat.type, msg.from, msg.message_id, msg.date, rawText, media, msg.edited_flag === true);
       return;
     }
     const existing = batches.get(key);
@@ -672,7 +694,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     clearTimeout(b.timer);
     batches.delete(key);
     const [chatId] = key.split(":");
-    void injectMessage(chatId, b.threadId, b.chatType, b.from, b.lastMessageId, b.lastTs, b.parts.join("\n"), {});
+    void injectMessage(chatId, b.threadId, b.chatType, b.from, b.lastMessageId, b.lastTs, b.parts.join("\n"), {}, false);
   }
 
   async function injectMessage(
@@ -684,6 +706,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ts: number,
     text: string,
     media: Media,
+    edited: boolean,
   ): Promise<void> {
     const attrs = [
       `chat_id="${safeName(chatId)}"`,
@@ -694,6 +717,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       `ts="${new Date((ts || 0) * 1000).toISOString()}"`,
     ];
     if (threadId != null) attrs.push(`thread_id="${threadId}"`);
+    if (edited) attrs.push('edited="true"');
     if (media.attachmentPath) attrs.push(`attachment="${safeName(media.attachmentPath)}"`);
     if (media.attachmentKind) attrs.push(`attachment_kind="${safeName(media.attachmentKind)}"`);
     const body = (text.length > 0 ? text : "(no text)").replace(/<\/telegram-message>/gi, "<\\/telegram-message>");
