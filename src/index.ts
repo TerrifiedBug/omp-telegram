@@ -3,45 +3,36 @@
 // back via draft/edit streaming. Access control (pairing, allowlists, groups)
 // is user-managed through the /telegram command and never via the model.
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { execFile } from "node:child_process";
+import { constants, type Dirent, readFileSync, writeFileSync } from "node:fs";
+import { access as fsAccess, readFile, readdir, stat } from "node:fs/promises";
+import { basename, delimiter, extname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
   type Access,
   assertAllowedChat,
-  controlTopicCreationChat,
+  awayNotifyTarget,
+  canAnswerPrompt,
   defaultAccess,
   ensureStateDir,
   gate,
-  awayNotifyTarget,
   isDmChat,
   isPairedOwnerDm,
   loadAccess,
   pairedOwnerId,
   resolveDmTopicsHost,
+  resolveToken,
   saveAccess,
   statePath,
 } from "./access";
-import { type TgFile, type TgMessage, type TgUpdate, type TgUser, Poller, TgError, acquireLock, downloadFileBytes, releaseLock, tg } from "./api";
-import { SpawnController, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage } from "./control";
+import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg, webhookConflictHint } from "./api";
+import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand } from "./bridge";
+import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
+import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
-import {
-  type ThreadEntry,
-  type ThreadRegistry,
-  claimThread,
-  decideRoute,
-  findAdoptableThread,
-  isAlive,
-  isResumedOwner,
-  loadRegistry,
-  releaseThread,
-  saveRegistry,
-  watchRoute,
-  writeRouted,
-} from "./topics";
+import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, releaseThread, watchRoute } from "./topics";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -50,6 +41,7 @@ interface Media {
   attachmentKind?: string;
   imageBase64?: string;
   imageMime?: string;
+  transcript?: string;
 }
 
 interface Batch {
@@ -81,70 +73,24 @@ interface AskParams {
 }
 
 
-
-const BOT_COMMANDS = [
-  { command: "start", description: "Pairing instructions" },
-  { command: "spawn", description: "Start omp in a herdr space" },
-  { command: "sessions", description: "List active omp sessions" },
-  { command: "cleanup", description: "Delete stale and duplicate omp topics" },
-  { command: "stop", description: "Abort this topic's omp task" },
-  { command: "compact", description: "Compact this session's context" },
-  { command: "model", description: "Show or change this session's model" },
-  { command: "switch", description: "Choose this session's model" },
-  { command: "thinking", description: "Show or change thinking level" },
-  { command: "status", description: "Bridge and session health" },
-  { command: "help", description: "Show available commands" },
-  { command: "whoami", description: "Show your Telegram IDs" },
-];
-const KNOWN_COMMANDS = new Set(BOT_COMMANDS.map((c) => c.command));
-const GLOBAL_COMMANDS: Record<string, true> = {
-  start: true,
-  spawn: true,
-  sessions: true,
-  cleanup: true,
-  status: true,
-  help: true,
-  whoami: true,
-};
-
-/** Known bot commands are control-plane input and never become group agent turns. */
-export function consumeOutsidePrivateChat(chatType: string, command: string): boolean {
-  return chatType !== "private" && KNOWN_COMMANDS.has(command);
+interface PendingApproval {
+  toolName: string;
+  chatId: string;
+  threadId?: number;
+  timer?: NodeJS.Timeout;
+  messageId?: number;
+  resolved?: boolean;
+  approved?: boolean;
 }
 
-/** Telegram's definitive signal that a locally saved forum topic was deleted. */
-export function isMissingThreadError(err: unknown): boolean {
-  return err instanceof TgError && err.code === 400 && /message thread not found/i.test(err.message);
-}
+
 
 /** Task sessions are headless and always carry the required yield tool. */
 export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): boolean {
   return !hasUI && activeTools.includes("yield");
 }
 
-/** Delete stale topics and same-process extras while preserving live sibling sessions. */
-export async function cleanupRegisteredTopics(
-  registry: ThreadRegistry,
-  keepThreadId: number,
-  selfPid: number,
-  alive: (pid: number) => boolean,
-  deleteTopic: (threadId: number) => Promise<void>,
-): Promise<{ deletedThreadIds: number[]; failed: number }> {
-  const deletedThreadIds: number[] = [];
-  let failed = 0;
-  for (const [threadIdText, entry] of Object.entries(registry.threads)) {
-    const threadId = Number(threadIdText);
-    if (threadId === keepThreadId || (entry.pid !== selfPid && alive(entry.pid))) continue;
-    try {
-      await deleteTopic(threadId);
-      deletedThreadIds.push(threadId);
-    } catch {
-      failed++;
-    }
-  }
-  return { deletedThreadIds, failed };
-}
-const SUBCOMMANDS = ["status", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
+const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
 const BATCH_WINDOW_MS = 800;
 const THINKING_LEVELS: Record<string, true> = {
   inherit: true,
@@ -173,6 +119,102 @@ export function parseTelegramPromptTarget(prompt: string): PromptTarget | undefi
   const threadId = rawThread == null ? undefined : Number(rawThread);
   if (rawThread != null && !Number.isInteger(threadId)) return undefined;
   return { responderId, chatId, chatType, ...(threadId == null ? {} : { threadId }) };
+}
+
+/** Active Telegram turns outrank the optional away-notification destination. */
+export function approvalPingTarget(
+  telegramActive: boolean,
+  activeTarget: { chatId: string; threadId?: number } | undefined,
+  awayTarget: { chatId: string; threadId?: number } | undefined,
+): { chatId: string; threadId?: number } | undefined {
+  return telegramActive ? activeTarget : awayTarget;
+}
+
+/** Replace every `{file}` placeholder without invoking a shell. */
+export function substituteFileArg(argv: readonly string[], file: string): string[] {
+  return argv.map((arg) => arg.replaceAll("{file}", file));
+}
+
+type RunTranscriber = (executable: string, args: readonly string[]) => Promise<string>;
+
+function runTranscriber(executable: string, args: readonly string[]): Promise<string> {
+  const { promise, resolve, reject } = Promise.withResolvers<string>();
+  execFile(executable, [...args], { encoding: "utf8", timeout: 120_000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    if (err) reject(err);
+    else resolve(stdout);
+  });
+  return promise;
+}
+
+export async function transcribeVoice(
+  command: readonly string[],
+  file: string,
+  run: RunTranscriber = runTranscriber,
+): Promise<string> {
+  try {
+    const [executable, ...args] = substituteFileArg(command, file);
+    if (!executable) throw new Error("transcribeCommand is empty");
+    const transcript = (await run(executable, args)).trim();
+    if (!transcript) throw new Error("command produced no output");
+    return `[Voice transcript: ${transcript}]`;
+  } catch (err) {
+    return `[Voice transcription failed: ${err instanceof Error ? err.message : String(err)}]`;
+  }
+}
+
+export interface DoctorCheck {
+  label: string;
+  run: () => string | readonly string[] | Promise<string | readonly string[]>;
+}
+
+/** Run every diagnostic independently so one broken subsystem cannot hide the rest. */
+export async function collectDoctorReport(checks: readonly DoctorCheck[]): Promise<string[]> {
+  const lines = ["Telegram doctor"];
+  for (const check of checks) {
+    try {
+      const result = await check.run();
+      lines.push(...(typeof result === "string" ? [result] : result));
+    } catch (err) {
+      lines.push(`${check.label}: probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return lines;
+}
+
+async function inspectStateFile(name: string, parseJson: boolean): Promise<string> {
+  const file = statePath(name);
+  try {
+    const info = await stat(file);
+    const mode = info.mode & 0o777;
+    let suffix = `mode 0${mode.toString(8)}${mode & 0o077 ? " INSECURE" : " ok"}`;
+    if (parseJson) {
+      try {
+        JSON.parse(await readFile(file, "utf8"));
+        suffix += " · JSON ok";
+      } catch {
+        suffix += " · INVALID JSON";
+      }
+    }
+    return `${name}: ${suffix}`;
+  } catch (err) {
+    if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return `${name}: missing`;
+    throw err;
+  }
+}
+
+async function executableAvailable(executable: string): Promise<boolean> {
+  const candidates = isAbsolute(executable) || executable.includes("/")
+    ? [resolve(executable)]
+    : (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, executable));
+  for (const candidate of candidates) {
+    try {
+      await fsAccess(candidate, constants.X_OK);
+      return true;
+    } catch {
+      // Try the next PATH entry.
+    }
+  }
+  return false;
 }
 function promptTargetFromMessage(message: TgMessage): PromptTarget | undefined {
   if (!message.from) return undefined;
@@ -203,27 +245,6 @@ function errorResult(text: string): { content: ContentBlock[]; isError: true } {
   return { content: [{ type: "text", text }], isError: true };
 }
 
-/** Only the paired owner may turn an inert DM topic into a local process. */
-export function canAutoResumeTopic(
-  msg: TgMessage,
-  access: Access,
-  entry: ThreadEntry | undefined,
-  commandName?: string,
-): entry is ThreadEntry {
-  if (commandName === "stop" || !entry) return false;
-  if (!isPairedOwnerDm(String(msg.from?.id ?? ""), String(msg.chat.id), msg.chat.type, access)) return false;
-  const hasSession =
-    (typeof entry.sessionFile === "string" && entry.sessionFile.length > 0) ||
-    (typeof entry.sessionId === "string" && entry.sessionId.length > 0);
-  return (
-    hasSession &&
-    typeof entry.workspaceId === "string" &&
-    entry.workspaceId.length > 0 &&
-    typeof entry.workspaceLabel === "string" &&
-    entry.workspaceLabel.length > 0 &&
-    Array.isArray(entry.workspaceTerminalIds)
-  );
-}
 
 export default function telegramExtension(pi: ExtensionAPI): void {
   const T = pi.typebox.Type;
@@ -240,7 +261,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let ownTopic: { threadId: number; name: string } | undefined;
   let ownSpace: { workspaceId: string; label: string; terminalIds: string[] } | undefined;
   let stopWatch: (() => void) | undefined;
-  let controlTopicCreating: Promise<void> | undefined;
   let activePromptTarget: PromptTarget | undefined;
   let savedPromptTools: string[] | undefined;
   let compacting = false;
@@ -253,20 +273,39 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   const promptController = new TelegramPromptController({
     callTelegram: (method, payload) => tg(token, method, payload),
-    authorize: (responderId, chatId, chatType) => {
-      const current = loadAccess(warn);
-      if (chatType === "private") return isPairedOwnerDm(responderId, chatId, chatType, current);
-      if (chatType !== "group" && chatType !== "supergroup") return false;
-      const policy = current.groups[chatId];
-      if (!policy) return false;
-      const allowed = policy.allowFrom ?? [];
-      return allowed.length === 0 || allowed.includes(responderId);
-    },
+    authorize: (responderId, chatId, chatType) => canAnswerPrompt(responderId, chatId, chatType, loadAccess(warn)),
   });
   const batches = new Map<string, Batch>();
   const notified = new Set<string>();
-  const resumingTopics = new Set<number>();
+  const pendingApprovals = new Map<string, PendingApproval>();
   const lockPath = statePath("bot.lock");
+  const bridgeHost: BridgeHost = {
+    isDaemon: false,
+    selfPid: process.pid,
+    token: () => token,
+    botUsername: () => botUsername,
+    botHasTopics: () => botHasTopics,
+    ownThreadId: () => ownTopic?.threadId,
+    callTelegram: (method, payload) => tg(token, method, payload),
+    warn,
+    log,
+    spawnController,
+    promptController,
+    handleSessionCommand: (msg, parsed) => handleCommand(msg, parsed),
+    deliverLocal: async (msg) => {
+      access = loadAccess(warn);
+      await deliver(msg);
+    },
+  };
+  outbound.setMissingThreadHandler(async (_chatId, threadId) => {
+    if (!ownTopic || threadId !== ownTopic.threadId) return undefined;
+    releaseThread(threadId, process.pid, warn);
+    ownTopic = undefined;
+    stopWatch?.();
+    stopWatch = undefined;
+    await ensureTopic(lastCtx);
+    return bridgeHost.ownThreadId();
+  });
 
   function notifyOnce(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error"): void {
     if (notified.has(message)) return;
@@ -282,18 +321,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   }
 
 
-  function resolveToken(): string {
-    if (process.env.TELEGRAM_BOT_TOKEN) return process.env.TELEGRAM_BOT_TOKEN;
-    try {
-      for (const line of readFileSync(statePath(".env"), "utf8").split("\n")) {
-        const m = /^TELEGRAM_BOT_TOKEN=(.*)$/.exec(line.trim());
-        if (m) return m[1];
-      }
-    } catch {
-      /* no .env yet */
-    }
-    return "";
-  }
 
   function writeToken(tok: string): void {
     ensureStateDir();
@@ -304,10 +331,21 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     warn(`poller stopped: ${reason}`);
     lastCtx?.ui.notify(`telegram: ${reason}`, "error");
     releaseLock(lockPath);
+    if (reason.includes("409")) {
+      void webhookConflictHint(token)
+        .then((hint) => {
+          if (!hint) return;
+          warn(hint);
+          lastCtx?.ui.notify(`telegram: ${hint}`, "warning");
+        })
+        .catch((err) => log.debug(`[telegram] webhook diagnosis failed: ${String(err)}`));
+    }
+    armLockRetry(lastCtx, false, 60_000);
   }
 
   async function acquireAndLaunch(ctx: ExtensionContext | undefined, announce: boolean): Promise<boolean> {
     if (poller.running) return true;
+    if (daemonAlive(readDaemonState())) return false;
     const lock = acquireLock(lockPath);
     if (!lock.ok) {
       notifyOnce(ctx, `telegram: bot lock held by pid ${lock.holder} — waiting (another omp session polls this token)`, "warning");
@@ -326,7 +364,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     await tg(token, "setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } }).catch(() => {});
     await ensureControlTopic(ctx);
     outbound.setToken(token);
-    poller.start(token, onUpdate, onFatal, log);
+    poller.start(token, (update) => handleUpdate(bridgeHost, update), onFatal, log);
     if (lockRetryTimer) {
       clearInterval(lockRetryTimer);
       lockRetryTimer = undefined;
@@ -336,6 +374,15 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     return true;
   }
 
+  function armLockRetry(ctx: ExtensionContext | undefined, announce: boolean, intervalMs = 30_000): void {
+    if (lockRetryTimer) return;
+    lockRetryTimer = setInterval(() => {
+      if (poller.running) return;
+      void acquireAndLaunch(ctx, announce).catch((err) => warn(`lock retry failed: ${String(err)}`));
+    }, intervalMs);
+    lockRetryTimer.unref?.();
+  }
+
   async function startBot(ctx: ExtensionContext | undefined, announce = false): Promise<void> {
     if (poller.running) return;
     token = resolveToken();
@@ -343,16 +390,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       notifyOnce(ctx, "telegram: no bot token — run /telegram token <token>", "warning");
       return;
     }
+    const daemon = ensureDaemon(warn);
     outbound.setToken(token); // outbound (telegram_send/react, idle pings) works even when another session holds the poll lock
     await ensureTopic(ctx);
-    const launched = await acquireAndLaunch(ctx, announce);
-    if (!launched && !lockRetryTimer) {
-      lockRetryTimer = setInterval(() => {
-        if (poller.running) return;
-        void acquireAndLaunch(ctx, announce).catch((e) => warn(`lock retry failed: ${String(e)}`));
-      }, 30_000);
-      lockRetryTimer.unref?.();
-    }
+    const launched = daemon === "alive" || daemon === "spawned" ? false : await acquireAndLaunch(ctx, announce);
+    if (!launched) armLockRetry(ctx, announce);
   }
 
   function stopBot(): void {
@@ -376,34 +418,12 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (botHasTopics === false && access.topicsChat === pairedOwnerId(access) && access.controlThreadId == null) {
       notifyOnce(ctx, "telegram: control topic unavailable until DM forum-topic mode is enabled in @BotFather", "warning");
     }
-    const ownerId = controlTopicCreationChat(access, botHasTopics);
-    if (!token || !ownerId) return;
-    if (controlTopicCreating) return controlTopicCreating;
-
-    controlTopicCreating = (async () => {
-      const topic = await tg<{ message_thread_id: number }>(token, "createForumTopic", {
-        chat_id: ownerId,
-        name: "omp control",
-      });
-      const fresh = loadAccess(warn);
-      if (pairedOwnerId(fresh) !== ownerId || fresh.topicsChat !== ownerId || fresh.controlThreadId != null) return;
-      fresh.controlThreadId = topic.message_thread_id;
-      saveAccess(fresh);
-      access = fresh;
-      await tg(token, "sendMessage", {
-        chat_id: ownerId,
-        message_thread_id: topic.message_thread_id,
-        text: "OMP control\n\nUse this topic for bridge commands:\n/spawn — start omp in a herdr space\n/sessions — inspect session and topic state\n/status — bridge health\n/help — command reference\n\nUse the other topics for conversations with individual omp sessions.",
-      });
-      log.info(`[telegram] control topic #${topic.message_thread_id} created in owner DM ${ownerId}`);
-    })();
     try {
-      await controlTopicCreating;
+      await ensureBridgeControlTopic(bridgeHost);
+      access = loadAccess(warn);
     } catch (err) {
       warn(`could not create control topic: ${String(err)}`);
       ctx?.ui.notify(`telegram: control topic creation failed — ${String(err)}`, "warning");
-    } finally {
-      controlTopicCreating = undefined;
     }
   }
 
@@ -525,11 +545,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function parseBotCommand(text: string): { name: string; args: string } | undefined {
-    const match = /^\/([a-zA-Z0-9_]+)(?:@[\w]+)?(?:\s+([\s\S]*))?$/.exec(text.trim());
-    if (!match) return undefined;
-    return { name: match[1].toLowerCase(), args: match[2]?.trim() ?? "" };
-  }
 
 
   async function commandReply(msg: TgMessage, text: string, useControlTopic = true): Promise<void> {
@@ -683,153 +698,19 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   // Global control commands are intercepted by the poller before topic routing;
   // /stop reaches the owning session so it aborts the correct in-process turn.
   async function processLocal(msg: TgMessage): Promise<void> {
-    access = loadAccess(warn);
-    const parsed = parseBotCommand(msg.text ?? "");
-    if (msg.chat.type === "private" && parsed && (await handleCommand(msg, parsed))) return;
-    await deliver(msg);
+    await handleUpdate(bridgeHost, { update_id: msg.message_id, message: msg });
   }
 
-  async function waitForResumedOwner(threadId: number, previous: ThreadEntry): Promise<boolean> {
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-      const owner = loadRegistry().threads[String(threadId)];
-      if (isResumedOwner(previous, owner, isAlive)) return true;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 250);
-        timer.unref?.();
-      });
-    }
-    return false;
-  }
 
-  async function resumeStaleTopic(msg: TgMessage, threadId: number, entry: ThreadEntry): Promise<void> {
-    const origin = { chat_id: String(msg.chat.id), message_thread_id: threadId };
-    const notice = await tg<TgMessage>(token, "sendMessage", {
-      ...origin,
-      text: "Resuming this topic's saved omp session; messages here are queued...",
-    }).catch(() => undefined);
-    const report = async (text: string): Promise<void> => {
-      if (notice) {
-        await tg(token, "editMessageText", {
-          chat_id: String(msg.chat.id),
-          message_id: notice.message_id,
-          text,
-        }).catch(() => {});
-      } else {
-        await tg(token, "sendMessage", { ...origin, text }).catch(() => {});
-      }
-    };
-
-    try {
-      const started = await resumeOmp(entry);
-      if (!(await waitForResumedOwner(threadId, entry))) {
-        throw new Error(`omp started in pane ${started.paneId}, but it did not reattach to this topic within 30 seconds`);
-      }
-      await report("Session resumed. Delivering queued messages.");
-    } catch (err) {
-      await report(`Could not resume this session: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      resumingTopics.delete(threadId);
-    }
-  }
 
 
   // ---- inbound ------------------------------------------------------------
 
-  async function onUpdate(update: TgUpdate): Promise<void> {
-    if (update.callback_query) {
-      if (await promptController.handleCallback(update.callback_query)) return;
-      await spawnController.handleCallback(update.callback_query);
-      return;
-    }
-    const msg = update.message;
-    if (!msg || msg.from?.is_bot) return;
-    access = loadAccess(warn); // re-read per message so /telegram edits take effect live
-    if (access.controlThreadId == null && access.topicsChat === pairedOwnerId(access)) await ensureControlTopic();
-    if (await promptController.handleMessage(msg)) return;
-
-    const parsed = parseBotCommand(msg.text ?? "");
-    if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name)) return;
-    if (msg.chat.type === "private" && parsed && GLOBAL_COMMANDS[parsed.name] && (await handleCommand(msg, parsed))) return;
-
-    // Topics routing: gate topic-chat traffic here, then hand it to the owning
-    // session (this one, a sibling process, or an exact saved session to resume).
-    const registry = loadRegistry(warn);
-    const route = access.topicsChat ? decideRoute(msg, access.topicsChat, registry, process.pid, isAlive) : { kind: "untopiced" as const };
-    if (route.kind !== "untopiced") {
-      const threadId = msg.message_thread_id;
-      const g = gate(msg, botUsername, access);
-      if (g.action === "drop") return;
-      if (g.action === "pair") {
-        const lead = g.isResend ? "Still pending" : "Pairing required";
-        await tg(token, "sendMessage", { chat_id: String(msg.chat.id), message_thread_id: threadId, text: `${lead} — run in omp:\n\n/telegram pair ${g.code}` }).catch(() => {});
-        return;
-      }
-      if (route.kind === "forward") {
-        try {
-          writeRouted(route.threadId, msg);
-        } catch (err) {
-          log.warn(`[telegram] route write failed: ${String(err)}`);
-          await processLocal(msg);
-        }
-        return;
-      }
-      if (route.kind === "unowned") {
-        const entry = registry.threads[String(route.threadId)];
-        if (canAutoResumeTopic(msg, access, entry, parsed?.name)) {
-          try {
-            writeRouted(route.threadId, msg);
-          } catch (err) {
-            log.warn(`[telegram] resume queue write failed: ${String(err)}`);
-            await tg(token, "sendMessage", {
-              chat_id: String(msg.chat.id),
-              message_thread_id: route.threadId,
-              text: "Could not queue this message, so the session was not resumed.",
-            }).catch(() => {});
-            return;
-          }
-          if (!resumingTopics.has(route.threadId)) {
-            resumingTopics.add(route.threadId);
-            void resumeStaleTopic(msg, route.threadId, entry);
-          }
-          return;
-        }
-        const text =
-          parsed?.name === "stop"
-            ? "No live omp session owns this topic, so there is nothing to stop."
-            : entry
-              ? "No live omp session owns this topic. Resume it locally once to refresh its auto-resume identity."
-              : "No saved omp session is attached to this topic.";
-        await tg(token, "sendMessage", {
-          chat_id: String(msg.chat.id),
-          message_thread_id: route.threadId,
-          text,
-        }).catch(() => {});
-        return;
-      }
-      await processLocal(msg);
-      return;
-    }
-
-    if (msg.chat.type === "private" && parsed && (await handleCommand(msg, parsed))) return;
-    const result = gate(msg, botUsername, access);
-    if (result.action === "drop") {
-      if (msg.chat.type !== "private" && !(String(msg.chat.id) in access.groups)) {
-        log.debug(`[telegram] ignored message from unconfigured group ${msg.chat.id} (${safeName(msg.chat.title)})`);
-      }
-      return;
-    }
-    if (result.action === "pair") {
-      const lead = result.isResend ? "Still pending" : "Pairing required";
-      await tg(token, "sendMessage", { chat_id: String(msg.chat.id), text: `${lead} — run in omp:\n\n/telegram pair ${result.code}` }).catch(() => {});
-      return;
-    }
-    await deliver(msg);
-  }
 
   async function handleCommand(msg: TgMessage, parsed: { name: string; args: string }): Promise<boolean> {
     const { name: cmd, args } = parsed;
-    if (!KNOWN_COMMANDS.has(cmd)) return false;
+    if (cmd !== "stop" && cmd !== "compact" && cmd !== "model" && cmd !== "switch" && cmd !== "thinking") return false;
+    access = loadAccess(warn);
     if (access.dmPolicy === "disabled") return true;
 
     const senderId = String(msg.from?.id ?? "");
@@ -842,81 +723,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
     if (ownerId && !owner) return true;
 
-    if (cmd === "start") {
-      await commandReply(
-        msg,
-        owner
-          ? 'This bot is paired to you. Use "omp control" for /spawn, /sessions, and /status; use session topics for agent conversations.'
-          : "This bot bridges Telegram to one omp operator.\n\nTo pair:\n1. Send any normal message to receive a code.\n2. In omp, run /telegram pair <code>.",
-      );
-    } else if (cmd === "help") {
-      await commandReply(
-        msg,
-        owner
-          ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/sessions — list active omp sessions and topic attachment\n/cleanup — delete all other omp topics\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
-          : "/start — pairing instructions\n/status — pairing state\n/whoami — show Telegram IDs",
-      );
-    } else if (cmd === "whoami") {
-      await commandReply(msg, `chat_id: ${chatId}\nuser_id: ${senderId}\nchat_type: ${msg.chat.type}`);
-    } else if (cmd === "spawn") {
-      if (!owner) {
-        await commandReply(msg, "Pair this DM locally before using control commands.");
-      } else {
-        await spawnController.start(msg, args);
-      }
-    } else if (cmd === "sessions") {
-      if (!owner) {
-        await commandReply(msg, "Pair this DM locally before using control commands.");
-      } else {
-        try {
-          const spaces = await listControlSpaces();
-          await commandReply(msg, formatSessions(spaces, loadRegistry(warn), isAlive));
-        } catch (err) {
-          await commandReply(msg, `Cannot list omp sessions: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
-    } else if (cmd === "cleanup") {
-      if (!owner) {
-        await commandReply(msg, "Pair this DM locally before using cleanup.");
-      } else if (!ownTopic) {
-        await commandReply(msg, "No main omp topic is attached, so cleanup was skipped.");
-      } else {
-        const registry = loadRegistry(warn);
-        const otherCount = Object.keys(registry.threads).filter((threadId) => Number(threadId) !== ownTopic?.threadId).length;
-        const protectedCount = Object.entries(registry.threads).filter(
-          ([threadId, entry]) => Number(threadId) !== ownTopic?.threadId && entry.pid !== process.pid && isAlive(entry.pid),
-        ).length;
-        const count = otherCount - protectedCount;
-        const protectedText = protectedCount
-          ? ` ${protectedCount} topic${protectedCount === 1 ? "" : "s"} owned by other live omp sessions will stay.`
-          : "";
-        if (count === 0) {
-          await commandReply(msg, `Nothing stale or duplicated to clean up. The main omp topic and omp control remain.${protectedText}`);
-        } else if (args !== "confirm") {
-          await commandReply(
-            msg,
-            `This permanently deletes ${count} stale or duplicate omp topic${count === 1 ? "" : "s"} and all messages in ${count === 1 ? "it" : "them"}. The main omp topic and omp control stay.${protectedText}\n\nRun /cleanup confirm to continue.`,
-          );
-        } else {
-          const topicsChat = registry.chatId || access.topicsChat!;
-          const result = await cleanupRegisteredTopics(registry, ownTopic.threadId, process.pid, isAlive, async (threadId) => {
-            try {
-              await tg(token, "deleteForumTopic", { chat_id: topicsChat, message_thread_id: threadId });
-            } catch (err) {
-              if (!isMissingThreadError(err)) throw err;
-            }
-          });
-          const currentRegistry = loadRegistry(warn);
-          for (const threadId of result.deletedThreadIds) delete currentRegistry.threads[String(threadId)];
-          saveRegistry(currentRegistry);
-          const deleted = result.deletedThreadIds.length;
-          await commandReply(
-            msg,
-            `Deleted ${deleted} stale or duplicate omp topic${deleted === 1 ? "" : "s"}. The main omp topic and omp control remain.${protectedText}${result.failed ? ` ${result.failed} could not be deleted and remain registered.` : ""}`,
-          );
-        }
-      }
-    } else if (cmd === "stop") {
+    if (cmd === "stop") {
       if (!owner) {
         await commandReply(msg, "Pair this DM locally before using control commands.", false);
       } else if (!msg.is_topic_message || msg.message_thread_id == null) {
@@ -937,33 +744,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);
       else if (!ctx) await commandReply(msg, `Run /${cmd} inside the omp session topic you want to change.`, false);
       else startModelChange(msg, args, ctx);
-    } else if (cmd === "thinking") {
+    } else {
       const ctx = owner ? sessionContextFor(msg) : undefined;
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);
       else if (!ctx) await commandReply(msg, "Run /thinking inside the omp session topic you want to change.", false);
       else startThinkingChange(msg, args, ctx);
-    } else {
-      // status
-      if (!owner) {
-        const pending = Object.entries(access.pending).find(([, p]) => p.senderId === senderId);
-        await commandReply(msg, pending ? `Pending — run in omp:\n\n/telegram pair ${pending[0]}` : "Not paired. Send a normal message to get a pairing code.");
-      } else {
-        const registry = loadRegistry(warn);
-        const liveTopics = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
-        try {
-          const spaces = await listControlSpaces();
-          const liveOmp = spaces.reduce((total, space) => total + space.ompCount, 0);
-          await commandReply(
-            msg,
-            `Paired owner: ${ownerId}\nBridge: ${poller.running ? "polling" : "standby"}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nOMP sessions: ${liveOmp}\nLive topic owners: ${liveTopics}`,
-          );
-        } catch (err) {
-          await commandReply(
-            msg,
-            `Paired owner: ${ownerId}\nBridge: ${poller.running ? "polling" : "standby"}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nLive topic owners: ${liveTopics}\nHerdr: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }
     }
     return true;
   }
@@ -981,9 +766,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
     // Media messages inject immediately; text-only messages batch (Telegram splits
     // long pastes into consecutive messages within a moment of each other).
-    if (media.attachmentKind || media.imageBase64) {
+    if (msg.edited_flag || media.attachmentKind || media.imageBase64) {
       flushBatch(key);
-      await injectMessage(chatId, threadId, msg.chat.type, msg.from, msg.message_id, msg.date, rawText, media);
+      await injectMessage(chatId, threadId, msg.chat.type, msg.from, msg.message_id, msg.date, rawText, media, msg.edited_flag === true);
       return;
     }
     const existing = batches.get(key);
@@ -1018,7 +803,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     clearTimeout(b.timer);
     batches.delete(key);
     const [chatId] = key.split(":");
-    void injectMessage(chatId, b.threadId, b.chatType, b.from, b.lastMessageId, b.lastTs, b.parts.join("\n"), {});
+    void injectMessage(chatId, b.threadId, b.chatType, b.from, b.lastMessageId, b.lastTs, b.parts.join("\n"), {}, false);
   }
 
   async function injectMessage(
@@ -1030,6 +815,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ts: number,
     text: string,
     media: Media,
+    edited: boolean,
   ): Promise<void> {
     const attrs = [
       `chat_id="${safeName(chatId)}"`,
@@ -1040,9 +826,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       `ts="${new Date((ts || 0) * 1000).toISOString()}"`,
     ];
     if (threadId != null) attrs.push(`thread_id="${threadId}"`);
+    if (edited) attrs.push('edited="true"');
     if (media.attachmentPath) attrs.push(`attachment="${safeName(media.attachmentPath)}"`);
     if (media.attachmentKind) attrs.push(`attachment_kind="${safeName(media.attachmentKind)}"`);
-    const body = (text.length > 0 ? text : "(no text)").replace(/<\/telegram-message>/gi, "<\\/telegram-message>");
+    const messageText = [text, media.transcript].filter((part) => part && part.length > 0).join("\n\n");
+    const body = (messageText.length > 0 ? messageText : "(no text)").replace(/<\/telegram-message>/gi, "<\\/telegram-message>");
     let wrapper = `<telegram-message ${attrs.join(" ")}>\n${body}\n</telegram-message>`;
     if (!hintSent) {
       hintSent = true;
@@ -1069,7 +857,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!doc) return {};
       if (doc.size != null && doc.size > INBOX_MAX_FILE_BYTES) return { attachmentKind: doc.kind }; // over the bot-download cap
       const path = await fetchToInbox(doc.file_id, doc.uniqueId, doc.name);
-      return path ? { attachmentPath: path, attachmentKind: doc.kind } : { attachmentKind: doc.kind };
+      if (!path) return { attachmentKind: doc.kind };
+      const transcript = doc.kind === "voice" && access.transcribeCommand
+        ? await transcribeVoice(access.transcribeCommand, path)
+        : undefined;
+      return { attachmentPath: path, attachmentKind: doc.kind, transcript };
     } catch (err) {
       log.debug(`[telegram] media download failed: ${String(err)}`);
       return {};
@@ -1110,12 +902,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     access = a;
     const lines = [
       `Telegram bridge: ${poller.running ? `running as @${botUsername || "?"}` : "stopped"}`,
+      `Daemon: ${daemonStatus(loadAccess(warn))}`,
       `DM policy: ${a.dmPolicy} · autostart: ${a.enabled ? "on" : "off"}`,
       `Owner: ${pairedOwnerId(a) ?? (a.allowFrom.length > 1 ? `ambiguous (${a.allowFrom.join(", ")})` : "unpaired")}`,
       `Pending codes: ${Object.keys(a.pending).length ? Object.keys(a.pending).join(", ") : "none"}`,
       `Groups: ${Object.keys(a.groups).length ? Object.keys(a.groups).join(", ") : "none"}`,
       `Streaming: ${a.streaming === false ? "off" : "on"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
       `Notify chat: ${a.notifyChat ?? "off"}`,
+      `Voice transcription: ${a.transcribeCommand?.length ? a.transcribeCommand.join(" ") : "off"}`,
       `Away: ${a.away ? "on" : "off"}`,
       `Control topic: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`,
     ];
@@ -1134,6 +928,149 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ctx.ui.notify(lines.join("\n"), "info");
   }
 
+  function daemonStatus(currentAccess: Access): string {
+    const state = readDaemonState();
+    if (state && daemonAlive(state)) {
+      const uptime = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
+      return `pid ${state.pid} · v${state.version} · up ${uptime}s`;
+    }
+    return daemonDisableReason(currentAccess, resolveToken()) ?? (state ? `stale pid ${state.pid}` : "not running");
+  }
+
+  async function waitForDaemonExit(pid: number): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const timer = setTimeout(resolve, 50);
+      timer.unref?.();
+      await promise;
+    }
+  }
+
+  async function cmdDaemon(ctx: ExtensionContext, arg: string): Promise<void> {
+    const action = arg.trim() || "status";
+    const state = readDaemonState();
+    if (action === "status") {
+      ctx.ui.notify(`telegram daemon: ${daemonStatus(loadAccess(warn))}\nLog: ${statePath("daemon.log")}`, "info");
+      return;
+    }
+    if (action !== "restart" && action !== "stop") {
+      ctx.ui.notify("usage: /telegram daemon status | restart | stop", "warning");
+      return;
+    }
+    if (state && daemonAlive(state)) {
+      try {
+        process.kill(state.pid, "SIGTERM");
+      } catch (err) {
+        ctx.ui.notify(`telegram: could not stop daemon pid ${state.pid} — ${String(err)}`, "error");
+        return;
+      }
+      if (action === "restart") await waitForDaemonExit(state.pid);
+    }
+    if (action === "stop") {
+      ctx.ui.notify(state ? `telegram: daemon pid ${state.pid} stopping; session fallback will take over` : "telegram: daemon is not running", "info");
+      return;
+    }
+    const result = ensureDaemon(warn);
+    ctx.ui.notify(`telegram: daemon restart ${result} — ${daemonStatus(loadAccess(warn))}`, result === "failed" ? "error" : "info");
+  }
+
+  async function cmdDoctor(ctx: ExtensionContext): Promise<void> {
+    const currentAccess = access;
+    const currentToken = resolveToken();
+    const checks: DoctorCheck[] = [
+      {
+        label: "Token",
+        run: async () => {
+          if (!currentToken) return "Token: missing";
+          const me = await tg<{ username: string; has_topics_enabled?: boolean }>(currentToken, "getMe");
+          const topicMode = me.has_topics_enabled === undefined ? "unknown" : me.has_topics_enabled ? "on" : "off";
+          return `Token: present · getMe ok @${me.username} · DM topics ${topicMode}`;
+        },
+      },
+      {
+        label: "Webhook",
+        run: async () => currentToken ? `Webhook: ${(await webhookConflictHint(currentToken)) ?? "none"}` : "Webhook: skipped (token missing)",
+      },
+      {
+        label: "Poll lock",
+        run: () => {
+          try {
+            const rawPid = readFileSync(lockPath, "utf8").trim();
+            const pid = Number(rawPid);
+            return Number.isInteger(pid) && pid > 1
+              ? `Poll lock: pid ${pid} · ${isAlive(pid) ? "alive" : "dead"}`
+              : `Poll lock: malformed (${rawPid || "empty"})`;
+          } catch (err) {
+            if (err && typeof err === "object" && "code" in err && err.code === "ENOENT") return "Poll lock: none";
+            throw err;
+          }
+        },
+      },
+      {
+        label: "Daemon",
+        run: () => {
+          const state = readDaemonState();
+          return `Daemon: ${state && daemonAlive(state)
+            ? `pid ${state.pid} · v${state.version} · alive`
+            : daemonDisableReason(currentAccess, currentToken) ?? (state ? `pid ${state.pid} · dead` : "not running")}`;
+        },
+      },
+      {
+        label: "State",
+        run: async () => {
+          const files = await Promise.all([
+            inspectStateFile(".env", false),
+            inspectStateFile("access.json", true),
+            inspectStateFile("threads.json", true),
+            inspectStateFile("daemon.json", true),
+          ]);
+          return [`State: ${statePath(".")}`, ...files.map((line) => `  ${line}`)];
+        },
+      },
+      {
+        label: "Topics",
+        run: () => {
+          const registry = loadRegistry(warn);
+          const liveOwners = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
+          return `Topics: chat ${currentAccess.topicsChat ?? "off"} · control ${currentAccess.controlThreadId != null ? `#${currentAccess.controlThreadId}` : "none"} · ${Object.keys(registry.threads).length} topics, ${liveOwners} live owners`;
+        },
+      },
+      {
+        label: "Transcriber",
+        run: async () => {
+          const executable = currentAccess.transcribeCommand?.[0];
+          if (!executable) return "Transcriber: off";
+          return `Transcriber: ${executable} · ${await executableAvailable(executable) ? "available" : "not found"}`;
+        },
+      },
+      {
+        label: "Herdr",
+        run: async () => {
+          const spaces = await listControlSpaces();
+          return `Herdr: HERDR_ENV ${process.env.HERDR_ENV === "1" ? "set" : "unset"} · ${spaces.length} spaces`;
+        },
+      },
+      {
+        label: "Inbox",
+        run: async () => {
+          const inbox = statePath("inbox");
+          let entries: Dirent[];
+          try {
+            entries = await readdir(inbox, { withFileTypes: true });
+          } catch (err) {
+            if (!(err && typeof err === "object" && "code" in err && err.code === "ENOENT")) throw err;
+            entries = [];
+          }
+          const files = entries.filter((entry) => entry.isFile());
+          const sizes = await Promise.all(files.map((entry) => stat(join(inbox, entry.name))));
+          return `Inbox: ${files.length} files · ${sizes.reduce((total, info) => total + info.size, 0)} bytes`;
+        },
+      },
+    ];
+    ctx.ui.notify((await collectDoctorReport(checks)).join("\n"), "info");
+  }
+
   async function cmdToken(ctx: ExtensionContext, arg: string): Promise<void> {
     const tok = arg.trim();
     if (!tok) {
@@ -1147,6 +1084,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       botUsername = me.username;
       botHasTopics = me.has_topics_enabled;
       outbound.setToken(tok);
+      ensureDaemon(warn);
       ctx.ui.notify(`telegram: @${me.username} ok — run /telegram on to start`, "info");
     } catch (err) {
       ctx.ui.notify(`telegram: token rejected — ${err instanceof TgError ? `${err.code} ${err.message}` : String(err)}`, "error");
@@ -1170,6 +1108,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     a.allowFrom = [entry.senderId];
     a.pending = {};
     saveAccess(a);
+    ensureDaemon(warn);
     access = a;
     ctx.ui.notify(`telegram: paired owner ${entry.senderId}`, "info");
     if (token) {
@@ -1248,11 +1187,13 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const allowFrom = ai >= 0 && flags[ai + 1] ? flags[ai + 1].split(",").map((s) => s.trim()).filter(Boolean) : [];
       a.groups[id] = { requireMention, allowFrom };
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: group ${id} added (requireMention: ${requireMention}, allowFrom: ${allowFrom.length})`, "info");
     } else if (action === "rm" && id) {
       delete a.groups[id];
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: group ${id} removed`, "info");
     } else {
@@ -1290,8 +1231,20 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     } else if (key === "streaming") {
       if (value !== "true" && value !== "false") return ctx.ui.notify("streaming: true | false", "warning");
       a.streaming = value === "true";
+    } else if (key === "transcribeCommand") {
+      if (!value) {
+        a.transcribeCommand = undefined;
+      } else {
+        try {
+          const arr: unknown = JSON.parse(value);
+          if (!Array.isArray(arr) || arr.length === 0 || !arr.every((arg) => typeof arg === "string")) throw new Error("not a command");
+          a.transcribeCommand = arr;
+        } catch {
+          return ctx.ui.notify('transcribeCommand: JSON argv array, e.g. ["whisper-cli","-f","{file}"] (empty value clears)', "warning");
+        }
+      }
     } else {
-      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming`, "warning");
+      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming, transcribeCommand`, "warning");
     }
     saveAccess(a);
     access = a;
@@ -1367,6 +1320,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       ownTopic = undefined;
       a.topicsChat = undefined;
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify("telegram: topics off", "info");
       return;
@@ -1375,6 +1329,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const enable = async (chatId: string, where: string): Promise<void> => {
       a.topicsChat = chatId;
       saveAccess(a);
+      ensureDaemon(warn);
       access = a;
       ctx.ui.notify(`telegram: topics on in ${where} — claiming this session's topic`, "info");
       if (!token) {
@@ -1537,17 +1492,25 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         case "status":
           showStatus(ctx);
           break;
+        case "doctor":
+          await cmdDoctor(ctx);
+          break;
+        case "daemon":
+          await cmdDaemon(ctx, arg);
+          break;
         case "token":
           await cmdToken(ctx, arg);
           break;
         case "on":
           access.enabled = true;
           saveAccess(access);
+          ensureDaemon(warn);
           await startBot(ctx, true);
           break;
         case "off":
           access.enabled = false;
           saveAccess(access);
+          ensureDaemon(warn);
           stopBot();
           ctx.ui.notify("telegram: bridge stopped", "info");
           break;
@@ -1618,6 +1581,71 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       ],
     };
   });
+  pi.on("tool_approval_requested", (event, ctx) => {
+    lastCtx = ctx;
+    const currentAccess = loadAccess(warn);
+    const ownTarget =
+      ownTopic && currentAccess.topicsChat ? { chatId: currentAccess.topicsChat, threadId: ownTopic.threadId } : undefined;
+    const target = approvalPingTarget(
+      outbound.isActive(),
+      outbound.lastTarget(),
+      awayNotifyTarget(false, currentAccess, token.length > 0, ownTarget),
+    );
+    if (!target) return;
+    const previous = pendingApprovals.get(event.toolCallId);
+    clearTimeout(previous?.timer);
+    const pending: PendingApproval = { toolName: event.toolName, chatId: target.chatId, threadId: target.threadId };
+    pending.timer = setTimeout(() => {
+      if (pendingApprovals.get(event.toolCallId) !== pending) return;
+      pending.timer = undefined;
+      const reason = event.reason?.trim() ? `\n${event.reason.trim()}` : "";
+      void outbound
+        .send(
+          pending.chatId,
+          `[WAIT] omp is waiting for approval: ${event.toolName}${reason}\nApprove at the terminal — remote approval isn't supported.`,
+          { threadId: pending.threadId },
+        )
+        .then(async (ids) => {
+          if (pendingApprovals.get(event.toolCallId) !== pending) return;
+          pending.messageId = ids[0];
+          if (pending.resolved && pending.messageId != null) {
+            await tg(token, "editMessageText", {
+              chat_id: pending.chatId,
+              message_id: pending.messageId,
+              text: `${pending.approved ? "[APPROVED]" : "[DENIED]"} ${pending.toolName}`,
+            }).catch(() => {});
+            pendingApprovals.delete(event.toolCallId);
+          }
+        })
+        .catch((err) => {
+          pendingApprovals.delete(event.toolCallId);
+          log.debug(`[telegram] approval ping failed: ${String(err)}`);
+        });
+    }, 2_000);
+    pending.timer.unref?.();
+    pendingApprovals.set(event.toolCallId, pending);
+  });
+  pi.on("tool_approval_resolved", (event, ctx) => {
+    lastCtx = ctx;
+    const pending = pendingApprovals.get(event.toolCallId);
+    if (!pending) return;
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pendingApprovals.delete(event.toolCallId);
+      return;
+    }
+    if (pending.messageId == null) {
+      pending.resolved = true;
+      pending.approved = event.approved;
+      return;
+    }
+    pendingApprovals.delete(event.toolCallId);
+    void tg(token, "editMessageText", {
+      chat_id: pending.chatId,
+      message_id: pending.messageId,
+      text: `${event.approved ? "[APPROVED]" : "[DENIED]"} ${event.toolName}`,
+    }).catch(() => {});
+  });
   pi.on("message_update", (e, ctx) => {
     lastCtx = ctx;
     outbound.onMessageUpdate(e.message);
@@ -1638,6 +1666,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   pi.on("agent_end", async (e, ctx) => {
     lastCtx = ctx;
+    for (const pending of pendingApprovals.values()) {
+      clearTimeout(pending.timer);
+    }
+    pendingApprovals.clear();
     const wasActive = outbound.isActive();
     await outbound.onAgentEnd();
     await restorePromptTools();

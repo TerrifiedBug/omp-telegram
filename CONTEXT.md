@@ -9,6 +9,17 @@ messages become user turns, and assistant output streams back into session topic
 The running Telegram transport and router shared by omp sessions.
 _Avoid_: bot, integration, plugin
 
+**Standalone poller daemon**:
+The laptop-wide Bun process that normally owns Telegram `getUpdates`, handles
+control commands, and routes topic messages through filesystem queues. It never
+executes agent turns.
+_Avoid_: agent daemon, background session
+
+**Session poller fallback**:
+A live omp session that temporarily owns `getUpdates` when the standalone daemon
+is disabled, ineligible, or unavailable. It uses the same router and poll lock.
+_Avoid_: second poller, backup bot
+
 **Inbound**:
 A Telegram message flowing into the omp session as a user turn.
 _Avoid_: incoming
@@ -68,20 +79,30 @@ _Avoid_: session topic, project topic
 An open project context that may contain zero or more omp sessions.
 _Avoid_: session, thread
 
+**Herdr worktree**:
+A new git worktree and herdr workspace created from an existing herdr space by
+`/spawn new`.
+_Avoid_: branch session, cloned space
+
 **Omp session**:
 One running omp agent process. Concurrent sessions in one herdr space remain
 independent and receive distinct topics.
 _Avoid_: space, topic
 
 **Session topic**:
-The Telegram thread claimed by an omp session. A restarted session in the same
-directory can re-adopt a stale session topic for continuity.
+The Telegram thread claimed by one saved omp conversation. Resume identity is
+the session file; fresh sessions in the same directory receive distinct topics.
 _Avoid_: control topic, space, session
 
 **Topic**:
 A Telegram forum thread. Qualify it as a control topic or session topic when
 the distinction matters.
 _Avoid_: space, session
+
+**Approval wait ping**:
+A Telegram notification sent after an omp tool approval has remained unresolved
+for two seconds. It is informational; approval remains terminal-local.
+_Avoid_: remote approval, approval prompt
 
 **Away**:
 A state the user sets to signal they have stepped away from the machine. While

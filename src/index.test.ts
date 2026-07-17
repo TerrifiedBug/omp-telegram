@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
-import { TgError, type TgMessage } from "./api";
-import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat, isMissingThreadError, isTaskSubagent, parseTelegramPromptTarget } from "./index";
+import { isMissingThreadError, TgError, type TgMessage } from "./api";
+import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
+import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -23,6 +24,56 @@ describe("Telegram session ownership", () => {
     expect(isTaskSubagent(false, ["read", "yield"])).toBe(true);
     expect(isTaskSubagent(true, ["read", "yield"])).toBe(false);
     expect(isTaskSubagent(false, ["read"])).toBe(false);
+  });
+});
+
+describe("approval ping targeting", () => {
+  const active = { chatId: "42", threadId: 7 };
+  const away = { chatId: "99" };
+
+  test("prefers the active Telegram conversation and otherwise uses the away target", () => {
+    expect(approvalPingTarget(true, active, away)).toEqual(active);
+    expect(approvalPingTarget(false, active, away)).toEqual(away);
+    expect(approvalPingTarget(true, undefined, away)).toBeUndefined();
+    expect(approvalPingTarget(false, undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe("voice transcription", () => {
+  test("substitutes every file placeholder in argv", () => {
+    expect(substituteFileArg(["transcribe", "--input={file}", "{file}"], "/tmp/voice note.ogg")).toEqual([
+      "transcribe",
+      "--input=/tmp/voice note.ogg",
+      "/tmp/voice note.ogg",
+    ]);
+  });
+
+  test("executes argv directly and returns visible success or failure text", async () => {
+    await expect(transcribeVoice(["/bin/echo", "{file}", "$(echo injected)"], "/tmp/voice note.ogg")).resolves.toBe(
+      "[Voice transcript: /tmp/voice note.ogg $(echo injected)]",
+    );
+    await expect(transcribeVoice(["missing", "{file}"], "/tmp/note.ogg", async () => {
+      throw new Error("transcriber offline");
+    })).resolves.toBe("[Voice transcription failed: transcriber offline]");
+  });
+});
+
+describe("Telegram doctor", () => {
+  test("reports degraded checks without hiding later sections", async () => {
+    const report = await collectDoctorReport([
+      { label: "Token", run: async () => { throw new Error("offline"); } },
+      { label: "Daemon", run: () => "Daemon: pid 42 · dead" },
+      { label: "Herdr", run: () => { throw new Error("not installed"); } },
+      { label: "Inbox", run: () => "Inbox: 3 files · 99 bytes" },
+    ]);
+
+    expect(report).toEqual([
+      "Telegram doctor",
+      "Token: probe failed: offline",
+      "Daemon: pid 42 · dead",
+      "Herdr: probe failed: not installed",
+      "Inbox: 3 files · 99 bytes",
+    ]);
   });
 });
 

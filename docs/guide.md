@@ -16,38 +16,37 @@ chat access remains separately configured from the terminal, never by the model.
 
 ```mermaid
 flowchart LR
-  TG[Paired Telegram DM] --> CT[omp control topic]
-  TG --> T1[project topic]
-  CT --> P[Poll-lock holder]
-  P --> H[herdr]
-  H --> O1[omp session]
+  TG[Paired Telegram DM] --> D[Standalone poller daemon]
+  TG --> T1[Session topic]
+  D --> H[herdr]
+  D <--> Q[Filesystem route queues]
+  Q <--> O1[omp session]
   T1 <--> O1
 ```
 
-One omp process holds the Telegram poll lock. Global bridge commands are handled
-centrally in **omp control**; messages in project topics are routed to their
-owning omp processes.
+The laptop-wide daemon normally owns Telegram `getUpdates`, handles global
+commands in **omp control**, and routes session-topic messages through persistent
+filesystem queues. Session extensions own agent execution and outbound delivery.
+If the daemon is ineligible or unavailable, one live omp session acquires the
+same poll lock and provides the identical routing behavior.
 
 ## Requirements
 
-- omp ≥ 16.3.12, Bun ≥ 1.3
+- omp ≥ 17.0.0, Bun ≥ 1.3
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - [herdr](https://herdr.dev/) for `/spawn` and `/sessions` (chat bridging works without it)
 
 ## Install
 
-Clone the repository, then link it into omp:
+Install the published extension:
 
 ```bash
-git clone https://github.com/TerrifiedBug/omp-telegram.git
-cd omp-telegram
-omp plugin link .
-omp plugin list        # → omp-telegram@0.1.1
+omp plugin install omp-telegram
+omp plugin list        # → omp-telegram@0.2.0
 ```
 
-`omp plugin link` needs no build or install step: the extension has zero runtime
-dependencies and uses only the raw Bot API and Node/Bun built-ins. `bun install`
-is needed only for development checks.
+There is no build step and no runtime dependency install. The extension uses
+only the raw Bot API and Node/Bun built-ins.
 
 ## Create a bot
 
@@ -67,11 +66,14 @@ Inside an omp session:
 ```
 
 `/telegram token` reports `@yourbot ok` on success. `/telegram on` sets
-`access.enabled = true` so the bridge autostarts every session.
+`access.enabled = true` and starts the standalone daemon when owner-DM topics
+are enabled and no groups are configured. The daemon stays alive after every omp
+session exits. Groups and non-topic configurations deliberately use the
+session-poller fallback because their messages need a live target session.
 
 ## Activation
 
-The bridge starts when **any** of these is true at session start:
+The bridge is enabled when **any** of these is true at session start:
 
 | Method | Scope |
 |---|---|
@@ -80,6 +82,7 @@ The bridge starts when **any** of these is true at session start:
 | `/telegram on` (sets `enabled`) | every session, until `/telegram off` |
 
 If no token is configured it stays passive and warns once (`no bot token`).
+Use `/telegram daemon status|restart|stop` to manage the standalone process.
 
 ## Pairing
 
@@ -100,6 +103,8 @@ Codes expire after 1 hour; at most 3 are pending before an owner is established.
 | `/telegram` or `status` | Running state, bot username, policy, owner, pending codes, groups, config, lock holder |
 | `token <bot-token>` | Validate (`getMe`) then store the token; run `on` to start |
 | `on` / `off` | Start / stop polling now; persists `enabled` |
+| `doctor` | Diagnose token, webhook, daemon, poll lock, state files, optional binaries, and herdr locally; never prints the token |
+| `daemon [status\|restart\|stop]` | Inspect, restart, or stop the standalone poller |
 | `pair <code>` | Approve a pending pairing; the bot confirms in-chat |
 | `deny <code>` | Drop a pending code |
 | `allow <user-id>` / `remove <user-id>` | Set or remove the sole DM owner; a second owner is refused |
@@ -128,6 +133,8 @@ notice in the originating topic.
 | Command | Effect |
 |---|---|
 | `/spawn [space]` | List open herdr spaces with inline buttons, or confirm an exact label. A space with live omp sessions requires confirmation before starting another. |
+| `/spawn new <branch> [space]` | Create an unfocused git worktree from the selected source space, then run omp in its root pane. |
+| `/spawn dir <absolute-path>` | Create an unfocused herdr workspace rooted at an existing absolute directory, then run omp there. |
 | `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
 | `/cleanup [confirm]` | Permanently delete stale topics and extra topics created by this omp process, including pre-fix task-subagent spam. The current main session, control topic, and topics owned by other live omp processes remain. The bare command previews the count; `/cleanup confirm` performs the deletion. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
@@ -139,13 +146,15 @@ notice in the originating topic.
 | `/help` | Show the owner command summary. |
 | `/whoami` | Show Telegram chat and user IDs. |
 
-`/spawn` uses Telegram's native inline keyboard, not a Mini App. The poll-lock
-holder revalidates the short-lived selection, creates an unfocused herdr tab,
-and runs `omp` in its root pane. The new omp process loads this extension and
-claims its topic. Repeated or expired callback actions cannot spawn twice.
+`/spawn` uses Telegram's native inline keyboard, not a Mini App. The poller
+revalidates each short-lived selection, creates an unfocused herdr tab,
+worktree, or workspace, and runs `omp` in its root pane. The new process loads
+this extension and claims its topic. Repeated or expired callback actions cannot
+spawn twice. Branch names and directory paths are passed as argv, never
+interpolated into a shell command.
 
 When the paired owner sends a normal message to a stale owner-DM topic, the
-poll-lock holder queues the message, revalidates the topic's saved herdr space,
+standalone daemon queues the message, revalidates the topic's saved herdr space,
 and starts `omp --resume` with the exact saved session file. The resumed process
 reclaims that same topic and consumes the queue. Concurrent messages queue
 without starting duplicate processes. `/stop` never starts an idle session, and
@@ -162,6 +171,24 @@ configured groups never receive process-spawning authority.
 | `replyToMode` | `off` \| `first` \| `all` — threading for `telegram_send` replies | `first` |
 | `ackReaction` | a whitelist emoji (empty to disable) — reaction on receipt | unset |
 | `mentionPatterns` | JSON array of regexes that also satisfy group mention-gating, e.g. `["\\bassistant\\b"]` | unset |
+| `transcribeCommand` | JSON argv array for voice notes, e.g. `["whisper-cli","-f","{file}"]`; empty value disables it | unset |
+
+Voice transcription runs only for Telegram voice notes. Every `{file}` substring
+is replaced with the downloaded inbox path and the command executes directly,
+without a shell, with a 120-second timeout and 1 MiB output cap. Successful text
+is appended to the agent prompt as `[Voice transcript: …]`; failures remain
+visible as `[Voice transcription failed: …]` while the original attachment is
+still delivered.
+
+## Diagnostics
+
+Run `/telegram doctor` in omp first. It validates `getMe`, reports webhook
+conflicts that block long polling, checks daemon and poll-lock liveness, verifies
+state-file permissions and JSON, identifies whether configured transcriber and
+herdr binaries resolve, and probes herdr. It performs no mutations and never
+prints the bot token. `/telegram daemon restart` replaces a stale or
+wrong-version daemon; a live session poller takes over automatically whenever
+the daemon is unavailable.
 
 ## Groups
 
@@ -211,6 +238,8 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `inbox/` | Downloaded attachments; each file is ≤ 20 MiB, and startup/download cleanup removes files older than 7 days then prunes oldest files above 250 MiB total |
 | `prompts/` | Expiring cross-process selectable-question requests and answers |
 | `bot.lock` | Poller PID lock |
+| `daemon.json` | Standalone daemon PID, plugin version, and start time |
+| `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
 | `threads.json` | Topic registry — which session (pid/cwd) owns which forum topic |
 | `route/<thread_id>/` | Cross-process routed-message spool (topics mode) |
 
@@ -244,6 +273,15 @@ the bot DM.
   can tell which one finished.
 - Requires the bridge to be running — arming while it's off warns you, and pings
   only start once you run `/telegram on`.
+
+## Approval wait pings
+
+With omp 17, a tool approval wait that remains unresolved for two seconds sends
+`[WAIT] omp is waiting for approval: <tool>` to the active Telegram session
+topic, or to the configured away destination for a local run. A resolution
+before two seconds cancels the ping. Telegram cannot approve or deny the tool:
+finish the approval at the terminal. Session shutdown and agent completion clear
+pending timers.
 
 ## Per-session topics
 
@@ -339,15 +377,16 @@ session, `omp control`, and topics owned by other live omp processes.
   only from the originating responder in the same chat, topic, and Telegram
   message. Requests expire after five minutes and survive poll-lock handoff.
 - **One poller per token:** Telegram allows a single `getUpdates` consumer per
-  bot token. A PID lock (`bot.lock`) prevents two omp sessions from fighting; a
-  second session waits and acquires the lock within 30 s of the first quitting,
-  instead of triggering a 409 storm.
+  bot token. The standalone daemon and session fallback share a PID lock
+  (`bot.lock`), preventing 409 conflicts during takeover.
 
 ## Limitations
 
-- At least one omp session must remain alive to poll Telegram. Another live
-  session takes the lock within roughly 30 seconds after the holder exits.
-- `/spawn` and `/sessions` require omp to run inside a herdr-managed pane.
+- The standalone daemon requires owner-DM topics, an enabled bridge, and no
+  configured groups. Other configurations use a live omp session as the poller.
+- The daemon runs only while the host is awake and logged in; it is not a
+  launchd/systemd service.
+- `/spawn`, `/sessions`, and stale-topic auto-resume require herdr.
 - Sessions already running when topics are first enabled must reload or restart
   before they claim a Telegram topic.
 - Owner-DM topics record the exact current session and herdr space for auto-resume. Legacy topics and sessions started outside herdr must be resumed locally once before this metadata exists.
@@ -358,7 +397,8 @@ session, `omp control`, and topics owned by other live omp processes.
 - The Bot API exposes incoming updates, not searchable Telegram history.
 - Native `/new`, `/plan`, and `/goal` are not relayed: omp does not expose their
   TUI-only session/mode actions to asynchronous extensions. `/spawn` starts a
-  separate session; plan approval and local tool-approval overlays remain local.
+  separate session. Tool-approval waits can ping Telegram, but approval and plan
+  approval remain terminal-local.
 
 ## Notes
 

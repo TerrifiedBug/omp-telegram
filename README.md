@@ -8,7 +8,7 @@ commands like `/spawn`, `/sessions`, `/cleanup`, and `/status`.
 
 ## What you need
 
-- [omp](https://github.com/can1357/oh-my-pi) 16.3.12 or newer
+- [omp](https://github.com/can1357/oh-my-pi) 17.0.0 or newer
 - [Bun](https://bun.sh/) 1.3 or newer
 - A Telegram bot from [@BotFather](https://t.me/BotFather)
 - [herdr](https://herdr.dev/) for `/spawn`, `/sessions`, and stale-topic auto-resume
@@ -18,9 +18,7 @@ Regular Telegram chat works without herdr.
 ## 1. Install
 
 ```bash
-git clone https://github.com/TerrifiedBug/omp-telegram.git
-cd omp-telegram
-omp plugin link .
+omp plugin install omp-telegram
 ```
 
 There is no build step and no runtime dependency install.
@@ -42,6 +40,11 @@ Open omp and run:
 ```
 
 `/telegram on` keeps the bridge enabled for future omp sessions.
+
+With owner-DM topics enabled and no groups configured, `/telegram on` also
+starts a laptop-wide Bun daemon. It keeps polling when every omp session is
+closed, so a message to a saved session topic can resume that session. Other
+configurations use a live omp session as the poller.
 
 ## 4. Pair your Telegram account
 
@@ -76,11 +79,13 @@ they can claim their own topic.
 Inside **omp control**:
 
 ```text
-/spawn       Choose a herdr space and start another omp session
-/sessions    See live, unattached, and stale sessions
-/cleanup     Delete stale and duplicate topics after explicit confirmation
-/status      Check the bridge
-/help        Show Telegram commands
+/spawn                         Choose a herdr space and start another omp session
+/spawn new <branch> [space]    Create a worktree from a space and start omp
+/spawn dir <absolute-path>     Create a herdr workspace and start omp
+/sessions                      See live, unattached, and stale sessions
+/cleanup                       Delete stale and duplicate topics after confirmation
+/status                        Check the bridge
+/help                          Show Telegram commands
 ```
 
 Inside an omp session topic:
@@ -91,18 +96,36 @@ Inside an omp session topic:
 - Use `/model`, `/switch`, and `/thinking` to change that session with inline pickers.
 - When omp needs a choice, the bot shows single-select, multi-select, and **Other**
   controls directly in Telegram.
+- When omp waits more than two seconds for tool approval, the bot pings the
+  active session topic. Approval still happens at the terminal.
 - Send photos or files as normal Telegram attachments.
-- If its omp process was closed, send a normal message to queue it and resume the exact saved session in its original herdr space. Another omp session must still be running to poll Telegram.
+- Voice notes are saved as attachments. To append a local transcript to the
+  agent prompt, configure a no-shell argv template:
+
+  ```text
+  /telegram set transcribeCommand ["whisper-cli","-f","{file}"]
+  ```
+- If its omp process was closed, send a normal message to queue it and resume
+  the exact saved session in its original herdr space.
 
 Replies stream back while omp is working.
 
 ## If something looks wrong
 
-- **No omp control topic:** enable private-chat topics in BotFather, then restart the omp session polling Telegram.
-- **`/spawn` says herdr is unavailable:** start omp inside a herdr-managed pane.
-- **A running session has no topic:** restart that omp session, then check `/sessions` again.
-- **A stale topic will not resume:** topics created before auto-resume, or outside herdr, must be resumed locally once to record their session and herdr identity.
-- **The bot stops responding:** keep at least one omp session running. Another live session takes over polling automatically.
+- Start with `/telegram doctor`. It checks token validity, webhook conflicts,
+  daemon and poll-lock state, state-file permissions, optional binaries, and
+  herdr reachability without printing the bot token.
+- **No omp control topic:** enable private-chat topics in BotFather, then run
+  `/telegram daemon restart`.
+- **`/spawn` says herdr is unavailable:** run omp inside a herdr-managed pane;
+  `/spawn dir` can create a workspace from any existing herdr session.
+- **A running session has no topic:** restart that omp session, then check
+  `/sessions` again.
+- **A stale topic will not resume:** legacy topics and sessions started outside
+  herdr must be resumed locally once to record their session and herdr identity.
+- **The bot stops responding:** run `/telegram doctor`, then
+  `/telegram daemon restart`. A session poller takes over when the daemon is
+  disabled or unavailable.
 
 ## Security
 

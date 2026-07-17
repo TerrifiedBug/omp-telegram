@@ -44,6 +44,8 @@ export type Access = {
   deliverAs?: "steer" | "followUp";
   /** Stream partial output to Telegram (draft/edit). Default true. */
   streaming?: boolean;
+  /** Optional argv template for voice-note transcription. Each `{file}` substring is replaced with the downloaded path. */
+  transcribeCommand?: string[];
   /** Chat to ping when a locally-started run goes idle. Unset = off. Set via `/telegram notify`. */
   notifyChat?: string;
   /** Chat hosting per-session topics (a DM with the bot's forum-topic mode enabled, or a forum supergroup). Presence enables topics mode. Set via `/telegram topics`. */
@@ -89,6 +91,20 @@ export function statePath(...parts: string[]): string {
   return join(stateDir(), ...parts);
 }
 
+/** Resolve the bot token from the process environment or the private state file. */
+export function resolveToken(): string {
+  if (process.env.TELEGRAM_BOT_TOKEN) return process.env.TELEGRAM_BOT_TOKEN;
+  try {
+    for (const line of readFileSync(statePath(".env"), "utf8").split("\n")) {
+      const match = /^TELEGRAM_BOT_TOKEN=(.*)$/.exec(line.trim());
+      if (match) return match[1];
+    }
+  } catch {
+    /* no .env yet */
+  }
+  return "";
+}
+
 export function defaultAccess(): Access {
   return { enabled: false, dmPolicy: "pairing", allowFrom: [], groups: {}, pending: {} };
 }
@@ -102,6 +118,16 @@ export function pairedOwnerId(access: Access): string | undefined {
 export function isPairedOwnerDm(userId: string, chatId: string, chatType: string, access: Access): boolean {
   const ownerId = pairedOwnerId(access);
   return ownerId != null && chatType === "private" && userId === ownerId && chatId === ownerId;
+}
+
+/** Authorize one Telegram prompt answer using the same DM/group policy as inbound turns. */
+export function canAnswerPrompt(responderId: string, chatId: string, chatType: string, access: Access): boolean {
+  if (chatType === "private") return isPairedOwnerDm(responderId, chatId, chatType, access);
+  if (chatType !== "group" && chatType !== "supergroup") return false;
+  const policy = access.groups[chatId];
+  if (!policy) return false;
+  const allowed = policy.allowFrom ?? [];
+  return allowed.length === 0 || allowed.includes(responderId);
 }
 
 /** Dedicated owner-DM destination for global control commands, when configured. */
@@ -165,6 +191,9 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       chunkMode: parsed.chunkMode,
       deliverAs: parsed.deliverAs,
       streaming: parsed.streaming,
+      transcribeCommand: Array.isArray(parsed.transcribeCommand) && parsed.transcribeCommand.every((arg) => typeof arg === "string")
+        ? parsed.transcribeCommand
+        : undefined,
       notifyChat: parsed.notifyChat,
       topicsChat: parsed.topicsChat,
       controlThreadId: parsed.controlThreadId,

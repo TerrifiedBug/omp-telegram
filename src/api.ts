@@ -38,6 +38,11 @@ export class TgError extends Error {
   }
 }
 
+/** Telegram's definitive signal that a locally saved forum topic was deleted. */
+export function isMissingThreadError(err: unknown): boolean {
+  return err instanceof TgError && err.code === 400 && /message thread not found/i.test(err.message);
+}
+
 // ---- Wire types (only the fields we read) --------------------------------
 
 export interface TgUser {
@@ -109,6 +114,8 @@ export interface TgMessage {
   media_group_id?: string;
   is_topic_message?: boolean;
   message_thread_id?: number;
+  /** Internal spool sentinel; not a Bot API field. */
+  edited_flag?: true;
 }
 export interface TgCallbackQuery {
   id: string;
@@ -119,6 +126,7 @@ export interface TgCallbackQuery {
 export interface TgUpdate {
   update_id: number;
   message?: TgMessage;
+  edited_message?: TgMessage;
   callback_query?: TgCallbackQuery;
 }
 export interface TgFile {
@@ -150,6 +158,13 @@ export async function tg<T>(
     throw new TgError(data.description ?? `Telegram ${method} failed`, data.error_code ?? res.status, data.parameters?.retry_after);
   }
   return data.result as T;
+}
+
+/** Diagnose persistent getUpdates conflicts without changing webhook state. */
+export async function webhookConflictHint(token: string): Promise<string | undefined> {
+  const info = await tg<{ url?: string }>(token, "getWebhookInfo");
+  const url = info.url?.trim();
+  return url ? `a webhook is set on this token (${url}) — delete it (deleteWebhook) or use a different token` : undefined;
 }
 
 /** Multipart upload (sendPhoto/sendDocument). 120s default timeout. */
@@ -272,7 +287,7 @@ export class Poller {
         const updates = await tg<TgUpdate[]>(
           token,
           "getUpdates",
-          { offset, timeout: 30, allowed_updates: ["message", "callback_query"] },
+          { offset, timeout: 30, allowed_updates: ["message", "edited_message", "callback_query"] },
           { timeoutMs: 40_000, signal: this.#abort!.signal },
         );
         attempt = 0;
