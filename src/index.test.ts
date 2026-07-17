@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
-import { isTaskSubagent, parseTelegramPromptTarget } from "./index";
+import { approvalPingTarget, isTaskSubagent, parseTelegramPromptTarget } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -24,6 +24,18 @@ describe("Telegram session ownership", () => {
     expect(isTaskSubagent(false, ["read", "yield"])).toBe(true);
     expect(isTaskSubagent(true, ["read", "yield"])).toBe(false);
     expect(isTaskSubagent(false, ["read"])).toBe(false);
+  });
+});
+
+describe("approval ping targeting", () => {
+  const active = { chatId: "42", threadId: 7 };
+  const away = { chatId: "99" };
+
+  test("prefers the active Telegram conversation and otherwise uses the away target", () => {
+    expect(approvalPingTarget(true, active, away)).toEqual(active);
+    expect(approvalPingTarget(false, active, away)).toEqual(away);
+    expect(approvalPingTarget(true, undefined, away)).toBeUndefined();
+    expect(approvalPingTarget(false, undefined, undefined)).toBeUndefined();
   });
 });
 

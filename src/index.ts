@@ -71,6 +71,16 @@ interface AskParams {
 }
 
 
+interface PendingApproval {
+  toolName: string;
+  chatId: string;
+  threadId?: number;
+  timer?: NodeJS.Timeout;
+  messageId?: number;
+  resolved?: boolean;
+  approved?: boolean;
+}
+
 
 
 /** Task sessions are headless and always carry the required yield tool. */
@@ -107,6 +117,15 @@ export function parseTelegramPromptTarget(prompt: string): PromptTarget | undefi
   const threadId = rawThread == null ? undefined : Number(rawThread);
   if (rawThread != null && !Number.isInteger(threadId)) return undefined;
   return { responderId, chatId, chatType, ...(threadId == null ? {} : { threadId }) };
+}
+
+/** Active Telegram turns outrank the optional away-notification destination. */
+export function approvalPingTarget(
+  telegramActive: boolean,
+  activeTarget: { chatId: string; threadId?: number } | undefined,
+  awayTarget: { chatId: string; threadId?: number } | undefined,
+): { chatId: string; threadId?: number } | undefined {
+  return telegramActive ? activeTarget : awayTarget;
 }
 function promptTargetFromMessage(message: TgMessage): PromptTarget | undefined {
   if (!message.from) return undefined;
@@ -169,6 +188,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   const batches = new Map<string, Batch>();
   const notified = new Set<string>();
+  const pendingApprovals = new Map<string, PendingApproval>();
   const lockPath = statePath("bot.lock");
   const bridgeHost: BridgeHost = {
     isDaemon: false,
@@ -1355,6 +1375,71 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       ],
     };
   });
+  pi.on("tool_approval_requested", (event, ctx) => {
+    lastCtx = ctx;
+    const currentAccess = loadAccess(warn);
+    const ownTarget =
+      ownTopic && currentAccess.topicsChat ? { chatId: currentAccess.topicsChat, threadId: ownTopic.threadId } : undefined;
+    const target = approvalPingTarget(
+      outbound.isActive(),
+      outbound.lastTarget(),
+      awayNotifyTarget(false, currentAccess, token.length > 0, ownTarget),
+    );
+    if (!target) return;
+    const previous = pendingApprovals.get(event.toolCallId);
+    clearTimeout(previous?.timer);
+    const pending: PendingApproval = { toolName: event.toolName, chatId: target.chatId, threadId: target.threadId };
+    pending.timer = setTimeout(() => {
+      if (pendingApprovals.get(event.toolCallId) !== pending) return;
+      pending.timer = undefined;
+      const reason = event.reason?.trim() ? `\n${event.reason.trim()}` : "";
+      void outbound
+        .send(
+          pending.chatId,
+          `⏳ omp is waiting for approval: ${event.toolName}${reason}\nApprove at the terminal — remote approval isn't supported.`,
+          { threadId: pending.threadId },
+        )
+        .then(async (ids) => {
+          if (pendingApprovals.get(event.toolCallId) !== pending) return;
+          pending.messageId = ids[0];
+          if (pending.resolved && pending.messageId != null) {
+            await tg(token, "editMessageText", {
+              chat_id: pending.chatId,
+              message_id: pending.messageId,
+              text: `${pending.approved ? "✔" : "✖"} ${pending.toolName} ${pending.approved ? "approved" : "denied"}`,
+            }).catch(() => {});
+            pendingApprovals.delete(event.toolCallId);
+          }
+        })
+        .catch((err) => {
+          pendingApprovals.delete(event.toolCallId);
+          log.debug(`[telegram] approval ping failed: ${String(err)}`);
+        });
+    }, 2_000);
+    pending.timer.unref?.();
+    pendingApprovals.set(event.toolCallId, pending);
+  });
+  pi.on("tool_approval_resolved", (event, ctx) => {
+    lastCtx = ctx;
+    const pending = pendingApprovals.get(event.toolCallId);
+    if (!pending) return;
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pendingApprovals.delete(event.toolCallId);
+      return;
+    }
+    if (pending.messageId == null) {
+      pending.resolved = true;
+      pending.approved = event.approved;
+      return;
+    }
+    pendingApprovals.delete(event.toolCallId);
+    void tg(token, "editMessageText", {
+      chat_id: pending.chatId,
+      message_id: pending.messageId,
+      text: `${event.approved ? "✔" : "✖"} ${event.toolName} ${event.approved ? "approved" : "denied"}`,
+    }).catch(() => {});
+  });
   pi.on("message_update", (e, ctx) => {
     lastCtx = ctx;
     outbound.onMessageUpdate(e.message);
@@ -1375,6 +1460,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   pi.on("agent_end", async (e, ctx) => {
     lastCtx = ctx;
+    for (const pending of pendingApprovals.values()) {
+      clearTimeout(pending.timer);
+    }
+    pendingApprovals.clear();
     const wasActive = outbound.isActive();
     await outbound.onAgentEnd();
     await restorePromptTools();
