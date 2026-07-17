@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
-import { TgError, type TgMessage } from "./api";
-import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat, isMissingThreadError, isTaskSubagent, parseTelegramPromptTarget } from "./index";
+import { isMissingThreadError, TgError, type TgMessage } from "./api";
+import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
+import { isTaskSubagent, parseTelegramPromptTarget } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {

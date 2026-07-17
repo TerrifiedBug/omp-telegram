@@ -38,6 +38,11 @@ export class TgError extends Error {
   }
 }
 
+/** Telegram's definitive signal that a locally saved forum topic was deleted. */
+export function isMissingThreadError(err: unknown): boolean {
+  return err instanceof TgError && err.code === 400 && /message thread not found/i.test(err.message);
+}
+
 // ---- Wire types (only the fields we read) --------------------------------
 
 export interface TgUser {
