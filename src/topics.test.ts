@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { statePath } from "./access";
@@ -13,7 +13,9 @@ import {
   findAdoptableThread,
   isResumedOwner,
   loadRegistry,
+  purgeRouteDir,
   releaseThread,
+  staleThreads,
   watchRoute,
   writeRouted,
 } from "./topics";
@@ -193,5 +195,44 @@ describe("writeRouted / watchRoute", () => {
     dispose();
     expect(got).toHaveLength(0);
     expect(readdirSync(spool)).toContain("tmp-999-1.json");
+  });
+});
+
+describe("staleThreads", () => {
+  const reg = (pids: Record<string, number>): ThreadRegistry => ({
+    version: 1,
+    chatId: "100",
+    threads: Object.fromEntries(
+      Object.entries(pids).map(([id, pid]) => [id, { pid, cwd: `/p${id}`, name: `t${id}`, claimedAt: 0 }]),
+    ),
+  });
+
+  test("returns only dead-pid entries, sorted ascending by thread id", () => {
+    const stale = staleThreads(reg({ "9": 200, "3": 100, "5": 300 }), (pid) => pid === 300);
+    expect(stale.map(([id]) => id)).toEqual([3, 9]);
+    expect(stale[0][1].name).toBe("t3");
+  });
+
+  test("excludes live-pid entries entirely", () => {
+    expect(staleThreads(reg({ "7": 1 }), () => true)).toEqual([]);
+  });
+
+  test("honors excludeThreadId even when that entry is dead", () => {
+    const stale = staleThreads(reg({ "7": 100, "12": 200 }), () => false, 7);
+    expect(stale.map(([id]) => id)).toEqual([12]);
+  });
+});
+
+describe("purgeRouteDir", () => {
+  test("removes an existing spool dir with contents", () => {
+    writeRouted(7, { message_id: 1, date: 0, chat: { id: 100, type: "supergroup" }, is_topic_message: true, message_thread_id: 7 });
+    const spool = statePath("route", "7");
+    expect(existsSync(spool)).toBe(true);
+    purgeRouteDir(7);
+    expect(existsSync(spool)).toBe(false);
+  });
+
+  test("does not throw when the dir does not exist", () => {
+    expect(() => purgeRouteDir(999)).not.toThrow();
   });
 });

@@ -74,6 +74,11 @@ The bot creates:
 Restart any omp sessions that were already running before you enabled topics so
 they can claim their own topic.
 
+Topics persist and are re-adopted on restart. To tidy them automatically instead,
+run `/telegram topics tidy on` — each session's topic is deleted (DM host) or
+closed and reopened on re-adoption (group host) when it exits. Sweep leftovers from
+crashed sessions with `/cleanup`.
+
 ## Use it
 
 Inside **omp control**:
@@ -83,7 +88,7 @@ Inside **omp control**:
 /spawn new <branch> [space]    Create a worktree from a space and start omp
 /spawn dir <absolute-path>     Create a herdr workspace and start omp
 /sessions                      See live, unattached, and stale sessions
-/cleanup                       Delete stale and duplicate topics after confirmation
+/cleanup [go]                   Tidy topics of exited sessions (delete in DM, close in group); go performs it
 /status                        Check the bridge
 /help                          Show Telegram commands
 ```

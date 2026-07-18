@@ -4,6 +4,7 @@ import {
   type Access,
   controlTopicCreationChat,
   gate,
+  isDmChat,
   isPairedOwnerDm,
   loadAccess,
   pairedOwnerId,
@@ -21,12 +22,13 @@ import {
 import type { TelegramPromptController } from "./prompts";
 import {
   type ThreadEntry,
-  type ThreadRegistry,
   decideRoute,
   isAlive,
   isResumedOwner,
   loadRegistry,
-  saveRegistry,
+  purgeRouteDir,
+  releaseThread,
+  staleThreads,
   writeRouted,
 } from "./topics";
 
@@ -34,7 +36,7 @@ export const BOT_COMMANDS = [
   { command: "start", description: "Pairing instructions" },
   { command: "spawn", description: "Start omp in a herdr space, new worktree, or directory" },
   { command: "sessions", description: "List active omp sessions" },
-  { command: "cleanup", description: "Delete stale and duplicate omp topics" },
+  { command: "cleanup", description: "Tidy topics of exited sessions" },
   { command: "stop", description: "Abort this topic's omp task" },
   { command: "compact", description: "Compact this session's context" },
   { command: "model", description: "Show or change this session's model" },
@@ -135,27 +137,14 @@ export function canAutoResumeTopic(
   );
 }
 
-/** Delete stale topics and same-process extras while preserving live sibling sessions. */
-export async function cleanupRegisteredTopics(
-  registry: ThreadRegistry,
-  keepThreadId: number,
-  selfPid: number,
-  alive: (pid: number) => boolean,
-  deleteTopic: (threadId: number) => Promise<void>,
-): Promise<{ deletedThreadIds: number[]; failed: number }> {
-  const deletedThreadIds: number[] = [];
-  let failed = 0;
-  for (const [threadIdText, entry] of Object.entries(registry.threads)) {
-    const threadId = Number(threadIdText);
-    if (threadId === keepThreadId || (entry.pid !== selfPid && alive(entry.pid))) continue;
-    try {
-      await deleteTopic(threadId);
-      deletedThreadIds.push(threadId);
-    } catch {
-      failed++;
-    }
+/** Delete (DM host) or close (forum supergroup) one topic. Caller owns error handling. */
+export async function tidyRemoteTopic(callTelegram: TelegramCall, chatId: string, threadId: number): Promise<"deleted" | "closed"> {
+  if (isDmChat(chatId)) {
+    await callTelegram("deleteForumTopic", { chat_id: chatId, message_thread_id: threadId });
+    return "deleted";
   }
-  return { deletedThreadIds, failed };
+  await callTelegram("closeForumTopic", { chat_id: chatId, message_thread_id: threadId });
+  return "closed";
 }
 
 let controlTopicCreating: Promise<void> | undefined;
@@ -273,7 +262,7 @@ export async function handleGlobalCommand(
       access,
       msg,
       owner
-        ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/spawn new <branch> [space] — create a worktree and start omp\n/spawn dir <absolute-path> — create a workspace and start omp\n/sessions — list active omp sessions and topic attachment\n/cleanup — delete all other omp topics\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
+        ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/spawn new <branch> [space] — create a worktree and start omp\n/spawn dir <absolute-path> — create a workspace and start omp\n/sessions — list active omp sessions and topic attachment\n/cleanup [go] — tidy topics of exited sessions\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
         : "/start — pairing instructions\n/status — pairing state\n/whoami — show Telegram IDs",
     );
   } else if (command === "whoami") {
@@ -294,50 +283,49 @@ export async function handleGlobalCommand(
   } else if (command === "cleanup") {
     if (!owner) {
       await commandReply(host, access, msg, "Pair this DM locally before using cleanup.");
+    } else if (!access.topicsChat) {
+      await commandReply(host, access, msg, "Topics mode is off — nothing to clean.");
+    } else if (args !== "" && args !== "go") {
+      await commandReply(host, access, msg, "usage: /cleanup [go]");
     } else {
-      const keepThreadId = host.ownThreadId() ?? -1;
-      if (!host.isDaemon && keepThreadId < 0) {
-        await commandReply(host, access, msg, "No main omp topic is attached, so cleanup was skipped.");
-        return true;
-      }
       const registry = loadRegistry(host.warn);
-      const otherCount = Object.keys(registry.threads).filter((threadId) => Number(threadId) !== keepThreadId).length;
-      const protectedCount = Object.entries(registry.threads).filter(
-        ([threadId, entry]) => Number(threadId) !== keepThreadId && entry.pid !== host.selfPid && isAlive(entry.pid),
-      ).length;
-      const count = otherCount - protectedCount;
-      const protectedText = protectedCount
-        ? ` ${protectedCount} topic${protectedCount === 1 ? "" : "s"} owned by other live omp sessions will stay.`
-        : "";
-      const preserved = host.isDaemon ? "Topics owned by live omp sessions and omp control remain." : "The main omp topic and omp control remain.";
-      if (count === 0) {
-        await commandReply(host, access, msg, `Nothing stale or duplicated to clean up. ${preserved}${protectedText}`);
-      } else if (args !== "confirm") {
-        await commandReply(
-          host,
-          access,
-          msg,
-          `This permanently deletes ${count} stale or duplicate omp topic${count === 1 ? "" : "s"} and all messages in ${count === 1 ? "it" : "them"}. ${preserved}${protectedText}\n\nRun /cleanup confirm to continue.`,
-        );
+      const topicsChat = registry.chatId || access.topicsChat;
+      const stale = staleThreads(registry, isAlive, access.controlThreadId);
+      if (stale.length === 0) {
+        await commandReply(host, access, msg, "Nothing to clean — no stale session topics. Live sessions and omp control remain.");
+      } else if (args === "") {
+        const lines = stale.map(([threadId, entry]) => `#${threadId} ${entry.name} — ${entry.cwd}`).join("\n");
+        const action = isDmChat(topicsChat)
+          ? `Run /cleanup go to DELETE these ${stale.length} topic${stale.length === 1 ? "" : "s"} and their message history.`
+          : `Run /cleanup go to close these ${stale.length} topic${stale.length === 1 ? "" : "s"} (history kept; reopened on re-adoption).`;
+        await commandReply(host, access, msg, `${lines}\n\n${action}`);
       } else {
-        const topicsChat = registry.chatId || access.topicsChat!;
-        const result = await cleanupRegisteredTopics(registry, keepThreadId, host.selfPid, isAlive, async (threadId) => {
+        // args === "go": re-derived above; never act on the preview.
+        const deletes = isDmChat(topicsChat);
+        let cleaned = 0;
+        let failed = 0;
+        for (const [threadId, entry] of stale) {
           try {
-            await host.callTelegram("deleteForumTopic", { chat_id: topicsChat, message_thread_id: threadId });
+            const mode = await tidyRemoteTopic(host.callTelegram, topicsChat, threadId);
+            if (mode === "deleted") {
+              releaseThread(threadId, entry.pid, host.warn);
+              purgeRouteDir(threadId);
+            }
+            cleaned++;
           } catch (err) {
-            if (!isMissingThreadError(err)) throw err;
+            if (!isMissingThreadError(err)) {
+              host.warn(`could not tidy topic #${threadId}: ${String(err)}`);
+              failed++;
+              continue;
+            }
+            releaseThread(threadId, entry.pid, host.warn); // remote topic already gone
+            purgeRouteDir(threadId);
+            cleaned++;
           }
-        });
-        const currentRegistry = loadRegistry(host.warn);
-        for (const threadId of result.deletedThreadIds) delete currentRegistry.threads[String(threadId)];
-        saveRegistry(currentRegistry);
-        const deleted = result.deletedThreadIds.length;
-        await commandReply(
-          host,
-          access,
-          msg,
-          `Deleted ${deleted} stale or duplicate omp topic${deleted === 1 ? "" : "s"}. ${preserved}${protectedText}${result.failed ? ` ${result.failed} could not be deleted and remain registered.` : ""}`,
-        );
+        }
+        const verb = deletes ? "deleted" : "closed";
+        const suffix = failed > 0 ? ` (${failed} failed — see omp logs)` : "";
+        await commandReply(host, access, msg, `🧹 ${verb} ${cleaned} stale topic${cleaned === 1 ? "" : "s"}${suffix}`);
       }
     }
   } else {

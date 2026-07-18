@@ -50,6 +50,8 @@ export type Access = {
   notifyChat?: string;
   /** Chat hosting per-session topics (a DM with the bot's forum-topic mode enabled, or a forum supergroup). Presence enables topics mode. Set via `/telegram topics`. */
   topicsChat?: string;
+  /** Tidy this session's topic on clean exit: delete it in a DM host, close it in a forum supergroup. Set via /telegram topics tidy. */
+  topicsTidy?: boolean;
   /** Persistent owner-DM topic used for bridge/herdr control commands. */
   controlThreadId?: number;
   /** Laptop-wide "user stepped away" flag. While set, a local run's final assistant message is sent to Telegram. Set via `/telegram away`, cleared on interactive local input. */
@@ -196,6 +198,7 @@ export function loadAccess(warn?: (msg: string) => void): Access {
         : undefined,
       notifyChat: parsed.notifyChat,
       topicsChat: parsed.topicsChat,
+      topicsTidy: parsed.topicsTidy,
       controlThreadId: parsed.controlThreadId,
       away: parsed.away,
     };
