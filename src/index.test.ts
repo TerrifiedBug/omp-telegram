@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
-import { canAutoResumeTopic, cleanupRegisteredTopics, consumeOutsidePrivateChat } from "./bridge";
+import { canAutoResumeTopic, consumeOutsidePrivateChat } from "./bridge";
 import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
@@ -74,37 +74,6 @@ describe("Telegram doctor", () => {
       "Herdr: probe failed: not installed",
       "Inbox: 3 files · 99 bytes",
     ]);
-  });
-});
-
-describe("Telegram topic cleanup", () => {
-  test("removes same-process and stale topics without touching live sibling sessions", async () => {
-    const registry = {
-      version: 1 as const,
-      chatId: "42",
-      threads: {
-        "1": { pid: 1, cwd: "/main", name: "main", claimedAt: 1 },
-        "2": { pid: 1, cwd: "/child", name: "child", claimedAt: 2 },
-        "3": { pid: 3, cwd: "/stale", name: "stale", claimedAt: 3 },
-        "4": { pid: 2, cwd: "/sibling", name: "sibling", claimedAt: 4 },
-      },
-    };
-    const attempted: number[] = [];
-
-    const result = await cleanupRegisteredTopics(
-      registry,
-      1,
-      1,
-      (pid) => pid === 2,
-      async (threadId) => {
-        attempted.push(threadId);
-        if (threadId === 3) throw new Error("transient Telegram failure");
-      },
-    );
-
-    expect(result).toEqual({ deletedThreadIds: [2], failed: 1 });
-    expect(attempted).toEqual([2, 3]);
-    expect(Object.keys(registry.threads)).toEqual(["1", "2", "3", "4"]);
   });
 });
 

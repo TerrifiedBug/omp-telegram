@@ -7,7 +7,7 @@ import type { Logger, TgMessage } from "./api";
 import { type BridgeHost, handleUpdate } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
-import { saveRegistry } from "./topics";
+import { loadRegistry, saveRegistry } from "./topics";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 let dir: string;
@@ -144,5 +144,48 @@ describe("shared bridge routing", () => {
     expect(sessionCommands).toEqual([]);
     expect(delivered).toHaveLength(1);
     expect(delivered[0].edited_flag).toBe(true);
+  });
+});
+
+describe("cleanup command", () => {
+  const seedStale = (chatId: string) =>
+    saveRegistry({
+      version: 1,
+      chatId,
+      threads: {
+        "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 }, // dead pid → stale
+        "101": { pid: process.pid, cwd: "/live", name: "live", claimedAt: 2 }, // alive → kept
+        "99": { pid: 999999, cwd: "/ctl", name: "control", claimedAt: 3 }, // control topic → excluded
+      },
+    });
+
+  test("bare /cleanup previews only stale topics and acts on nothing", async () => {
+    seedStale("42");
+    await handleUpdate(makeHost(), { update_id: 10, message: message("/cleanup") });
+    const preview = calls.find((c) => String(c.payload.text ?? "").includes("Run /cleanup go"))?.payload.text as string;
+    expect(preview).toContain("#100 stale — /stale");
+    expect(preview).not.toContain("#101");
+    expect(preview).not.toContain("#99");
+    expect(calls.some((c) => c.method === "deleteForumTopic" || c.method === "closeForumTopic")).toBe(false);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]);
+  });
+
+  test("/cleanup go deletes stale DM topics and drops their registry entries", async () => {
+    seedStale("42");
+    await handleUpdate(makeHost(), { update_id: 11, message: message("/cleanup go") });
+    expect(calls.filter((c) => c.method === "deleteForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
+    expect(calls.some((c) => c.method === "closeForumTopic")).toBe(false);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["101", "99"]);
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 deleted 1 stale topic"))).toBe(true);
+  });
+
+  test("/cleanup go closes stale group topics and keeps their entries for re-adoption", async () => {
+    saveAccess({ ...defaultAccess(), enabled: true, allowFrom: ["42"], topicsChat: "-100200", controlThreadId: 99 });
+    seedStale("-100200");
+    await handleUpdate(makeHost(), { update_id: 12, message: message("/cleanup go") });
+    expect(calls.filter((c) => c.method === "closeForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
+    expect(calls.some((c) => c.method === "deleteForumTopic")).toBe(false);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]); // group entry kept, parked
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 1 stale topic"))).toBe(true);
   });
 });

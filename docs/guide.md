@@ -113,7 +113,7 @@ Codes expire after 1 hour; at most 3 are pending before an owner is established.
 | `group rm <id>` | Remove a group |
 | `set <key> <value>` | Tune delivery/UX (see below) |
 | `notify <chat_id>` / `notify off` | Ping a chat when a **locally-started** run goes idle (AFK pings). Off by default. |
-| `topics on` / `topics <chat_id>` / `topics off` | Per-session **forum topics**: claim one topic per omp session, routing each session's traffic to its own thread. `on` auto-hosts in your paired DM (no id needed); `<chat_id>` hosts in a specific chat (e.g. a forum supergroup). Off by default. |
+| `topics on` / `topics <chat_id>` / `topics off` / `topics tidy on\|off` | Per-session **forum topics**: claim one topic per omp session, routing each session's traffic to its own thread. `on` auto-hosts in your paired DM (no id needed); `<chat_id>` hosts in a specific chat (e.g. a forum supergroup). `tidy on` deletes (DM host) or closes (group host) a session's topic when it exits; a re-adopted closed group topic is reopened. Off by default. |
 
 Every mutation persists to `access.json` and takes effect on the next inbound
 message (the poller re-reads access per message).
@@ -136,7 +136,7 @@ notice in the originating topic.
 | `/spawn new <branch> [space]` | Create an unfocused git worktree from the selected source space, then run omp in its root pane. |
 | `/spawn dir <absolute-path>` | Create an unfocused herdr workspace rooted at an existing absolute directory, then run omp there. |
 | `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
-| `/cleanup [confirm]` | Permanently delete stale topics and extra topics created by this omp process, including pre-fix task-subagent spam. The current main session, control topic, and topics owned by other live omp processes remain. The bare command previews the count; `/cleanup confirm` performs the deletion. |
+| `/cleanup [go]` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews; `/cleanup go` performs the tidy. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
@@ -296,6 +296,8 @@ operator-chosen chat.
 /telegram topics -1001234567890 # topics on, hosted in a forum supergroup
 /telegram topics off          # release this session's topic and turn topics off
 /telegram topics              # show the topics chat, this session's topic, and DM forum-topic mode
+/telegram topics tidy on      # tidy this session's topic on clean exit (delete in DM host, close in group host)
+/telegram topics tidy off     # keep topics after exit for re-adoption (default)
 ```
 
 - Each session **claims one topic** on start (and when that session runs `/telegram topics on` or `/telegram topics <chat_id>`),
@@ -337,13 +339,18 @@ configured group) like any other outbound target. If topic creation fails (mode 
 missing admin right), the session logs a warning and runs untopiced — the bridge
 never blocks.
 
-**Why topics persist (no automatic cleanup).** Topics are **not** closed or deleted
-when a session exits; they stay and are **re-adopted** on restart. In a DM the Bot
-API only lets a bot *delete* a topic (destructive — it also deletes all its
-messages); `closeForumTopic`/`reopenForumTopic` (park without deleting) are
-**forum-supergroup only**. `/cleanup` therefore requires `/cleanup confirm`,
-deletes stale and same-process duplicate topics, and preserves the current main
-session, `omp control`, and topics owned by other live omp processes.
+**Topic lifecycle — persist by default, opt-in tidy.** By default topics are **not**
+closed or deleted when a session exits; they persist and are **re-adopted** on
+restart in the same directory. Turn on **tidy mode** with `/telegram topics tidy on`
+to clean each session's topic on a **clean exit**: in a DM host the topic is
+*deleted* (the Bot API's only option there — this also removes its message history
+and its stale-topic auto-resume identity), and in a **forum supergroup** it is
+*closed* (parked, history kept) and **reopened** automatically when the next omp run
+in that directory re-adopts it. A crash or `kill -9` skips the clean-exit path; sweep
+those leftovers with the owner `/cleanup` command — `/cleanup` previews the stale
+topics and `/cleanup go` deletes (DM host) or closes (group host) them, never
+touching live sessions or `omp control`. Either way, `/spawn` from Telegram always
+starts a fresh session in a brand-new topic.
 
 ## Security
 

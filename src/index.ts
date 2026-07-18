@@ -26,13 +26,13 @@ import {
   statePath,
 } from "./access";
 import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg, webhookConflictHint } from "./api";
-import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand } from "./bridge";
+import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand, tidyRemoteTopic } from "./bridge";
 import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
-import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, releaseThread, watchRoute } from "./topics";
+import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -508,6 +508,12 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         name = existing[1].name;
         claimThread(access.topicsChat, threadId, threadEntry(ctx, cwd, name, existing[1].claimedAt), warn);
         try {
+          // A group-hosted topic may have been parked (closed) by tidy on the last
+          // exit; reopen it. Already-open topics reject with TOPIC_NOT_MODIFIED and a
+          // genuinely deleted one still surfaces via isMissingThreadError below.
+          if (!isDmChat(access.topicsChat)) {
+            await tg(token, "reopenForumTopic", { chat_id: access.topicsChat, message_thread_id: threadId }).catch(() => {});
+          }
           await tg(token, "sendMessage", {
             chat_id: access.topicsChat,
             message_thread_id: threadId,
@@ -543,6 +549,35 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       ownTopic = undefined;
       stopWatch = undefined;
     }
+  }
+
+  /**
+   * Tidy this session's own topic on a clean exit when tidy mode is on: delete a
+   * DM-hosted topic, close a group-hosted one. Reloads access so a flag flipped by
+   * another session is honored. On any non-"missing" error the topic and its
+   * registry entry are left untouched — behavior degrades to today's persist path.
+   */
+  async function tidyOwnTopic(): Promise<void> {
+    const a = loadAccess(warn);
+    const threadId = ownTopic?.threadId;
+    if (!a.topicsTidy || threadId == null || !a.topicsChat || !token) return;
+    stopWatch?.();
+    stopWatch = undefined;
+    let mode: "deleted" | "closed";
+    try {
+      mode = await tidyRemoteTopic(bridgeHost.callTelegram, a.topicsChat, threadId);
+    } catch (err) {
+      if (!isMissingThreadError(err)) {
+        warn(`could not tidy topic #${threadId}: ${String(err)}`);
+        return;
+      }
+      mode = "deleted"; // the remote topic is already gone — reconcile local state
+    }
+    if (mode === "deleted") {
+      releaseThread(threadId, process.pid, warn);
+      purgeRouteDir(threadId);
+    }
+    ownTopic = undefined;
   }
 
 
@@ -1313,9 +1348,33 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const v = arg.trim();
     const a = loadAccess(warn);
     access = a;
+    if (/^tidy(\s|$)/.test(v)) {
+      const sub = v.slice(4).trim().toLowerCase();
+      if (sub === "on") {
+        a.topicsTidy = true;
+        saveAccess(a);
+        access = a;
+        ctx.ui.notify("telegram: topics tidy on — a session's topic is deleted (DM host) or closed (group host) when it exits", "info");
+      } else if (sub === "off") {
+        a.topicsTidy = false;
+        saveAccess(a);
+        access = a;
+        ctx.ui.notify("telegram: topics tidy off — topics persist for re-adoption", "info");
+      } else if (sub === "" || sub === "status") {
+        ctx.ui.notify(`telegram: topics tidy ${a.topicsTidy ? "on" : "off"}`, "info");
+      } else {
+        ctx.ui.notify("usage: /telegram topics tidy on | off", "warning");
+      }
+      return;
+    }
     if (v === "off") {
       stopWatch?.();
       stopWatch = undefined;
+      if (a.topicsTidy && ownTopic && a.topicsChat && token) {
+        const tid = ownTopic.threadId;
+        await tidyRemoteTopic(bridgeHost.callTelegram, a.topicsChat, tid).catch((err) => warn(`could not tidy topic #${tid}: ${String(err)}`));
+        purgeRouteDir(tid);
+      }
       if (ownTopic) releaseThread(ownTopic.threadId, process.pid);
       ownTopic = undefined;
       a.topicsChat = undefined;
@@ -1362,9 +1421,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       return;
     }
     const owned = ownTopic ? ` · this session: #${ownTopic.threadId} (${ownTopic.name})` : "";
-    if (!a.topicsChat) return ctx.ui.notify("usage: /telegram topics on | <chat_id> | off", "info");
+    if (!a.topicsChat) return ctx.ui.notify("usage: /telegram topics on | <chat_id> | off | tidy on|off", "info");
     const dmMode = isDmChat(a.topicsChat) ? ` · DM forum-topic mode: ${botHasTopics === undefined ? "unknown" : botHasTopics ? "on" : "off"}` : "";
-    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
+    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · tidy: ${a.topicsTidy ? "on" : "off"} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
   }
 
   // ---- registrations ------------------------------------------------------
@@ -1708,6 +1767,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     await restorePromptTools();
     await captureOwnSpace(ctx);
     refreshTopicClaim(ctx);
+    await tidyOwnTopic();
     stopBot();
     await poller.done();
   });

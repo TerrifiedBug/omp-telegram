@@ -5,7 +5,7 @@
 // per-topic watcher. No network here: this module is pure filesystem + policy,
 // so it is fully unit-testable. Telegram I/O stays in api.ts / outbound.ts.
 
-import { type FSWatcher, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { type FSWatcher, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureStateDir, statePath } from "./access";
 import type { Logger, TgMessage } from "./api";
@@ -99,6 +99,23 @@ export function releaseThread(threadId: number, pid: number, warn?: (msg: string
   }
 }
 
+/**
+ * Topics whose owning pid is no longer alive, sorted
+ * ascending by thread id for deterministic output. Liveness is injected (like
+ * `decideRoute`) so this stays pure and unit-testable. `excludeThreadId`
+ * defensively skips the control topic.
+ */
+export function staleThreads(
+  r: ThreadRegistry,
+  alive: (pid: number) => boolean,
+  excludeThreadId?: number,
+): Array<[number, ThreadEntry]> {
+  return Object.entries(r.threads)
+    .map(([key, entry]) => [Number(key), entry] as [number, ThreadEntry])
+    .filter(([threadId, entry]) => threadId !== excludeThreadId && !alive(entry.pid))
+    .sort((a, b) => a[0] - b[0]);
+}
+
 
 type SessionIdentity = Pick<ThreadEntry, "sessionId" | "sessionFile">;
 
@@ -169,6 +186,11 @@ export function decideRoute(
 /** Per-topic spool directory for cross-process routed payloads. Writer & watcher must agree. */
 function routeDir(threadId: number): string {
   return statePath("route", String(threadId));
+}
+
+/** Remove a topic's spool dir and any un-consumed payloads. Missing dir is a no-op. */
+export function purgeRouteDir(threadId: number): void {
+  rmSync(routeDir(threadId), { recursive: true, force: true });
 }
 
 /**
