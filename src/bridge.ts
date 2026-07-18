@@ -290,7 +290,11 @@ export async function handleGlobalCommand(
     } else {
       const registry = loadRegistry(host.warn);
       const topicsChat = registry.chatId || access.topicsChat;
-      const stale = staleThreads(registry, isAlive, access.controlThreadId);
+      // controlThreadId is an owner-DM thread; only exclude it when this session's
+      // topics are hosted in that same DM (thread ids are chat-local, so in a group
+      // host it could numerically collide with a real stale group topic).
+      const controlExclude = topicsChat === pairedOwnerId(access) ? access.controlThreadId : undefined;
+      const stale = staleThreads(registry, isAlive, controlExclude);
       if (stale.length === 0) {
         await commandReply(host, access, msg, "Nothing to clean — no stale session topics. Live sessions and omp control remain.");
       } else if (args === "") {
