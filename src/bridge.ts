@@ -10,7 +10,7 @@ import {
   pairedOwnerId,
   saveAccess,
 } from "./access";
-import { isMissingThreadError, type Logger, type TgMessage, type TgUpdate } from "./api";
+import { isMissingThreadError, type Logger, TgError, type TgMessage, type TgUpdate } from "./api";
 import {
   type TelegramCall,
   type SpawnController,
@@ -143,7 +143,13 @@ export async function tidyRemoteTopic(callTelegram: TelegramCall, chatId: string
     await callTelegram("deleteForumTopic", { chat_id: chatId, message_thread_id: threadId });
     return "deleted";
   }
-  await callTelegram("closeForumTopic", { chat_id: chatId, message_thread_id: threadId });
+  try {
+    await callTelegram("closeForumTopic", { chat_id: chatId, message_thread_id: threadId });
+  } catch (err) {
+    // An already-closed topic returns 400 TOPIC_NOT_MODIFIED; that is idempotent success.
+    // /cleanup keeps closed group entries, so a repeat run must not report this as failed.
+    if (!(err instanceof TgError && err.code === 400 && /topic_not_modified/i.test(err.message))) throw err;
+  }
   return "closed";
 }
 

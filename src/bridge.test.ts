@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess, saveAccess, statePath } from "./access";
-import type { Logger, TgMessage } from "./api";
+import { type Logger, type TgMessage, TgError } from "./api";
 import { type BridgeHost, handleUpdate } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
@@ -189,5 +189,37 @@ describe("cleanup command", () => {
     expect(calls.some((c) => c.method === "deleteForumTopic")).toBe(false);
     expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]); // group entries kept, parked
     expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 2 stale topics"))).toBe(true);
+  });
+
+  test("/cleanup go treats an already-closed group topic as success (idempotent)", async () => {
+    saveAccess({ ...defaultAccess(), enabled: true, allowFrom: ["42"], topicsChat: "-100200", controlThreadId: 5 });
+    saveRegistry({ version: 1, chatId: "-100200", threads: { "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 } } });
+    const host = makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method === "closeForumTopic") throw new TgError("Bad Request: TOPIC_NOT_MODIFIED", 400);
+        return undefined!;
+      }) as TelegramCall,
+    });
+    await handleUpdate(host, { update_id: 13, message: message("/cleanup go") });
+    expect(calls.some((c) => c.method === "closeForumTopic")).toBe(true);
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 1 stale topic"))).toBe(true);
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("failed"))).toBe(false);
+    expect(Object.keys(loadRegistry().threads)).toEqual(["100"]); // parked entry kept
+  });
+
+  test("/cleanup go counts a non-idempotent close error as failed and keeps the entry", async () => {
+    saveAccess({ ...defaultAccess(), enabled: true, allowFrom: ["42"], topicsChat: "-100200", controlThreadId: 5 });
+    saveRegistry({ version: 1, chatId: "-100200", threads: { "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 } } });
+    const host = makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method === "closeForumTopic") throw new TgError("Bad Request: CHAT_ADMIN_REQUIRED", 400);
+        return undefined!;
+      }) as TelegramCall,
+    });
+    await handleUpdate(host, { update_id: 14, message: message("/cleanup go") });
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 0 stale topics (1 failed"))).toBe(true);
+    expect(Object.keys(loadRegistry().threads)).toEqual(["100"]);
   });
 });
