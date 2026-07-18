@@ -155,7 +155,7 @@ describe("cleanup command", () => {
       threads: {
         "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 }, // dead pid → stale
         "101": { pid: process.pid, cwd: "/live", name: "live", claimedAt: 2 }, // alive → kept
-        "99": { pid: 999999, cwd: "/ctl", name: "control", claimedAt: 3 }, // control topic → excluded
+        "99": { pid: 999999, cwd: "/ctl", name: "control", claimedAt: 3 }, // dead; excluded only in DM hosting (matches controlThreadId 99)
       },
     });
 
@@ -179,13 +179,15 @@ describe("cleanup command", () => {
     expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 deleted 1 stale topic"))).toBe(true);
   });
 
-  test("/cleanup go closes stale group topics and keeps their entries for re-adoption", async () => {
+  test("/cleanup go closes stale group topics (control id is DM-scoped) and keeps entries", async () => {
     saveAccess({ ...defaultAccess(), enabled: true, allowFrom: ["42"], topicsChat: "-100200", controlThreadId: 99 });
     seedStale("-100200");
     await handleUpdate(makeHost(), { update_id: 12, message: message("/cleanup go") });
-    expect(calls.filter((c) => c.method === "closeForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
+    // controlThreadId 99 is an owner-DM thread; in a group host it must NOT protect
+    // the numerically-matching stale group topic, so both 99 and 100 are closed.
+    expect(calls.filter((c) => c.method === "closeForumTopic").map((c) => c.payload.message_thread_id)).toEqual([99, 100]);
     expect(calls.some((c) => c.method === "deleteForumTopic")).toBe(false);
-    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]); // group entry kept, parked
-    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 1 stale topic"))).toBe(true);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]); // group entries kept, parked
+    expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 2 stale topics"))).toBe(true);
   });
 });
