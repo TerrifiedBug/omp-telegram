@@ -6,8 +6,9 @@ global command results and interactive pickers live there instead of inside an
 agent conversation. The poll-lock-holding omp process handles those commands
 before session-topic routing: `/spawn` lists open herdr spaces and starts omp in
 a new unfocused tab; `/sessions` compares herdr processes with Telegram topic
-claims; `/cleanup` removes stale and same-process duplicate topics after explicit
-confirmation while preserving live sibling sessions; `/status` reports bridge
+claims; `/cleanup` tidies the topics of exited (stale) sessions after an explicit
+`/cleanup go` — deleting them in a DM host, closing them (history kept) in a forum
+supergroup — while preserving live sessions and `omp control`; `/status` reports bridge
 health. `/stop` remains session-topic-local so it aborts the correct in-process
 agent turn.
 
