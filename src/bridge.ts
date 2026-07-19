@@ -63,7 +63,7 @@ const COMMANDS: CommandSpec[] = [
     ],
   },
   { command: "sessions", description: "List active omp sessions", scope: "global", help: ["/sessions — list active omp sessions and topic attachment"] },
-  { command: "cleanup", description: "Tidy topics of exited sessions", scope: "global", help: ["/cleanup [go] — tidy topics of exited sessions"] },
+  { command: "cleanup", description: "Tidy topics of exited sessions", scope: "global", help: ["/cleanup — preview exited-session topics, then tap to confirm (or /cleanup go to skip the preview)"] },
   { command: "stop", description: "Abort this topic's omp task", scope: "session", help: ["/stop — abort this topic’s current task"] },
   { command: "compact", description: "Compact this session's context", scope: "session", help: ["/compact [focus] — compact this session’s context"] },
   { command: "model", description: "Show or change this session's model", scope: "session", help: ["/model [provider/id] — show or change this session’s model"] },

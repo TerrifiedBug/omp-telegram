@@ -167,7 +167,11 @@ const SET_KEY_HELP: Record<string, string> = {
  */
 export function telegramArgumentCompletions(
   prefix: string,
-  dynamic: { pending: () => string[]; owners: () => string[] } = { pending: () => [], owners: () => [] },
+  dynamic: { pending: () => string[]; owners: () => string[]; groups: () => string[] } = {
+    pending: () => [],
+    owners: () => [],
+    groups: () => [],
+  },
 ): Array<{ value: string; label: string; description?: string }> | null {
   // Match tokens case-sensitively, matching the handler switch and the camelCase
   // `set` keys (e.g. `replyToMode`); lowercasing would make those unreachable.
@@ -186,6 +190,18 @@ export function telegramArgumentCompletions(
   if (done.length === 1) {
     if (done[0] === "pair" || done[0] === "deny") return build(dynamic.pending());
     if (done[0] === "remove") return build(dynamic.owners());
+  }
+
+  // `group` grammar: `group add <id> [--no-mention] [--allow a,b]` | `group rm <id>`.
+  // The <id> for `add` is a free-form chat id (nothing to offer), but `rm`
+  // completes configured group ids and the flags autocomplete after the id.
+  if (done[0] === "group" && done.length >= 2) {
+    if (done[1] === "rm" && done.length === 2) return build(dynamic.groups());
+    if (done[1] === "add" && done.length >= 3 && done[done.length - 1] !== "--allow") {
+      const used = new Set(done.slice(3));
+      return build(["--no-mention", "--allow"].filter((flag) => !used.has(flag)));
+    }
+    return null; // the `group add` id position, or `--allow`'s free-form value
   }
 
   // Static grammar walk along the already-typed tokens.
@@ -1671,6 +1687,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       telegramArgumentCompletions(prefix, {
         pending: () => Object.keys(loadAccess(warn).pending),
         owners: () => loadAccess(warn).allowFrom,
+        groups: () => Object.keys(loadAccess(warn).groups),
       }),
     handler: async (args, ctx) => {
       lastCtx = ctx;

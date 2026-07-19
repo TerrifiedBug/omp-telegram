@@ -130,8 +130,9 @@ describe("stale topic auto-resume policy", () => {
 });
 
 describe("/telegram argument completions", () => {
-  const labels = (prefix: string, dynamic?: { pending: () => string[]; owners: () => string[] }) =>
-    (telegramArgumentCompletions(prefix, dynamic) ?? []).map((item) => item.label);
+  type Dynamic = { pending: () => string[]; owners: () => string[]; groups: () => string[] };
+  const labels = (prefix: string, dynamic?: Partial<Dynamic>) =>
+    (telegramArgumentCompletions(prefix, { pending: () => [], owners: () => [], groups: () => [], ...dynamic }) ?? []).map((item) => item.label);
   const values = (prefix: string) => (telegramArgumentCompletions(prefix) ?? []).map((item) => item.value);
 
   test("offers every subcommand at the top level with descriptions", () => {
@@ -187,5 +188,16 @@ describe("/telegram argument completions", () => {
     expect(labels("deny ", dynamic)).toEqual(["ab12", "cd34"]);
     expect(labels("remove ", dynamic)).toEqual(["42", "77"]);
     expect(telegramArgumentCompletions("pair ")).toBeNull(); // no dynamic source → nothing to suggest
+  });
+
+  test("completes the group grammar: subcommands, rm ids, and add flags", () => {
+    const dynamic = { groups: () => ["-100200", "-100300"] };
+    expect(labels("group ")).toEqual(["add", "rm"]);
+    expect(labels("group rm ", dynamic)).toEqual(["-100200", "-100300"]);
+    expect(labels("group rm -1003", dynamic)).toEqual(["-100300"]);
+    expect(telegramArgumentCompletions("group add ")).toBeNull(); // the new chat id is free-form
+    expect(labels("group add -100200 ")).toEqual(["--no-mention", "--allow"]);
+    expect(labels("group add -100200 --no-mention ")).toEqual(["--allow"]); // a used flag drops out
+    expect(telegramArgumentCompletions("group add -100200 --allow ")).toBeNull(); // the flag value is free-form
   });
 });
