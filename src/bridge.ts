@@ -32,51 +32,89 @@ import {
   writeRouted,
 } from "./topics";
 
-export const BOT_COMMANDS = [
-  { command: "start", description: "Pairing instructions" },
-  { command: "spawn", description: "Start omp in a herdr space, new worktree, or directory" },
-  { command: "sessions", description: "List active omp sessions" },
-  { command: "cleanup", description: "Tidy topics of exited sessions" },
-  { command: "stop", description: "Abort this topic's omp task" },
-  { command: "compact", description: "Compact this session's context" },
-  { command: "model", description: "Show or change this session's model" },
-  { command: "switch", description: "Choose this session's model" },
-  { command: "thinking", description: "Show or change thinking level" },
-  { command: "status", description: "Bridge and session health" },
-  { command: "help", description: "Show available commands" },
-  { command: "whoami", description: "Show your Telegram IDs" },
+export interface CommandSpec {
+  /** Bare command name (no leading slash). */
+  command: string;
+  /** One-line description for the Telegram command menu. */
+  description: string;
+  /** global = usable from any paired chat; session = needs a live session topic. */
+  scope: "global" | "session";
+  /** Listed for unpaired users (the pairing essentials) as well as the owner. */
+  public?: boolean;
+  /** Detailed usage line(s) for /help; defaults to `/<command> — <description>`. */
+  help?: string[];
+}
+
+// Single source of truth for the bot's command surface. The Telegram menu, the
+// command parser's known/global/session sets, per-scope menu targeting, and the
+// /help text are all derived from this table so the visible and accepted
+// surfaces cannot drift.
+const COMMANDS: CommandSpec[] = [
+  { command: "start", description: "Pairing instructions", scope: "global", public: true },
+  {
+    command: "spawn",
+    description: "Start omp in a herdr space, new worktree, or directory",
+    scope: "global",
+    help: [
+      "/spawn [space] — start omp in a herdr space",
+      "/spawn new <branch> [space] — create a worktree and start omp",
+      "/spawn dir <absolute-path> — create a workspace and start omp",
+    ],
+  },
+  { command: "sessions", description: "List active omp sessions", scope: "global", help: ["/sessions — list active omp sessions and topic attachment"] },
+  { command: "cleanup", description: "Tidy topics of exited sessions", scope: "global", help: ["/cleanup [go] — tidy topics of exited sessions"] },
+  { command: "stop", description: "Abort this topic's omp task", scope: "session", help: ["/stop — abort this topic’s current task"] },
+  { command: "compact", description: "Compact this session's context", scope: "session", help: ["/compact [focus] — compact this session’s context"] },
+  { command: "model", description: "Show or change this session's model", scope: "session", help: ["/model [provider/id] — show or change this session’s model"] },
+  { command: "thinking", description: "Show or change thinking level", scope: "session", help: ["/thinking [level] — show or change thinking level"] },
+  { command: "status", description: "Bridge and session health", scope: "global", help: ["/status — bridge and session health"] },
+  { command: "help", description: "Show available commands", scope: "global" },
+  { command: "whoami", description: "Show your Telegram IDs", scope: "global", public: true, help: ["/whoami — show Telegram IDs"] },
 ];
 
-const KNOWN_COMMANDS: Record<string, true> = {
-  start: true,
-  spawn: true,
-  sessions: true,
-  cleanup: true,
-  stop: true,
-  compact: true,
-  model: true,
-  switch: true,
-  thinking: true,
-  status: true,
-  help: true,
-  whoami: true,
-};
-const GLOBAL_COMMANDS: Record<string, true> = {
-  start: true,
-  spawn: true,
-  sessions: true,
-  cleanup: true,
-  status: true,
-  help: true,
-  whoami: true,
-};
-const SESSION_COMMANDS: Record<string, true> = {
-  stop: true,
-  compact: true,
-  model: true,
-  switch: true,
-  thinking: true,
-};
+const toMenu = (specs: CommandSpec[]): Array<{ command: string; description: string }> =>
+  specs.map(({ command, description }) => ({ command, description }));
+const namesByScope = (scope: CommandSpec["scope"]): Record<string, true> =>
+  Object.fromEntries(COMMANDS.filter((c) => c.scope === scope).map((c) => [c.command, true] as const));
+
+/** Full command menu, shown to the paired owner's DM. */
+export const BOT_COMMANDS = toMenu(COMMANDS);
+/** Minimal menu for unpaired private chats: the pairing essentials only. */
+export const PUBLIC_BOT_COMMANDS = toMenu(COMMANDS.filter((c) => c.public));
+
+const KNOWN_COMMANDS: Record<string, true> = Object.fromEntries(COMMANDS.map((c) => [c.command, true] as const));
+const GLOBAL_COMMANDS = namesByScope("global");
+const SESSION_COMMANDS = namesByScope("session");
+
+const helpLines = (c: CommandSpec): string[] => c.help ?? [`/${c.command} — ${c.description}`];
+/** /help for the paired owner: every command except the pre-pairing/meta ones. */
+const ownerHelpText = `Use "omp control" for bridge commands and the other topics for agent conversations.\n\n${COMMANDS.filter(
+  (c) => c.command !== "start" && c.command !== "help",
+)
+  .flatMap(helpLines)
+  .join("\n")}`;
+/** /help for unpaired users: the pairing essentials. */
+const publicHelpText = COMMANDS.filter((c) => c.public)
+  .flatMap(helpLines)
+  .join("\n");
+
+/**
+ * Push the command menu to Telegram: the minimal set to every private chat, and
+ * the full set scoped to the paired owner's DM (which overrides the minimal set
+ * there). Best-effort; menu failures never break polling.
+ */
+export async function syncBotCommands(call: TelegramCall, ownerId: string | undefined): Promise<void> {
+  await call("setMyCommands", { commands: PUBLIC_BOT_COMMANDS, scope: { type: "all_private_chats" } }).catch(() => {});
+  if (ownerId != null) {
+    await call("setMyCommands", { commands: BOT_COMMANDS, scope: { type: "chat", chat_id: Number(ownerId) } }).catch(() => {});
+  }
+}
+
+/** Drop a former owner's chat-scoped full menu so their DM reverts to the minimal set. */
+export async function clearOwnerBotCommands(call: TelegramCall, ownerId: string): Promise<void> {
+  await call("deleteMyCommands", { scope: { type: "chat", chat_id: Number(ownerId) } }).catch(() => {});
+}
+
 const packageVersion = (() => {
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
@@ -263,14 +301,7 @@ export async function handleGlobalCommand(
         : "This bot bridges Telegram to one omp operator.\n\nTo pair:\n1. Send any normal message to receive a code.\n2. In omp, run /telegram pair <code>.",
     );
   } else if (command === "help") {
-    await commandReply(
-      host,
-      access,
-      msg,
-      owner
-        ? 'Use "omp control" for bridge commands and the other topics for agent conversations.\n\n/spawn [space] — start omp in a herdr space\n/spawn new <branch> [space] — create a worktree and start omp\n/spawn dir <absolute-path> — create a workspace and start omp\n/sessions — list active omp sessions and topic attachment\n/cleanup [go] — tidy topics of exited sessions\n/stop — abort this topic’s current task\n/compact [focus] — compact this session’s context\n/model [provider/id] — show or change this session’s model\n/switch — choose this session’s model\n/thinking [level] — show or change thinking level\n/status — bridge and session health\n/whoami — show Telegram IDs'
-        : "/start — pairing instructions\n/status — pairing state\n/whoami — show Telegram IDs",
-    );
+    await commandReply(host, access, msg, owner ? ownerHelpText : publicHelpText);
   } else if (command === "whoami") {
     await commandReply(host, access, msg, `chat_id: ${chatId}\nuser_id: ${senderId}\nchat_type: ${msg.chat.type}`);
   } else if (command === "spawn") {

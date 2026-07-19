@@ -123,10 +123,13 @@ message (the poller re-reads access per message).
 These commands are accepted only in the paired owner's private DM. Known bot
 commands typed in a group are consumed and never become omp user turns.
 
+Unpaired chats see a minimal command menu — only `/start` and `/whoami`; the full
+menu is scoped to the paired owner's DM.
+
 With owner-DM topics enabled, the bridge creates one persistent **omp control**
 topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
 `/whoami`; use session topics for agent conversations and session-local `/stop`,
-`/compact`, `/model`, `/switch`, and `/thinking` commands. A global command
+`/compact`, `/model`, and `/thinking` commands. A global command
 entered elsewhere posts its result in omp control and leaves a short redirect
 notice in the originating topic.
 
@@ -140,7 +143,6 @@ notice in the originating topic.
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
-| `/switch` | Alias for the `/model` picker. |
 | `/thinking [level]` | Show a thinking-level picker, or set `inherit`, `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
 | `/status` | Show the paired owner, bridge state, topics state, live omp count, and topic-owner count. |
 | `/help` | Show the owner command summary. |
@@ -277,7 +279,7 @@ Set it up in two moves:
     any session clears it back to off.
   - **always** — keep pinging regardless, for juggling several herdr sessions you
     aren't actively watching.
-  - **off** — nothing pings. `/telegram here` is a shortcut ("I'm back").
+  - **off** — nothing pings.
 
 - Only **locally-started** runs ping — Telegram-initiated runs already stream
   their reply back, so they never double-notify.
@@ -381,7 +383,7 @@ starts a fresh session in a brand-new topic.
   private chat ID. Callback controls expire after five minutes and are consumed
   before starting a process.
 - **DM-only control:** `/spawn`, `/sessions`, `/cleanup`, `/stop`, `/compact`,
-  `/model`, `/switch`, `/thinking`, and `/status` never execute from groups.
+  `/model`, `/thinking`, and `/status` never execute from groups.
   Group policies grant chat delivery only, not operator authority.
 - **Configured groups are trusted prompt sources:** an allowed group member still
   sends normal omp user turns with the session's workspace and tool access. Use
