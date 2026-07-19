@@ -44,6 +44,7 @@ function makeHost(overrides: Partial<BridgeHost> = {}): BridgeHost {
     token: () => "token",
     botUsername: () => "omp_bot",
     botHasTopics: () => true,
+    botAllowsUserTopics: () => false,
     ownThreadId: () => undefined,
     callTelegram,
     warn: () => {},
@@ -190,6 +191,22 @@ describe("cleanup command", () => {
     expect(calls.some((c) => c.method === "closeForumTopic")).toBe(false);
     expect(Object.keys(loadRegistry().threads).sort()).toEqual(["101", "99"]);
     expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 deleted 1 stale topic"))).toBe(true);
+  });
+  test("/cleanup go purges a DM topic Telegram reports gone via TOPIC_ID_INVALID", async () => {
+    seedStale("42");
+    const host = makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method === "deleteForumTopic") throw new TgError("Bad Request: TOPIC_ID_INVALID", 400);
+        return undefined!;
+      }) as TelegramCall,
+    });
+    await handleUpdate(host, { update_id: 13, message: message("/cleanup go") });
+    // The remote topic is already gone; reconcile it locally instead of failing forever.
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["101", "99"]);
+    const reply = calls.find((c) => String(c.payload.text ?? "").includes("🧹"));
+    expect(String(reply?.payload.text)).toContain("🧹 deleted 1 stale topic");
+    expect(String(reply?.payload.text)).not.toContain("failed");
   });
 
   test("/cleanup go closes stale group topics (control id is DM-scoped) and keeps entries", async () => {
@@ -370,5 +387,31 @@ describe("bot command surface", () => {
     expect(help).toContain("/spawn new <branch>");
     expect(help).toContain("/thinking [level]");
     expect(help).not.toContain("/switch");
+  });
+});
+
+describe("status surfaces the DM user-topic-creation setting", () => {
+  let prevHerdr: string | undefined;
+  // runHerdr throws outside a herdr pane, so /status deterministically takes its
+  // catch path here — no subprocess — and the warning must appear in either branch.
+  beforeEach(() => {
+    prevHerdr = process.env.HERDR_ENV;
+    delete process.env.HERDR_ENV;
+  });
+  afterEach(() => {
+    if (prevHerdr === undefined) delete process.env.HERDR_ENV;
+    else process.env.HERDR_ENV = prevHerdr;
+  });
+
+  test("/status warns when the bot lets users create DM topics", async () => {
+    await handleUpdate(makeHost({ botAllowsUserTopics: () => true }), { update_id: 40, message: message("/status") });
+    const reply = calls.find((c) => c.method === "sendMessage" && String(c.payload.text ?? "").includes("Paired owner"));
+    expect(String(reply?.payload.text)).toContain("Users can create DM topics");
+  });
+
+  test("/status omits the warning when users cannot create DM topics", async () => {
+    await handleUpdate(makeHost({ botAllowsUserTopics: () => false }), { update_id: 41, message: message("/status") });
+    const reply = calls.find((c) => c.method === "sendMessage" && String(c.payload.text ?? "").includes("Paired owner"));
+    expect(String(reply?.payload.text)).not.toContain("Users can create DM topics");
   });
 });

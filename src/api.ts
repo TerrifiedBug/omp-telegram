@@ -39,9 +39,15 @@ export class TgError extends Error {
   }
 }
 
-/** Telegram's definitive signal that a locally saved forum topic was deleted. */
+/**
+ * Telegram's definitive signal that a locally saved forum topic no longer exists.
+ * Supergroup forums answer a gone topic with "message thread not found"; DM
+ * forum-topic mode answers with "TOPIC_ID_INVALID". Both mean the same thing —
+ * the topic is gone — so the delete/tidy and outbound-recovery paths treat either
+ * as idempotent success rather than a hard failure.
+ */
 export function isMissingThreadError(err: unknown): boolean {
-  return err instanceof TgError && err.code === 400 && /message thread not found/i.test(err.message);
+  return err instanceof TgError && err.code === 400 && /message thread not found|topic_id_invalid/i.test(err.message);
 }
 
 // ---- Wire types (only the fields we read) --------------------------------

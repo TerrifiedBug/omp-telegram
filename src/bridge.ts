@@ -131,6 +131,7 @@ export interface BridgeHost {
   token(): string;
   botUsername(): string;
   botHasTopics(): boolean | undefined;
+  botAllowsUserTopics(): boolean | undefined;
   ownThreadId(): number | undefined;
   callTelegram: TelegramCall;
   warn(message: string): void;
@@ -540,6 +541,12 @@ export async function handleGlobalCommand(
       const registry = loadRegistry(host.warn);
       const liveTopics = Object.values(registry.threads).filter((entry) => isAlive(entry.pid)).length;
       const bridge = host.isDaemon ? `daemon polling (pid ${host.selfPid}, v${packageVersion})` : "polling";
+      // When the bot lets users create their own DM topics, a command typed outside an
+      // existing topic makes Telegram spin up a throwaway topic to hold it — surface that.
+      const userTopicsWarn =
+        access.topicsChat && isDmChat(access.topicsChat) && host.botAllowsUserTopics() === true
+          ? "\n⚠ Users can create DM topics — disable it in @BotFather (Bot Settings) so /spawn and other commands don't leave stray topics."
+          : "";
       try {
         const spaces = await listControlSpaces();
         const liveOmp = spaces.reduce((total, space) => total + space.ompCount, 0);
@@ -547,14 +554,14 @@ export async function handleGlobalCommand(
           host,
           access,
           msg,
-          `Paired owner: ${ownerId}\nBridge: ${bridge}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nOMP sessions: ${liveOmp}\nLive topic owners: ${liveTopics}`,
+          `Paired owner: ${ownerId}\nBridge: ${bridge}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nOMP sessions: ${liveOmp}\nLive topic owners: ${liveTopics}${userTopicsWarn}`,
         );
       } catch (err) {
         await commandReply(
           host,
           access,
           msg,
-          `Paired owner: ${ownerId}\nBridge: ${bridge}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nLive topic owners: ${liveTopics}\nHerdr: ${err instanceof Error ? err.message : String(err)}`,
+          `Paired owner: ${ownerId}\nBridge: ${bridge}\nTopics: ${access.topicsChat ? "on" : "off"}\nControl topic: ${access.controlThreadId != null ? `#${access.controlThreadId}` : "not attached"}\nLive topic owners: ${liveTopics}\nHerdr: ${err instanceof Error ? err.message : String(err)}${userTopicsWarn}`,
         );
       }
     }

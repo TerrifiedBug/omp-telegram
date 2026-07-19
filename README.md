@@ -28,7 +28,11 @@ There is no build step and no runtime dependency install.
 1. Open [@BotFather](https://t.me/BotFather).
 2. Send `/newbot` and follow the prompts.
 3. Copy the bot token.
-4. In **Bot Settings**, enable topics for private chats.
+4. In **Bot Settings**, enable topics for private chats, and turn **off**
+   "allow users to create topics". The bot creates one topic per omp session
+   itself; leaving user creation on means a command like `/spawn` typed outside
+   an existing topic makes Telegram spin up a throwaway topic to hold it. If it
+   is left on, `/status` and `/telegram doctor` flag it.
 
 ## 3. Start the bridge
 

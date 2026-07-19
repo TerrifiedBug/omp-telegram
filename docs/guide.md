@@ -350,10 +350,14 @@ DM's chat_id equals the paired owner's user id, so the bridge resolves the host
 directly. Pair first with `/telegram pair <code>`. Historical state containing
 multiple DM users fails closed until repaired locally. The bot must have
 **forum-topic mode enabled for its private chats** — turn it on in **@BotFather
-→ your bot → Bot Settings**. On
-start the bridge reads `getMe`; if that mode is provably off it **skips topic
+→ your bot → Bot Settings**. In the same settings, turn **off "allow users to
+create topics"**: the bot creates one topic per session itself, so if users may
+create topics a command like `/spawn` typed outside an existing topic makes
+Telegram spin up a throwaway topic to hold it. On
+start the bridge reads `getMe`; if forum-topic mode is provably off it **skips topic
 creation, warns you to enable it in @BotFather, and runs untopiced** rather than
-failing cryptically. `/telegram topics` (bare) shows the current DM forum-topic mode
+failing cryptically. When user topic creation is on, `/status` and `/telegram doctor`
+flag it. `/telegram topics` (bare) shows the current DM forum-topic mode
 so you can see why topics do or don't work.
 
 **Hosting in a group (`topics <chat_id>`, the advanced path).** Pass a negative
