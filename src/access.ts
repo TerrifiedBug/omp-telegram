@@ -54,8 +54,13 @@ export type Access = {
   topicsTidy?: boolean;
   /** Persistent owner-DM topic used for bridge/herdr control commands. */
   controlThreadId?: number;
-  /** Laptop-wide "user stepped away" flag. While set, a local run's final assistant message is sent to Telegram. Set via `/telegram away`, cleared on interactive local input. */
-  away?: boolean;
+  /**
+   * Laptop-wide notification mode, set via `/telegram notify`. Absent = off.
+   * `away` posts a local run's final message and blocked-input pings while you
+   * are away, and auto-clears on the next interactive local keystroke. `always`
+   * keeps notifying regardless — for juggling herdr sessions you aren't watching.
+   */
+  notifyMode?: "away" | "always";
 };
 
 // Structural contract for what `gate()`/`isMentioned()` read off a Bot API
@@ -147,18 +152,19 @@ export function controlTopicCreationChat(access: Access, dmTopicsAvailable: bool
 }
 
 /**
- * Resolve where an "away" notification should land after a local run goes idle,
- * or undefined when none should fire. Skips Telegram-initiated runs (the user
- * already sees the reply) and requires a token plus the away flag. Targets this
- * session's forum topic when topics mode owns one, else the flat notifyChat.
+ * Resolve where a notification should land — a local run going idle, or a
+ * blocked-input ping — or undefined when none should fire. Skips
+ * Telegram-initiated runs (the user already sees the reply) and requires a
+ * token plus an active notify mode. Targets this session's forum topic when
+ * topics mode owns one, else the flat notifyChat.
  */
-export function awayNotifyTarget(
+export function notifyTarget(
   wasTelegramActive: boolean,
   access: Access,
   hasToken: boolean,
   ownTopic?: { chatId: string; threadId: number },
 ): { chatId: string; threadId?: number } | undefined {
-  if (wasTelegramActive || !hasToken || !access.away) return undefined;
+  if (wasTelegramActive || !hasToken || !access.notifyMode) return undefined;
   if (ownTopic) return { chatId: ownTopic.chatId, threadId: ownTopic.threadId };
   if (access.notifyChat) return { chatId: access.notifyChat };
   return undefined;
@@ -180,6 +186,13 @@ export function loadAccess(warn?: (msg: string) => void): Access {
   }
   try {
     const parsed = JSON.parse(raw) as Partial<Access>;
+    // Migrate the retired `away` boolean to the notifyMode enum on first load.
+    const notifyMode: Access["notifyMode"] =
+      parsed.notifyMode === "away" || parsed.notifyMode === "always"
+        ? parsed.notifyMode
+        : "away" in parsed && parsed.away === true
+          ? "away"
+          : undefined;
     return {
       enabled: parsed.enabled ?? false,
       dmPolicy: parsed.dmPolicy ?? "pairing",
@@ -200,7 +213,7 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       topicsChat: parsed.topicsChat,
       topicsTidy: parsed.topicsTidy,
       controlThreadId: parsed.controlThreadId,
-      away: parsed.away,
+      notifyMode,
     };
   } catch {
     try {

@@ -11,7 +11,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
   type Access,
   assertAllowedChat,
-  awayNotifyTarget,
+  notifyTarget,
   canAnswerPrompt,
   defaultAccess,
   ensureStateDir,
@@ -33,6 +33,7 @@ import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
+import { BlockedPings, askQuestionSummary } from "./blocked";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -83,15 +84,14 @@ interface PendingApproval {
   approved?: boolean;
 }
 
-
-
 /** Task sessions are headless and always carry the required yield tool. */
 export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): boolean {
   return !hasUI && activeTools.includes("yield");
 }
 
-const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "away", "here"];
+const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "here"];
 const BATCH_WINDOW_MS = 800;
+const BLOCK_PING_DELAY_MS = 2_000;
 const THINKING_LEVELS: Record<string, true> = {
   inherit: true,
   off: true,
@@ -121,7 +121,7 @@ export function parseTelegramPromptTarget(prompt: string): PromptTarget | undefi
   return { responderId, chatId, chatType, ...(threadId == null ? {} : { threadId }) };
 }
 
-/** Active Telegram turns outrank the optional away-notification destination. */
+/** Active Telegram turns outrank the optional notify destination. */
 export function approvalPingTarget(
   telegramActive: boolean,
   activeTarget: { chatId: string; threadId?: number } | undefined,
@@ -278,6 +278,22 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   const batches = new Map<string, Batch>();
   const notified = new Set<string>();
   const pendingApprovals = new Map<string, PendingApproval>();
+  const blockedPings = new BlockedPings({
+    send: (chatId, text, threadId) => outbound.send(chatId, text, { threadId }).then((ids) => ids[0]),
+    edit: (chatId, messageId, text) =>
+      tg(token, "editMessageText", { chat_id: chatId, message_id: messageId, text }).then(
+        () => undefined,
+        () => undefined,
+      ),
+    schedule: (cb, ms) => {
+      const timer = setTimeout(cb, ms);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    },
+    delayMs: BLOCK_PING_DELAY_MS,
+    resumedText: () => `[ANSWERED] omp resumed in ${basename(process.cwd())}`,
+    onError: (err) => log.debug(`[telegram] blocked ping failed: ${String(err)}`),
+  });
   const lockPath = statePath("bot.lock");
   const bridgeHost: BridgeHost = {
     isDaemon: false,
@@ -943,9 +959,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       `Pending codes: ${Object.keys(a.pending).length ? Object.keys(a.pending).join(", ") : "none"}`,
       `Groups: ${Object.keys(a.groups).length ? Object.keys(a.groups).join(", ") : "none"}`,
       `Streaming: ${a.streaming === false ? "off" : "on"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
-      `Notify chat: ${a.notifyChat ?? "off"}`,
+      `Notify: ${a.notifyMode ?? "off"}${a.notifyChat ? ` · chat ${a.notifyChat}` : ""}`,
       `Voice transcription: ${a.transcribeCommand?.length ? a.transcribeCommand.join(" ") : "off"}`,
-      `Away: ${a.away ? "on" : "off"}`,
       `Control topic: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`,
     ];
     const reg = loadRegistry(warn);
@@ -1286,62 +1301,58 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ctx.ui.notify(`telegram: set ${key}`, "info");
   }
 
+  /** Label the resolved notify destination with the same topic-first precedence as {@link notifyTarget}. */
+  function notifyChatLabel(a: Access): string {
+    if (ownTopic && a.topicsChat) return `topic #${ownTopic.threadId}`;
+    if (a.notifyChat) return `chat ${a.notifyChat}`;
+    return "no target";
+  }
+
+  /**
+   * Single notification surface: set the destination chat, or the mode
+   * (off | away | always). `away` auto-clears when you touch the keyboard;
+   * `always` keeps pinging idle + blocked-input across sessions you aren't watching.
+   */
   function cmdNotify(ctx: ExtensionContext, arg: string): void {
     const v = arg.trim();
     const a = loadAccess(warn);
     if (v === "" || v === "status") {
-      ctx.ui.notify(`telegram: notifyChat = ${a.notifyChat ?? "off"}`, "info");
+      ctx.ui.notify(`telegram: notify ${a.notifyMode ?? "off"} · ${notifyChatLabel(a)}`, "info");
       return;
     }
-    if (v === "off") {
+    if (v === "off" || v === "away" || v === "always") {
+      if (v !== "off" && !a.notifyChat && !(ownTopic && a.topicsChat)) {
+        ctx.ui.notify("telegram: notify needs a target — run /telegram topics on (per-project threads) or /telegram notify <chat>", "warning");
+        return;
+      }
+      a.notifyMode = v === "off" ? undefined : v;
+      saveAccess(a);
+      access = a;
+      if (v === "off") {
+        ctx.ui.notify("telegram: notify off — runs stay on-screen", "info");
+        return;
+      }
+      const clears = v === "away" ? "; typing here clears it" : "";
+      ctx.ui.notify(`telegram: notify ${v} — idle + blocked-input pings go to ${notifyChatLabel(a)}${clears}`, "info");
+      if (!token) ctx.ui.notify("telegram: notify armed, but the bridge isn't running — run /telegram on so pings can fire", "warning");
+      return;
+    }
+    if (v === "clear") {
       a.notifyChat = undefined;
       saveAccess(a);
       access = a;
-      ctx.ui.notify("telegram: notify off", "info");
+      ctx.ui.notify("telegram: notify chat cleared", "info");
       return;
     }
     if (!/^-?\d+$/.test(v)) {
-      ctx.ui.notify("usage: /telegram notify <chat_id> | off", "warning");
+      ctx.ui.notify("usage: /telegram notify <chat_id> | clear | off | away | always | status", "warning");
       return;
     }
     a.notifyChat = v;
     saveAccess(a);
     access = a;
-    ctx.ui.notify(`telegram: notifyChat = ${v} — pings this chat when a local run goes idle`, "info");
+    ctx.ui.notify(`telegram: notify chat = ${v} (mode ${a.notifyMode ?? "off"}) — enable with /telegram notify away|always`, "info");
     if (!token) ctx.ui.notify("telegram: notify armed, but the bridge isn't running — run /telegram on so pings can fire", "warning");
-  }
-
-  function cmdAway(ctx: ExtensionContext, arg: string): void {
-    const v = arg.trim().toLowerCase();
-    const a = loadAccess(warn);
-    if (v === "status") {
-      ctx.ui.notify(`telegram: away = ${a.away ? "on" : "off"}`, "info");
-      return;
-    }
-    if (v === "off") {
-      if (a.away) {
-        a.away = false;
-        saveAccess(a);
-        access = a;
-      }
-      ctx.ui.notify("telegram: away off — local runs stay on-screen", "info");
-      return;
-    }
-    if (v !== "" && v !== "on") {
-      ctx.ui.notify(`usage: /telegram away [on] | off | status (got "${v}")`, "warning");
-      return;
-    }
-    const hasTopicTarget = ownTopic != null && a.topicsChat != null;
-    if (!hasTopicTarget && !a.notifyChat) {
-      ctx.ui.notify("telegram: away needs a target — run /telegram topics on (per-project threads) or /telegram notify <chat>", "warning");
-      return;
-    }
-    a.away = true;
-    saveAccess(a);
-    access = a;
-    const where = hasTopicTarget ? `topic #${ownTopic?.threadId}` : `chat ${a.notifyChat}`;
-    ctx.ui.notify(`telegram: away on — local runs post their final message to ${where}; typing here clears it`, "info");
-    if (!token) ctx.ui.notify("telegram: away armed, but the bridge isn't running — run /telegram on so it can send", "warning");
   }
 
   async function cmdTopics(ctx: ExtensionContext, arg: string): Promise<void> {
@@ -1597,11 +1608,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         case "notify":
           cmdNotify(ctx, arg);
           break;
-        case "away":
-          cmdAway(ctx, arg);
-          break;
         case "here":
-          cmdAway(ctx, "off");
+          cmdNotify(ctx, "off");
           break;
         case "topics":
           await cmdTopics(ctx, arg);
@@ -1648,7 +1656,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const target = approvalPingTarget(
       outbound.isActive(),
       outbound.lastTarget(),
-      awayNotifyTarget(false, currentAccess, token.length > 0, ownTarget),
+      notifyTarget(false, currentAccess, token.length > 0, ownTarget),
     );
     if (!target) return;
     const previous = pendingApprovals.get(event.toolCallId);
@@ -1705,6 +1713,29 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       text: `${event.approved ? "[APPROVED]" : "[DENIED]"} ${event.toolName}`,
     }).catch(() => {});
   });
+  pi.on("tool_execution_start", (event, ctx) => {
+    lastCtx = ctx;
+    if (event.toolName !== "ask") return;
+    const currentAccess = loadAccess(warn);
+    const ownTarget =
+      ownTopic && currentAccess.topicsChat ? { chatId: currentAccess.topicsChat, threadId: ownTopic.threadId } : undefined;
+    const target = approvalPingTarget(
+      outbound.isActive(),
+      outbound.lastTarget(),
+      notifyTarget(false, currentAccess, token.length > 0, ownTarget),
+    );
+    if (!target) return;
+    blockedPings.start(
+      event.toolCallId,
+      target,
+      () => `[BLOCKED] omp is waiting for your input in ${basename(process.cwd())}${askQuestionSummary(event.args)}\nAnswer at the terminal.`,
+    );
+  });
+  pi.on("tool_execution_end", (event, ctx) => {
+    lastCtx = ctx;
+    if (event.toolName !== "ask") return;
+    blockedPings.end(event.toolCallId);
+  });
   pi.on("message_update", (e, ctx) => {
     lastCtx = ctx;
     outbound.onMessageUpdate(e.message);
@@ -1717,11 +1748,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     lastCtx = ctx;
     if (e.source !== "interactive") return;
     const a = loadAccess(warn);
-    if (!a.away) return;
-    a.away = false;
+    if (a.notifyMode !== "away") return;
+    a.notifyMode = undefined;
     saveAccess(a);
     access = a;
-    log.debug("[telegram] away cleared by local input");
+    log.debug("[telegram] notify away cleared by local input");
   });
   pi.on("agent_end", async (e, ctx) => {
     lastCtx = ctx;
@@ -1729,6 +1760,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       clearTimeout(pending.timer);
     }
     pendingApprovals.clear();
+    blockedPings.clear();
     const wasActive = outbound.isActive();
     await outbound.onAgentEnd();
     await restorePromptTools();
@@ -1736,11 +1768,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     refreshTopicClaim(ctx);
     const a = loadAccess(warn);
     const topic = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
-    const target = awayNotifyTarget(wasActive, a, token.length > 0, topic);
+    const target = notifyTarget(wasActive, a, token.length > 0, topic);
     if (!target) return;
     const text = finalAssistantText(e.messages);
     const body = text || `✅ omp idle in ${basename(process.cwd())} — your turn.`;
-    await outbound.send(target.chatId, body, { threadId: target.threadId }).catch((err) => log.debug(`[telegram] away notify failed: ${String(err)}`));
+    await outbound.send(target.chatId, body, { threadId: target.threadId }).catch((err) => log.debug(`[telegram] idle notify failed: ${String(err)}`));
   });
   pi.on("session_switch", async (_e, ctx) => {
     lastCtx = ctx;
