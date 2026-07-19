@@ -380,6 +380,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let token = "";
   let botUsername = "";
   let botHasTopics: boolean | undefined; // getMe.has_topics_enabled — undefined until first getMe, or on older servers that omit the field
+  let botAllowsUserTopics: boolean | undefined; // getMe.allows_users_to_create_topics — when true, a command typed outside a topic spawns a stray DM topic
   let lastCtx: ExtensionContext | undefined;
   let hintSent = false;
   let lockRetryTimer: NodeJS.Timeout | undefined;
@@ -426,6 +427,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     token: () => token,
     botUsername: () => botUsername,
     botHasTopics: () => botHasTopics,
+    botAllowsUserTopics: () => botAllowsUserTopics,
     ownThreadId: () => ownTopic?.threadId,
     callTelegram: (method, payload) => tg(token, method, payload),
     warn,
@@ -496,6 +498,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const me = await tg<{ username: string; has_topics_enabled?: boolean; allows_users_to_create_topics?: boolean }>(token, "getMe");
       botUsername = me.username;
       botHasTopics = me.has_topics_enabled;
+      botAllowsUserTopics = me.allows_users_to_create_topics;
+      if (access.topicsChat && isDmChat(access.topicsChat) && botAllowsUserTopics === true) {
+        notifyOnce(ctx, "telegram: your bot lets users create DM topics — disable it in @BotFather (Bot Settings) so /spawn and other commands don't leave stray topics.", "warning");
+      }
     } catch (err) {
       const detail = err instanceof TgError && err.code === 401 ? "invalid bot token (401)" : `getMe failed — ${String(err)}`;
       ctx?.ui.notify(`telegram: ${detail} — run /telegram token <token>`, "error");
@@ -1158,9 +1164,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         label: "Token",
         run: async () => {
           if (!currentToken) return "Token: missing";
-          const me = await tg<{ username: string; has_topics_enabled?: boolean }>(currentToken, "getMe");
+          const me = await tg<{ username: string; has_topics_enabled?: boolean; allows_users_to_create_topics?: boolean }>(currentToken, "getMe");
           const topicMode = me.has_topics_enabled === undefined ? "unknown" : me.has_topics_enabled ? "on" : "off";
-          return `Token: present · getMe ok @${me.username} · DM topics ${topicMode}`;
+          const userTopics = me.allows_users_to_create_topics ? " · ⚠ users can create DM topics (disable in @BotFather)" : "";
+          return `Token: present · getMe ok @${me.username} · DM topics ${topicMode}${userTopics}`;
         },
       },
       {
@@ -1258,6 +1265,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       token = tok;
       botUsername = me.username;
       botHasTopics = me.has_topics_enabled;
+      botAllowsUserTopics = me.allows_users_to_create_topics;
       outbound.setToken(tok);
       ensureDaemon(warn);
       ctx.ui.notify(`telegram: @${me.username} ok — run /telegram on to start`, "info");
@@ -1545,7 +1553,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       // sees the new value without a bridge restart. Best-effort; never blocks arming.
       if (isDmChat(chatId)) {
         try {
-          botHasTopics = (await tg<{ has_topics_enabled?: boolean }>(token, "getMe")).has_topics_enabled;
+          const me = await tg<{ has_topics_enabled?: boolean; allows_users_to_create_topics?: boolean }>(token, "getMe");
+          botHasTopics = me.has_topics_enabled;
+          botAllowsUserTopics = me.allows_users_to_create_topics;
         } catch (err) {
           log.debug(`[telegram] getMe refresh failed: ${String(err)}`);
         }

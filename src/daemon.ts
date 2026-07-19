@@ -215,10 +215,12 @@ export async function runDaemon(): Promise<void> {
 
       let botUsername = "";
       let botHasTopics: boolean | undefined;
+      let botAllowsUserTopics: boolean | undefined;
       try {
-        const me = await tg<{ username: string; has_topics_enabled?: boolean }>(token, "getMe");
+        const me = await tg<{ username: string; has_topics_enabled?: boolean; allows_users_to_create_topics?: boolean }>(token, "getMe");
         botUsername = me.username;
         botHasTopics = me.has_topics_enabled;
+        botAllowsUserTopics = me.allows_users_to_create_topics;
       } catch (err) {
         log.warn(`[telegram daemon] getMe failed: ${String(err)}`);
         releaseLock(lockPath);
@@ -239,6 +241,7 @@ export async function runDaemon(): Promise<void> {
         token: () => token,
         botUsername: () => botUsername,
         botHasTopics: () => botHasTopics,
+        botAllowsUserTopics: () => botAllowsUserTopics,
         ownThreadId: () => undefined,
         callTelegram,
         warn: log.warn,

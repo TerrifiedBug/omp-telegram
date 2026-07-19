@@ -44,6 +44,7 @@ function makeHost(overrides: Partial<BridgeHost> = {}): BridgeHost {
     token: () => "token",
     botUsername: () => "omp_bot",
     botHasTopics: () => true,
+    botAllowsUserTopics: () => false,
     ownThreadId: () => undefined,
     callTelegram,
     warn: () => {},

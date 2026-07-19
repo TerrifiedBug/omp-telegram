@@ -90,9 +90,12 @@ describe("Telegram turn identity", () => {
 });
 
 describe("deleted topic recovery", () => {
-  test("recognizes only Telegram's missing-thread response", () => {
+  test("recognizes a gone topic from both supergroup and DM-mode wordings", () => {
     expect(isMissingThreadError(new TgError("Bad Request: message thread not found", 400))).toBe(true);
+    // DM forum-topic mode reports a gone/nonexistent topic as TOPIC_ID_INVALID.
+    expect(isMissingThreadError(new TgError("Bad Request: TOPIC_ID_INVALID", 400))).toBe(true);
     expect(isMissingThreadError(new TgError("Bad Request: message thread not found", 429))).toBe(false);
+    expect(isMissingThreadError(new TgError("Bad Request: TOPIC_ID_INVALID", 429))).toBe(false);
     expect(isMissingThreadError(new TgError("Bad Request: chat not found", 400))).toBe(false);
     expect(isMissingThreadError(new Error("message thread not found"))).toBe(false);
   });
