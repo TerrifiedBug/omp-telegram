@@ -11,7 +11,7 @@ describe("Telegram bot command scope", () => {
     expect(consumeOutsidePrivateChat("supergroup", "stop")).toBe(true);
     expect(consumeOutsidePrivateChat("supergroup", "compact")).toBe(true);
     expect(consumeOutsidePrivateChat("supergroup", "model")).toBe(true);
-    expect(consumeOutsidePrivateChat("supergroup", "switch")).toBe(true);
+    expect(consumeOutsidePrivateChat("supergroup", "switch")).toBe(false); // /switch was folded into /model
     expect(consumeOutsidePrivateChat("supergroup", "thinking")).toBe(true);
     expect(consumeOutsidePrivateChat("supergroup", "cleanup")).toBe(true);
     expect(consumeOutsidePrivateChat("private", "spawn")).toBe(false);

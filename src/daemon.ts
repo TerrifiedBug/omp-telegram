@@ -14,11 +14,12 @@ import {
   canAnswerPrompt,
   ensureStateDir,
   loadAccess,
+  pairedOwnerId,
   resolveToken,
   statePath,
 } from "./access";
 import { acquireLock, type Logger, Poller, releaseLock, tg, webhookConflictHint } from "./api";
-import { BOT_COMMANDS, type BridgeHost, ensureControlTopic, handleUpdate } from "./bridge";
+import { type BridgeHost, ensureControlTopic, handleUpdate, syncBotCommands } from "./bridge";
 import { SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
 import { isAlive } from "./topics";
@@ -242,7 +243,7 @@ export async function runDaemon(): Promise<void> {
         promptController,
       };
 
-      await callTelegram("setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } }).catch(() => {});
+      await syncBotCommands(callTelegram, pairedOwnerId(loadAccess(log.warn))).catch(() => {});
       await ensureControlTopic(host).catch((err) => log.warn(`[telegram daemon] control topic creation failed: ${String(err)}`));
       poller = new Poller();
       fatalState = {};

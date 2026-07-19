@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess, saveAccess, statePath } from "./access";
 import { type Logger, type TgMessage, TgError } from "./api";
-import { type BridgeHost, handleUpdate } from "./bridge";
+import { type BridgeHost, BOT_COMMANDS, PUBLIC_BOT_COMMANDS, handleUpdate, syncBotCommands } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
 import { loadRegistry, saveRegistry } from "./topics";
@@ -221,5 +221,47 @@ describe("cleanup command", () => {
     await handleUpdate(host, { update_id: 14, message: message("/cleanup go") });
     expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 0 stale topics (1 failed"))).toBe(true);
     expect(Object.keys(loadRegistry().threads)).toEqual(["100"]);
+  });
+});
+
+describe("bot command surface", () => {
+  const names = (menu: ReadonlyArray<{ command: string }>): string[] => menu.map((c) => c.command);
+  const recorder = () => {
+    const recorded: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    const call: TelegramCall = async <T>(method: string, payload: Record<string, unknown>): Promise<T> => {
+      recorded.push({ method, payload });
+      return undefined!;
+    };
+    return { recorded, call };
+  };
+
+  test("the full menu drops /switch and the public menu is the pairing essentials", () => {
+    expect(names(BOT_COMMANDS)).toContain("model");
+    expect(names(BOT_COMMANDS)).not.toContain("switch");
+    expect(names(PUBLIC_BOT_COMMANDS)).toEqual(["start", "whoami"]);
+    for (const cmd of names(PUBLIC_BOT_COMMANDS)) expect(names(BOT_COMMANDS)).toContain(cmd);
+  });
+
+  test("syncBotCommands scopes the minimal menu to everyone and the full menu to the owner", async () => {
+    const { recorded, call } = recorder();
+    await syncBotCommands(call, "42");
+    expect(recorded).toHaveLength(2);
+    expect(recorded[0]).toEqual({ method: "setMyCommands", payload: { commands: PUBLIC_BOT_COMMANDS, scope: { type: "all_private_chats" } } });
+    expect(recorded[1]).toEqual({ method: "setMyCommands", payload: { commands: BOT_COMMANDS, scope: { type: "chat", chat_id: 42 } } });
+  });
+
+  test("syncBotCommands skips the owner scope when unpaired", async () => {
+    const { recorded, call } = recorder();
+    await syncBotCommands(call, undefined);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].payload.scope).toEqual({ type: "all_private_chats" });
+  });
+
+  test("owner /help is derived from the table — renders session commands, drops /switch", async () => {
+    await handleUpdate(makeHost(), { update_id: 20, message: message("/help") });
+    const help = calls.find((c) => c.method === "sendMessage" && String(c.payload.text ?? "").includes("/model"))?.payload.text as string;
+    expect(help).toContain("/spawn new <branch>");
+    expect(help).toContain("/thinking [level]");
+    expect(help).not.toContain("/switch");
   });
 });

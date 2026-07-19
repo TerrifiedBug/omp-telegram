@@ -26,7 +26,7 @@ import {
   statePath,
 } from "./access";
 import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg, webhookConflictHint } from "./api";
-import { BOT_COMMANDS, type BridgeHost, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand, tidyRemoteTopic } from "./bridge";
+import { type BridgeHost, clearOwnerBotCommands, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand, syncBotCommands, tidyRemoteTopic } from "./bridge";
 import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
@@ -89,7 +89,7 @@ export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): 
   return !hasUI && activeTools.includes("yield");
 }
 
-const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics", "here"];
+const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics"];
 const BATCH_WINDOW_MS = 800;
 const BLOCK_PING_DELAY_MS = 2_000;
 const THINKING_LEVELS: Record<string, true> = {
@@ -377,7 +377,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       releaseLock(lockPath);
       return true; // token/network problem — don't spin the lock retry
     }
-    await tg(token, "setMyCommands", { commands: BOT_COMMANDS, scope: { type: "all_private_chats" } }).catch(() => {});
+    await syncBotCommands((method, payload) => tg(token, method, payload), pairedOwnerId(access));
     await ensureControlTopic(ctx);
     outbound.setToken(token);
     poller.start(token, (update) => handleUpdate(bridgeHost, update), onFatal, log);
@@ -760,7 +760,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   async function handleCommand(msg: TgMessage, parsed: { name: string; args: string }): Promise<boolean> {
     const { name: cmd, args } = parsed;
-    if (cmd !== "stop" && cmd !== "compact" && cmd !== "model" && cmd !== "switch" && cmd !== "thinking") return false;
+    if (cmd !== "stop" && cmd !== "compact" && cmd !== "model" && cmd !== "thinking") return false;
     access = loadAccess(warn);
     if (access.dmPolicy === "disabled") return true;
 
@@ -790,10 +790,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);
       else if (!ctx) await commandReply(msg, "Run /compact inside the omp session topic you want to compact.", false);
       else startCompact(msg, args, ctx);
-    } else if (cmd === "model" || cmd === "switch") {
+    } else if (cmd === "model") {
       const ctx = owner ? sessionContextFor(msg) : undefined;
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);
-      else if (!ctx) await commandReply(msg, `Run /${cmd} inside the omp session topic you want to change.`, false);
+      else if (!ctx) await commandReply(msg, "Run /model inside the omp session topic you want to change.", false);
       else startModelChange(msg, args, ctx);
     } else {
       const ctx = owner ? sessionContextFor(msg) : undefined;
@@ -1141,6 +1141,12 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   }
 
+  /** Re-push the Telegram command menu so per-owner scoping tracks the current owner. */
+  function refreshBotCommands(): void {
+    if (!token) return;
+    void syncBotCommands((method, payload) => tg(token, method, payload), pairedOwnerId(loadAccess(warn)));
+  }
+
   async function cmdPair(ctx: ExtensionContext, arg: string): Promise<void> {
     const code = arg.trim().toLowerCase();
     const a = loadAccess(warn);
@@ -1160,6 +1166,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     saveAccess(a);
     ensureDaemon(warn);
     access = a;
+    refreshBotCommands();
     ctx.ui.notify(`telegram: paired owner ${entry.senderId}`, "info");
     if (token) {
       await tg(token, "sendMessage", {
@@ -1199,6 +1206,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     a.pending = {};
     saveAccess(a);
     access = a;
+    refreshBotCommands();
     ctx.ui.notify(`telegram: owner = ${id}`, "info");
   }
 
@@ -1212,6 +1220,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (removedOwner) a.controlThreadId = undefined;
     saveAccess(a);
     access = a;
+    if (removedOwner && token) void clearOwnerBotCommands((method, payload) => tg(token, method, payload), id);
+    refreshBotCommands();
     ctx.ui.notify(`telegram: removed ${id}`, "info");
   }
 
@@ -1607,9 +1617,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           break;
         case "notify":
           cmdNotify(ctx, arg);
-          break;
-        case "here":
-          cmdNotify(ctx, "off");
           break;
         case "topics":
           await cmdTopics(ctx, arg);

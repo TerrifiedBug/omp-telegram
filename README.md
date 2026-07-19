@@ -98,7 +98,7 @@ Inside an omp session topic:
 - Send a normal message to talk to that session.
 - Use `/stop` to stop its current task.
 - Use `/compact [focus]` to compact that session's context.
-- Use `/model`, `/switch`, and `/thinking` to change that session with inline pickers.
+- Use `/model` and `/thinking` to change that session with inline pickers.
 - When omp needs a choice, the bot shows single-select, multi-select, and **Other**
   controls directly in Telegram.
 - When omp waits more than two seconds for tool approval, the bot pings the
