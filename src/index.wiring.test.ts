@@ -104,7 +104,7 @@ describe("extension wiring", () => {
     expect(h.active()).toContain("ask");
   });
 
-  test("/away toggles sticky away mode in access.json", async () => {
+  test("/away toggles away mode on and off in access.json", async () => {
     writeAccess({ allowFrom: ["42"], notifyChat: "42" });
     const h = harness(["ask"]);
     const away = h.commands.get("away");
@@ -130,6 +130,63 @@ describe("extension wiring", () => {
     let warned = false;
     await h.commands.get("away")?.handler("", { ui: { notify: (_message: string, level?: string) => (warned ||= level === "warning") } });
     expect(warned).toBe(true);
+    expect(loadAccess().notifyMode).toBeUndefined();
+  });
+});
+
+describe("away auto-clear (input handler)", () => {
+  const fire = (
+    h: { handlers: Map<string, EventHandler[]> },
+    text: string,
+    source: "interactive" | "rpc" | "extension",
+    notify: (m: string, l?: string) => void = () => {},
+  ) => h.handlers.get("input")?.[0]?.({ type: "input", text, source }, { ui: { notify } });
+
+  test("an interactive local prompt clears `away` and announces it", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "away" });
+    const h = harness(["ask"]);
+    let announced = false;
+    await fire(h, "keep working on the parser", "interactive", (m) => (announced ||= /away off/.test(m)));
+    expect(loadAccess().notifyMode).toBeUndefined();
+    expect(announced).toBe(true);
+  });
+
+  test("a phone reply (extension) and an rpc turn never count as presence", async () => {
+    for (const source of ["extension", "rpc"] as const) {
+      writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "away" });
+      const h = harness(["ask"]);
+      await fire(h, "answer from the couch", source);
+      expect(loadAccess().notifyMode).toBe("away");
+    }
+  });
+
+  test("`always` never auto-clears on interactive input", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "always" });
+    const h = harness(["ask"]);
+    await fire(h, "do the next thing", "interactive");
+    expect(loadAccess().notifyMode).toBe("always");
+  });
+
+  test("another interactive slash command is still presence and clears `away`", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "away" });
+    const h = harness(["ask"]);
+    await fire(h, "/sessions", "interactive");
+    expect(loadAccess().notifyMode).toBeUndefined();
+  });
+
+  test("the `/away` toggle is not raced: input(`/away`) then the command lands OFF", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "away" });
+    const h = harness(["ask"]);
+    await fire(h, "/away", "interactive"); // guard: must NOT clear, or the toggle below re-arms
+    expect(loadAccess().notifyMode).toBe("away");
+    await h.commands.get("away")?.handler("", { ui: { notify() {} } });
+    expect(loadAccess().notifyMode).toBeUndefined();
+  });
+
+  test("interactive input with notify off is a no-op", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42" }); // notifyMode undefined
+    const h = harness(["ask"]);
+    await fire(h, "just do it", "interactive");
     expect(loadAccess().notifyMode).toBeUndefined();
   });
 });

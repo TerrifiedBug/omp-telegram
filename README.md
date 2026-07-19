@@ -124,8 +124,8 @@ Replies stream back while omp is working.
 Runs you start at the terminal don't touch Telegram by default. When you're
 stepping away, flip **away mode** so those runs reach your phone:
 
-- `/away` — quick sticky toggle. Run it, then kick off your work and walk away;
-  run it again when you're back.
+- `/away` — quick toggle. Run it, then kick off your work and walk away; it
+  auto-clears when you next type a prompt at the terminal (or run it again).
 - While away, any `ask` the agent raises is shown on **both** your terminal and
   Telegram at once — answer wherever you are, first one wins. Idle-completion
   pings go to Telegram too.

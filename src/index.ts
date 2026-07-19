@@ -1556,10 +1556,12 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   /**
    * Single notification surface: set the destination chat, or the mode
-   * (off | away | always). Both `away` and `always` are sticky and behave the
-   * same — they mirror `ask` prompts (shown on the terminal AND Telegram at once)
-   * plus idle/blocked pings to Telegram until turned off. `/away` is the quick
-   * toggle for the same behavior.
+   * (off | away | always). Both mirror `ask` prompts (shown on the terminal AND
+   * Telegram at once) plus idle/blocked pings to Telegram. They differ in when
+   * they disarm: `away` auto-clears on the next interactive local prompt (you're
+   * back at the keyboard — a phone reply never counts), while `always` stays on
+   * until turned off, for juggling sessions you aren't watching. `/away` is the
+   * quick toggle for `away`.
    */
   function cmdNotify(ctx: ExtensionContext, arg: string): void {
     const v = arg.trim();
@@ -1938,7 +1940,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       a.notifyMode = "away";
       saveAccess(a);
       access = a;
-      ctx.ui.notify(`telegram: away on — runs you start now mirror ask prompts to your terminal + ${notifyChatLabel(a)}, with idle pings there (run /away again to return)`, "info");
+      ctx.ui.notify(`telegram: away on — runs mirror ask prompts to your terminal + ${notifyChatLabel(a)}, with idle pings there. Clears when you next type a prompt here (or run /away).`, "info");
       if (!token) ctx.ui.notify("telegram: away armed, but the bridge isn't running — run /telegram on so it can fire", "warning");
     },
   });
@@ -1952,6 +1954,23 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       await pruneInbox(statePath("inbox")).catch((err) => warn(`inbox cleanup failed: ${String(err)}`));
       await startBot(ctx);
     }
+  });
+  pi.on("input", (event, ctx) => {
+    // `away` tracks the human at this terminal, so any interactive local prompt
+    // means they're back — disarm it. A phone reply (source "extension") or an
+    // rpc-driven turn is not presence and never clears it; `always` is the
+    // deliberate opt-out for juggling sessions you aren't watching. The one
+    // carve-out is the `/away` toggle itself: it reads the current mode, so
+    // clearing here first would make it re-arm — let its handler toggle instead.
+    if (event.source !== "interactive") return;
+    if (event.text.trim().split(/\s+/)[0] === "/away") return;
+    const a = loadAccess(warn);
+    if (a.notifyMode !== "away") return;
+    lastCtx = ctx;
+    a.notifyMode = undefined;
+    saveAccess(a);
+    access = a;
+    ctx.ui.notify("telegram: away off — you're back at the terminal, runs stay on-screen (run /away to re-arm)", "info");
   });
   pi.on("before_agent_start", async (event) => {
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
