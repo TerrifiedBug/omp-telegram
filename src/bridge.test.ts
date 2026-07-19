@@ -248,7 +248,7 @@ describe("cleanup command", () => {
   const previewButton = (row: number) =>
     keyboardOf(calls.find((c) => c.method === "sendMessage" && c.payload.reply_markup != null))[row][0].callback_data;
 
-  test("the confirm tap re-derives stale topics and deletes them", async () => {
+  test("the confirm tap tidies the previewed topics", async () => {
     seedStale("42");
     const host = previewHost(555);
     await handleUpdate(host, { update_id: 30, message: message("/cleanup") });
@@ -260,6 +260,39 @@ describe("cleanup command", () => {
     });
     expect(calls.filter((c) => c.method === "deleteForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
     expect(Object.keys(loadRegistry().threads).sort()).toEqual(["101", "99"]);
+    expect(calls.some((c) => c.method === "editMessageText" && String(c.payload.text).includes("🧹 deleted 1 stale topic"))).toBe(true);
+  });
+
+  test("the confirm tap spares a topic that went stale after the preview", async () => {
+    // Preview time: only 100 is stale; 101 is a live session.
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: {
+        "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 },
+        "101": { pid: process.pid, cwd: "/live", name: "live", claimedAt: 2 },
+      },
+    });
+    const host = previewHost(600);
+    await handleUpdate(host, { update_id: 40, message: message("/cleanup") });
+    const confirm = previewButton(0);
+    // 101 exits between preview and tap — it is now stale but was never previewed.
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: {
+        "100": { pid: 999999, cwd: "/stale", name: "stale", claimedAt: 1 },
+        "101": { pid: 999999, cwd: "/live", name: "live", claimedAt: 2 },
+      },
+    });
+    calls.length = 0;
+    await handleUpdate(host, {
+      update_id: 41,
+      callback_query: { id: "cb5", from: { id: 42 }, data: confirm, message: { message_id: 600, chat: { id: 42, type: "private" } } },
+    });
+    // Only the previewed topic 100 is deleted; the newly-stale, unpreviewed 101 survives.
+    expect(calls.filter((c) => c.method === "deleteForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
+    expect(Object.keys(loadRegistry().threads)).toEqual(["101"]);
     expect(calls.some((c) => c.method === "editMessageText" && String(c.payload.text).includes("🧹 deleted 1 stale topic"))).toBe(true);
   });
 
