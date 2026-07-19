@@ -31,7 +31,7 @@ import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessag
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
-import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
+import { PROMPT_SUPERSEDED, type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
 import { BlockedPings, askQuestionSummary } from "./blocked";
 
@@ -244,6 +244,109 @@ export function parseTelegramPromptTarget(prompt: string): PromptTarget | undefi
   const threadId = rawThread == null ? undefined : Number(rawThread);
   if (rawThread != null && !Number.isInteger(threadId)) return undefined;
   return { responderId, chatId, chatType, ...(threadId == null ? {} : { threadId }) };
+}
+
+/**
+ * Build a Telegram prompt target from a resolved notify destination so a local
+ * (terminal-originated) away/always run can route its `ask` questions to the
+ * paired owner. Returns undefined when there is no single paired owner, or when
+ * the owner would not be authorized to answer a prompt in that chat — in which
+ * case the caller leaves the native terminal `ask` untouched.
+ */
+export function buildPromptTarget(
+  dest: { chatId: string; threadId?: number } | undefined,
+  access: Access,
+): PromptTarget | undefined {
+  if (!dest) return undefined;
+  const responderId = pairedOwnerId(access);
+  if (!responderId) return undefined;
+  const chatType = isDmChat(dest.chatId) ? "private" : "supergroup";
+  const target: PromptTarget = {
+    responderId,
+    chatId: dest.chatId,
+    chatType,
+    ...(dest.threadId == null ? {} : { threadId: dest.threadId }),
+  };
+  return canAnswerPrompt(target.responderId, target.chatId, target.chatType, access) ? target : undefined;
+}
+
+/** One place a question can be shown. `run` resolves with a decision, or undefined when the surface gave up (expired, dismissed by a sibling win) without deciding. */
+export interface AskSurface<R> {
+  run(signal: AbortSignal): Promise<R | undefined>;
+}
+
+/**
+ * Present the same question on several surfaces at once (the terminal picker and
+ * Telegram) and take whichever decides first, aborting the rest. A surface that
+ * resolves `undefined` gave up without deciding and is ignored while another
+ * surface is still live; a surface that rejects is reported via `onSurfaceError`
+ * and also treated as gave-up so a working sibling still wins. `onExhausted(aborted)`
+ * supplies the result when every surface merely expired (`aborted` false) or the
+ * parent turn was cancelled (`aborted` true); if the surfaces are exhausted and at
+ * least one rejected, the race rejects with that error rather than reporting a bland
+ * expiry — so a broken Telegram send is surfaced when it was the only path. Losing
+ * surfaces are aborted with {@link PROMPT_SUPERSEDED} so they can tell "answered
+ * elsewhere" apart from a genuine task-stop abort, and a parent abort settles the
+ * race BEFORE the surfaces observe it so an abort-driven `undefined` is never misread
+ * as a user answer.
+ */
+export async function raceAskSurfaces<R>(
+  surfaces: AskSurface<R>[],
+  onExhausted: (aborted: boolean) => R,
+  signal?: AbortSignal,
+  onSurfaceError?: (err: unknown) => void,
+): Promise<R> {
+  if (surfaces.length === 0) return onExhausted(signal?.aborted ?? false);
+  const ac = new AbortController();
+  return await new Promise<R>((resolve, reject) => {
+    let settled = false;
+    let live = surfaces.length;
+    let lastError: unknown;
+    let sawError = false;
+    const stop = (abortReason: unknown): void => {
+      settled = true;
+      signal?.removeEventListener("abort", onParentAbort);
+      ac.abort(abortReason);
+    };
+    const win = (res: R): void => {
+      if (settled) return;
+      stop(PROMPT_SUPERSEDED);
+      resolve(res);
+    };
+    const gaveUp = (): void => {
+      if (settled) return;
+      live -= 1;
+      if (live > 0) return;
+      stop(PROMPT_SUPERSEDED);
+      if (sawError) reject(lastError);
+      else resolve(onExhausted(false));
+    };
+    function onParentAbort(): void {
+      if (settled) return;
+      stop(signal?.reason);
+      resolve(onExhausted(true));
+    }
+    if (signal) {
+      if (signal.aborted) {
+        stop(signal.reason);
+        resolve(onExhausted(true));
+        return;
+      }
+      signal.addEventListener("abort", onParentAbort, { once: true });
+    }
+    for (const surface of surfaces) {
+      surface.run(ac.signal).then(
+        (res) => (res === undefined ? gaveUp() : win(res)),
+        (err) => {
+          if (settled) return;
+          sawError = true;
+          lastError = err;
+          onSurfaceError?.(err);
+          gaveUp();
+        },
+      );
+    }
+  });
 }
 
 /** Active Telegram turns outrank the optional notify destination. */
@@ -1453,8 +1556,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   /**
    * Single notification surface: set the destination chat, or the mode
-   * (off | away | always). `away` auto-clears when you touch the keyboard;
-   * `always` keeps pinging idle + blocked-input across sessions you aren't watching.
+   * (off | away | always). Both `away` and `always` are sticky and behave the
+   * same — they mirror `ask` prompts (shown on the terminal AND Telegram at once)
+   * plus idle/blocked pings to Telegram until turned off. `/away` is the quick
+   * toggle for the same behavior.
    */
   function cmdNotify(ctx: ExtensionContext, arg: string): void {
     const v = arg.trim();
@@ -1475,8 +1580,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         ctx.ui.notify("telegram: notify off — runs stay on-screen", "info");
         return;
       }
-      const clears = v === "away" ? "; typing here clears it" : "";
-      ctx.ui.notify(`telegram: notify ${v} — idle + blocked-input pings go to ${notifyChatLabel(a)}${clears}`, "info");
+      ctx.ui.notify(`telegram: notify ${v} — ask prompts + idle pings mirror to ${notifyChatLabel(a)}`, "info");
       if (!token) ctx.ui.notify("telegram: notify armed, but the bridge isn't running — run /telegram on so pings can fire", "warning");
       return;
     }
@@ -1632,7 +1736,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     name: "telegram_ask",
     label: "Telegram Ask",
     description:
-      "Ask the user who started the active Telegram turn one or more selectable questions. Supports single-select, multi-select, and Other free-text answers. Use this instead of ask during Telegram-originated turns.",
+      'Ask the user one or more selectable questions (single-select, multi-select, or free-text "Other"). While active it shows the question on BOTH the terminal and Telegram at once and returns whichever the user answers first. It replaces `ask` automatically for Telegram-originated turns and while the user is away — use it exactly as you would use `ask`.',
     approval: "read",
     defaultInactive: true,
     parameters: T.Object({
@@ -1653,14 +1757,63 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         { minItems: 1, maxItems: 5 },
       ),
     }),
-    async execute(_id, params, signal) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       const p = params as AskParams;
       const target = activePromptTarget ? { ...activePromptTarget } : undefined;
-      if (!target) return errorResult("telegram_ask is available only while handling a Telegram-originated turn");
+      const canTerminal = ctx?.hasUI === true && typeof ctx.ui?.askDialog === "function";
+      if (!target && !canTerminal) {
+        return errorResult("telegram_ask has no surface available — no Telegram target and no interactive terminal.");
+      }
+      const surfaces: AskSurface<{ content: ContentBlock[]; isError?: true }>[] = [];
+      if (target) {
+        surfaces.push({
+          run: async (sig) => {
+            const outcome = await promptController.ask(target, p.questions, sig, { supersededText: "☑️ Closed at the terminal." });
+            if (outcome.status === "answered") return { content: [{ type: "text", text: formatPromptResult(outcome) }] };
+            if (outcome.status === "cancelled") return errorResult(formatPromptResult(outcome));
+            return undefined; // expired, or superseded because the terminal was answered first
+          },
+        });
+      }
+      if (canTerminal) {
+        surfaces.push({
+          run: async (sig) => {
+            const result = await ctx.ui.askDialog!(
+              p.questions.map((q) => ({
+                id: q.id,
+                question: q.question,
+                options: q.options.map((o) => ({ label: o.label, ...(o.description ? { description: o.description } : {}) })),
+                ...(q.multi != null ? { multi: q.multi } : {}),
+                ...(q.recommended != null ? { recommended: q.recommended } : {}),
+              })),
+              { signal: sig },
+            );
+            // Aborted (a sibling surface won, or the turn stopped) → idle; only a real Esc cancels.
+            if (result === undefined) return sig.aborted ? undefined : errorResult("Question cancelled at the terminal.");
+            if (result.kind === "chat") {
+              return { content: [{ type: "text", text: "User chose to chat about this instead of answering." }] };
+            }
+            if (
+              result.results.length !== p.questions.length ||
+              result.results.some((item, index) => item.id !== p.questions[index]?.id)
+            ) {
+              throw new Error("ask dialog returned results that do not match the requested questions");
+            }
+            const answers = result.results.map((item) => ({
+              id: item.id,
+              question: item.question,
+              selectedOptions: item.selectedOptions,
+              ...(item.customInput == null ? {} : { customInput: item.customInput }),
+              ...(item.note == null ? {} : { note: item.note }),
+            }));
+            return { content: [{ type: "text", text: formatPromptResult({ status: "answered", answers }) }] };
+          },
+        });
+      }
       try {
-        const outcome = await promptController.ask(target, p.questions, signal);
-        if (outcome.status !== "answered") return errorResult(formatPromptResult(outcome));
-        return { content: [{ type: "text", text: formatPromptResult(outcome) }] };
+        const exhausted = (aborted: boolean): { content: ContentBlock[]; isError: true } =>
+          errorResult(aborted ? "The question was cancelled because the task stopped." : "The question expired before it was answered.");
+        return await raceAskSurfaces(surfaces, exhausted, signal, (err) => log.debug(`[telegram] ask surface failed: ${String(err)}`));
       } catch (err) {
         return errorResult(err instanceof Error ? err.message : String(err));
       }
@@ -1764,6 +1917,32 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("away", {
+    description: "Toggle Telegram away mode — mirror ask prompts + idle pings to Telegram",
+    handler: async (_args, ctx) => {
+      lastCtx = ctx;
+      const a = loadAccess(warn);
+      if (a.notifyMode) {
+        // Toggle mirroring off from whatever on-mode it was — never rewrite a
+        // deliberate `always` into `away`.
+        a.notifyMode = undefined;
+        saveAccess(a);
+        access = a;
+        ctx.ui.notify("telegram: notify off — ask prompts and pings stay on this terminal", "info");
+        return;
+      }
+      if (!a.notifyChat && !(ownTopic && a.topicsChat)) {
+        ctx.ui.notify("telegram: away needs a target — run /telegram topics on or /telegram notify <chat_id>", "warning");
+        return;
+      }
+      a.notifyMode = "away";
+      saveAccess(a);
+      access = a;
+      ctx.ui.notify(`telegram: away on — runs you start now mirror ask prompts to your terminal + ${notifyChatLabel(a)}, with idle pings there (run /away again to return)`, "info");
+      if (!token) ctx.ui.notify("telegram: away armed, but the bridge isn't running — run /telegram on so it can fire", "warning");
+    },
+  });
+
   pi.on("session_start", async (_e, ctx) => {
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
     lastCtx = ctx;
@@ -1775,7 +1954,18 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   });
   pi.on("before_agent_start", async (event) => {
-    const target = parseTelegramPromptTarget(event.prompt);
+    const telegramTarget = parseTelegramPromptTarget(event.prompt);
+    // Terminal-originated turn while away/always: route `ask` to Telegram too,
+    // reusing the same swap. buildPromptTarget returns undefined (leaving native
+    // `ask` untouched) when there is no answerable owner destination.
+    let target = telegramTarget;
+    if (!target) {
+      const a = loadAccess(warn);
+      if (a.notifyMode === "away" || a.notifyMode === "always") {
+        const own = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
+        target = buildPromptTarget(notifyTarget(false, a, token.length > 0, own), a);
+      }
+    }
     if (!target) {
       await restorePromptTools();
       return;
@@ -1788,7 +1978,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     return {
       systemPrompt: [
         ...event.systemPrompt,
-        "This turn came from Telegram. Use telegram_ask instead of ask whenever selectable user input is required; its answer will arrive from the originating Telegram user.",
+        telegramTarget
+          ? "This turn came from Telegram. Use telegram_ask instead of ask whenever selectable user input is required; its answer will arrive from the originating Telegram user."
+          : "The user is away from this terminal. Use telegram_ask instead of ask whenever selectable user input is required; it shows the question on both this terminal and Telegram, and returns whichever the user answers first.",
       ],
     };
   });
@@ -1887,16 +2079,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   pi.on("turn_end", async (e, ctx) => {
     lastCtx = ctx;
     await outbound.onTurnEnd(e.message);
-  });
-  pi.on("input", (e, ctx) => {
-    lastCtx = ctx;
-    if (e.source !== "interactive") return;
-    const a = loadAccess(warn);
-    if (a.notifyMode !== "away") return;
-    a.notifyMode = undefined;
-    saveAccess(a);
-    access = a;
-    log.debug("[telegram] notify away cleared by local input");
   });
   pi.on("agent_end", async (e, ctx) => {
     lastCtx = ctx;

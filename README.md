@@ -119,6 +119,20 @@ Inside an omp session topic:
 
 Replies stream back while omp is working.
 
+## Away mode (answer local runs from your phone)
+
+Runs you start at the terminal don't touch Telegram by default. When you're
+stepping away, flip **away mode** so those runs reach your phone:
+
+- `/away` — quick sticky toggle. Run it, then kick off your work and walk away;
+  run it again when you're back.
+- While away, any `ask` the agent raises is shown on **both** your terminal and
+  Telegram at once — answer wherever you are, first one wins. Idle-completion
+  pings go to Telegram too.
+- Pick the destination once with `/telegram notify <chat_id>` (or turn on
+  per-session `/telegram topics`). `/telegram notify away | always | off` is the
+  full surface; `always` is the standing "mirror even at my desk" mode.
+
 ## If something looks wrong
 
 - Start with `/telegram doctor`. It checks token validity, webhook conflicts,

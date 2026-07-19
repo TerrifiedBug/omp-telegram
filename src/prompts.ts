@@ -9,6 +9,14 @@ const PROMPT_TTL_MS = 5 * 60_000;
 const POLL_INTERVAL_MS = 200;
 
 const OPTIONS_PER_PAGE = 8;
+
+/**
+ * Abort reason used when one ask surface is superseded because a sibling surface
+ * (e.g. the terminal picker) was answered first. Lets {@link TelegramPromptController.ask}
+ * distinguish "answered elsewhere" from a genuine task-stop abort when it closes
+ * the Telegram message.
+ */
+export const PROMPT_SUPERSEDED = Symbol("prompt-superseded");
 export interface PromptOption {
   label: string;
   description?: string;
@@ -34,6 +42,8 @@ export interface PromptAnswer {
   question: string;
   selectedOptions: string[];
   customInput?: string;
+  /** Extra free-text the terminal picker lets the user attach alongside a selection. Telegram prompts don't collect it. */
+  note?: string;
 }
 
 export type PromptOutcome =
@@ -176,12 +186,14 @@ export function formatPromptResult(outcome: PromptOutcome): string {
     const lines: string[] = [];
     if (answer.selectedOptions.length > 0) lines.push(`User selected: ${answer.selectedOptions.join(", ")}`);
     if (answer.customInput != null) lines.push(`User provided custom input: ${answer.customInput}`);
+    if (answer.note != null) lines.push(`User added a note: ${answer.note}`);
     return lines.join("\n");
   }
   return `User answers:\n${outcome.answers
     .map((answer) => {
       const values = [...answer.selectedOptions, ...(answer.customInput == null ? [] : [answer.customInput])];
-      return `- ${answer.id}: ${values.join(", ")}`;
+      const noteSuffix = answer.note == null ? "" : ` (note: ${answer.note})`;
+      return `- ${answer.id}: ${values.join(", ")}${noteSuffix}`;
     })
     .join("\n")}`;
 }
@@ -222,7 +234,12 @@ export class TelegramPromptController {
     this.#waitForPoll = options.waitForPoll ?? waitForPoll;
   }
 
-  async ask(target: PromptTarget, questions: PromptQuestion[], signal?: AbortSignal): Promise<PromptOutcome> {
+  async ask(
+    target: PromptTarget,
+    questions: PromptQuestion[],
+    signal?: AbortSignal,
+    opts?: { supersededText?: string },
+  ): Promise<PromptOutcome> {
     if (!this.#authorize(target.responderId, target.chatId, target.chatType)) {
       throw new Error("The originating Telegram user is no longer authorized");
     }
@@ -260,7 +277,8 @@ export class TelegramPromptController {
       await remove(requestPath(nonce));
     }
     if (outcome.status === "expired" || outcome.status === "aborted") {
-      await this.#edit(request, formatOutcome(outcome), { inline_keyboard: [] });
+      const superseded = outcome.status === "aborted" && signal?.reason === PROMPT_SUPERSEDED && opts?.supersededText;
+      await this.#edit(request, superseded ? opts.supersededText! : formatOutcome(outcome), { inline_keyboard: [] });
     }
     await remove(answerPath(nonce));
     return outcome;

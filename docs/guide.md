@@ -112,7 +112,7 @@ Codes expire after 1 hour; at most 3 are pending before an owner is established.
 | `group add <id> [--no-mention] [--allow a,b]` | Allow a group; optionally drop the mention requirement / restrict senders |
 | `group rm <id>` | Remove a group |
 | `set <key> <value>` | Tune delivery/UX (see below) |
-| `notify <chat_id>` / `notify off` | Ping a chat when a **locally-started** run goes idle (AFK pings). Off by default. |
+| `notify <chat_id>` / `notify clear` / `notify off\|away\|always` | Destination and mode for mirroring **locally-started** runs to Telegram. `away`/`always` mirror `ask` prompts (shown on the terminal AND Telegram) plus idle/blocked pings; `off` is the default. `/away` is the quick sticky toggle for the same thing. See [Notifications](#notifications). |
 | `topics on` / `topics <chat_id>` / `topics off` / `topics tidy on\|off` | Per-session **forum topics**: claim one topic per omp session, routing each session's traffic to its own thread. `on` auto-hosts in your paired DM (no id needed); `<chat_id>` hosts in a specific chat (e.g. a forum supergroup). `tidy on` deletes (DM host) or closes (group host) a session's topic when it exits; a re-adopted closed group topic is reopened. Off by default. |
 
 Every mutation persists to `access.json` and takes effect on the next inbound
@@ -237,9 +237,11 @@ count as a mention.
   else as documents (≤ 50 MB each).
 - **`telegram_react`** — react to a message with a Telegram whitelist emoji
   (👍 👎 ❤ 🔥 👀 🎉 …).
-- **`telegram_ask`** — during a Telegram-originated turn, ask the originating
-  user one or more single-select, multi-select, or free-text **Other** questions
-  with inline keyboards. Requests are responder-, chat-, topic-, message-, nonce-,
+- **`telegram_ask`** — ask the user one or more single-select, multi-select, or
+  free-text **Other** questions with inline keyboards. It replaces `ask` on
+  Telegram-originated turns and while away/always mode is on, showing the
+  question on both the terminal and Telegram at once and returning whichever the
+  user answers first. Requests are responder-, chat-, topic-, message-, nonce-,
   and expiry-bound; cross-process answers use the shared state directory.
 
 `telegram_send` and `telegram_react` refuse any chat the inbound gate would not
@@ -276,50 +278,66 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 
 By default the bridge is reactive — it only messages a chat that messaged it
 first, and a **locally-started** run (one you kick off at the terminal) mirrors
-nothing. Notifications opt one destination into two kinds of ping for local runs:
+nothing. Away mode opts one destination into mirroring for local runs:
 
+- **Ask prompts** — for any run **started while away is on**, when it calls
+  `ask` the question is shown on **both** this terminal and Telegram at once
+  (single-select, multi-select, and **Other** free-text, exactly like a
+  Telegram-originated turn). Answer wherever you are — the first surface to
+  answer wins and the other closes. Turn away on, kick off your work, then walk
+  away: its questions reach your phone, and the terminal picker still waits if
+  you sit back down. Away is sticky (it stays on across runs), so the natural
+  flow is `/away` *then* start tasks. Flipping away on *after* a run has already
+  started applies from the next run; that in-flight run's `ask` falls back to a
+  blocked ping (below).
 - **Idle** — a locally-started run finishes and the session goes idle: the bot
   sends `✅ omp idle in <dir> — your turn.`
-- **Blocked** — the run parks mid-turn waiting for you (a tool approval, or an
-  `ask` prompt). After a two-second grace the bot sends
-  `[BLOCKED] omp is waiting for your input in <dir>` with the question — the
-  state herdr shows as `blocked`. Answering at the terminal edits it to
-  `[ANSWERED]`.
+- **Blocked (fallback)** — if a run parks on input that *can't* be mirrored (a
+  tool approval, or an `ask` that started before away was on / has no answerable
+  Telegram destination), the bot sends `[BLOCKED] omp is waiting for your input
+  in <dir>` after a two-second grace — the state herdr shows as `blocked`.
+  Answering at the terminal edits it to `[ANSWERED]`.
 
-Set it up in two moves:
+Set it up:
 
+- `/away` — the quick toggle. Turns mirroring **on** when you step away and
+  **off** when you're back; run it again to flip. This is all you need day to day.
+  It's sticky: it stays on across runs until you turn it off (typing a normal
+  prompt no longer clears it).
 - `/telegram notify <chat_id>` picks the destination (grab your `<chat_id>` from
   `/whoami` in the bot DM); `/telegram notify clear` drops it.
-- `/telegram notify away | always | off` picks when to ping:
-  - **away** — only while you've stepped away; the next interactive keystroke at
-    any session clears it back to off.
-  - **always** — keep pinging regardless, for juggling several herdr sessions you
-    aren't actively watching.
-  - **off** — nothing pings.
+- `/telegram notify away | always | off` is the full surface for the same modes:
+  - **away** / **always** — both sticky and identical in behavior: mirror ask
+    prompts and idle/blocked pings until turned off. `away` is the label `/away`
+    sets; `always` reads as a standing "even at my desk, mirror to my phone"
+    preference for juggling several herdr sessions you aren't actively watching.
+  - **off** — nothing mirrors; asks stay on this terminal.
 
-- Only **locally-started** runs ping — Telegram-initiated runs already stream
+- Only **locally-started** runs mirror — Telegram-initiated runs already stream
   their reply back, so they never double-notify.
-- With **topics mode** on, a session's ping lands in its own topic; otherwise it
-  goes to the flat notify chat. Status and arming report the destination that
-  will actually be used (topic first).
+- With **topics mode** on, a session's prompts/pings land in its own topic;
+  otherwise they go to the flat notify chat. Status and arming report the
+  destination that will actually be used (topic first).
 - Sending doesn't need the poll lock, so in a multi-session setup any session
-  with the token configured pings on its own — including the `<dir>` so you can
+  with the token configured mirrors on its own — including the `<dir>` so you can
   tell which one.
-- Requires the bridge to be running — arming while it's off warns you, and pings
-  only start once you run `/telegram on`.
+- Requires the bridge to be running — arming while it's off warns you, and
+  mirroring only starts once you run `/telegram on`.
 
 ## Blocked pings in detail
 
-A **blocked** ping fires when a run parks for input and stays parked past a
-two-second grace (a resolution before then cancels it), honoring the notify mode
-above (a live Telegram turn instead pings its own session topic):
+A **blocked** ping is the fallback for input that can't be answered over
+Telegram; it fires past a two-second grace (a resolution before then cancels it):
 
 - **Tool approval** — `[WAIT] omp is waiting for approval: <tool>`. Telegram
   cannot approve or deny; finish it at the terminal. Resolving edits the message
   to `[APPROVED]` / `[DENIED]`.
-- **`ask` prompt** — `[BLOCKED] omp is waiting for your input in <dir>` with the
-  question. `ask` is read-approval, so it never triggers the approval ping on its
-  own; this is what surfaces it. Answering edits the message to `[ANSWERED]`.
+- **Unmirrored `ask`** — `[BLOCKED] omp is waiting for your input in <dir>` with
+  the question. This is what surfaces an `ask` that wasn't turned into the
+  dual-surface prompt — away wasn't on when the run started, or no answerable
+  Telegram destination is configured. Answering at the terminal edits it to
+  `[ANSWERED]`. When away *is* on at run start, the question is mirrored live
+  instead (see Notifications) and no blocked ping is needed.
 
 Session shutdown and agent completion clear pending timers.
 
