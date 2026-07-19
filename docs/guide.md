@@ -42,7 +42,7 @@ Install the published extension:
 
 ```bash
 omp plugin install omp-telegram
-omp plugin list        # → omp-telegram@0.4.0
+omp plugin list        # → omp-telegram@0.7.0
 ```
 
 There is no build step and no runtime dependency install. The extension uses
