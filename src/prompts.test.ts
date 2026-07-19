@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TgCallbackQuery, TgMessage } from "./api";
 import type { TelegramCall } from "./control";
-import { TelegramPromptController, formatPromptResult } from "./prompts";
+import { PROMPT_SUPERSEDED, TelegramPromptController, formatPromptResult } from "./prompts";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 let dir: string;
@@ -192,5 +192,45 @@ describe("TelegramPromptController", () => {
     now = 5 * 60_000 + 1;
     await advancePromptPoll();
     await expect(expiryPending).resolves.toEqual({ status: "expired" });
+  });
+
+  test("closes as answered-elsewhere on a superseded abort, task-stopped on a plain abort", async () => {
+    const supOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "superseded", waitForPoll: waitForTestPoll });
+    const supAbort = new AbortController();
+    const supPending = supOwner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }], supAbort.signal, {
+      supersededText: "☑️ Closed at the terminal.",
+    });
+    await waitForRequest("superseded");
+    supAbort.abort(PROMPT_SUPERSEDED);
+    await expect(supPending).resolves.toEqual({ status: "aborted" });
+    expect(calls.filter((call) => call.method === "editMessageText").at(-1)?.payload.text).toBe("☑️ Closed at the terminal.");
+
+    nextMessageId = 200;
+    const stopOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "stopped", waitForPoll: waitForTestPoll });
+    const stopAbort = new AbortController();
+    const stopPending = stopOwner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }], stopAbort.signal, {
+      supersededText: "☑️ Closed at the terminal.",
+    });
+    await waitForRequest("stopped");
+    stopAbort.abort();
+    await expect(stopPending).resolves.toEqual({ status: "aborted" });
+    expect(calls.filter((call) => call.method === "editMessageText").at(-1)?.payload.text).toBe("Question cancelled because the task stopped.");
+  });
+});
+
+describe("formatPromptResult", () => {
+  test("keeps a terminal note alongside the selection (single and multi)", () => {
+    expect(
+      formatPromptResult({ status: "answered", answers: [{ id: "q", question: "Pick", selectedOptions: ["JWT"], note: "check with security" }] }),
+    ).toBe("User selected: JWT\nUser added a note: check with security");
+    expect(
+      formatPromptResult({
+        status: "answered",
+        answers: [
+          { id: "a", question: "One", selectedOptions: ["X"], note: "careful" },
+          { id: "b", question: "Two", selectedOptions: ["Y"] },
+        ],
+      }),
+    ).toBe("User answers:\n- a: X (note: careful)\n- b: Y");
   });
 });
