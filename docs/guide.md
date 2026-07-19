@@ -112,7 +112,7 @@ Codes expire after 1 hour; at most 3 are pending before an owner is established.
 | `group add <id> [--no-mention] [--allow a,b]` | Allow a group; optionally drop the mention requirement / restrict senders |
 | `group rm <id>` | Remove a group |
 | `set <key> <value>` | Tune delivery/UX (see below) |
-| `notify <chat_id>` / `notify clear` / `notify off\|away\|always` | Destination and mode for mirroring **locally-started** runs to Telegram. `away`/`always` mirror `ask` prompts (shown on the terminal AND Telegram) plus idle/blocked pings; `off` is the default. `/away` is the quick sticky toggle for the same thing. See [Notifications](#notifications). |
+| `notify <chat_id>` / `notify clear` / `notify off\|away\|always` | Destination and mode for mirroring **locally-started** runs to Telegram. `away`/`always` mirror `ask` prompts (shown on the terminal AND Telegram) plus idle/blocked pings; `off` is the default. `away` auto-clears when you next type at the terminal; `always` stays until turned off. `/away` is the quick toggle for `away`. See [Notifications](#notifications). |
 | `topics on` / `topics <chat_id>` / `topics off` / `topics tidy on\|off` | Per-session **forum topics**: claim one topic per omp session, routing each session's traffic to its own thread. `on` auto-hosts in your paired DM (no id needed); `<chat_id>` hosts in a specific chat (e.g. a forum supergroup). `tidy on` deletes (DM host) or closes (group host) a session's topic when it exits; a re-adopted closed group topic is reopened. Off by default. |
 
 Every mutation persists to `access.json` and takes effect on the next inbound
@@ -286,10 +286,11 @@ nothing. Away mode opts one destination into mirroring for local runs:
   Telegram-originated turn). Answer wherever you are — the first surface to
   answer wins and the other closes. Turn away on, kick off your work, then walk
   away: its questions reach your phone, and the terminal picker still waits if
-  you sit back down. Away is sticky (it stays on across runs), so the natural
-  flow is `/away` *then* start tasks. Flipping away on *after* a run has already
-  started applies from the next run; that in-flight run's `ask` falls back to a
-  blocked ping (below).
+  you sit back down. It stays armed across runs while you're gone, but
+  auto-clears the moment you type your next prompt at this terminal — so `/away`
+  *then* walk away is the natural flow. (Use `always` to keep mirroring even at
+  the desk.) Flipping away on *after* a run has already started applies from the
+  next run; that in-flight run's `ask` falls back to a blocked ping (below).
 - **Idle** — a locally-started run finishes and the session goes idle: the bot
   sends `✅ omp idle in <dir> — your turn.`
 - **Blocked (fallback)** — if a run parks on input that *can't* be mirrored (a
@@ -302,15 +303,17 @@ Set it up:
 
 - `/away` — the quick toggle. Turns mirroring **on** when you step away and
   **off** when you're back; run it again to flip. This is all you need day to day.
-  It's sticky: it stays on across runs until you turn it off (typing a normal
-  prompt no longer clears it).
+  It auto-clears the next time you type a prompt at this terminal — a phone reply
+  never counts, so answering from your phone keeps it armed.
 - `/telegram notify <chat_id>` picks the destination (grab your `<chat_id>` from
   `/whoami` in the bot DM); `/telegram notify clear` drops it.
 - `/telegram notify away | always | off` is the full surface for the same modes:
-  - **away** / **always** — both sticky and identical in behavior: mirror ask
-    prompts and idle/blocked pings until turned off. `away` is the label `/away`
-    sets; `always` reads as a standing "even at my desk, mirror to my phone"
-    preference for juggling several herdr sessions you aren't actively watching.
+  - **away** — mirror ask prompts and idle/blocked pings while you're gone;
+    auto-clears on your next interactive prompt at this terminal (a phone reply
+    doesn't count). This is the mode `/away` sets.
+  - **always** — the same mirroring, but it never auto-clears — a standing "even
+    at my desk, mirror to my phone" preference for juggling several herdr
+    sessions you aren't actively watching. Turn it off explicitly.
   - **off** — nothing mirrors; asks stay on this terminal.
 
 - Only **locally-started** runs mirror — Telegram-initiated runs already stream
