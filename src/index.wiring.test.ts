@@ -112,6 +112,13 @@ describe("extension wiring", () => {
     expect(loadAccess().notifyMode).toBeUndefined();
   });
 
+  test("/away turns off `always` without downgrading it to `away`", async () => {
+    writeAccess({ allowFrom: ["42"], notifyChat: "42", notifyMode: "always" });
+    const h = harness(["ask"]);
+    await h.commands.get("away")?.handler("", { ui: { notify() {} } });
+    expect(loadAccess().notifyMode).toBeUndefined();
+  });
+
   test("/away refuses to arm without a destination", async () => {
     writeAccess({ allowFrom: ["42"] }); // no notifyChat, no topics
     const h = harness(["ask"]);

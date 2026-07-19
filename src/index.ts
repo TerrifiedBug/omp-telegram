@@ -1922,11 +1922,13 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       lastCtx = ctx;
       const a = loadAccess(warn);
-      if (a.notifyMode === "away") {
+      if (a.notifyMode) {
+        // Toggle mirroring off from whatever on-mode it was — never rewrite a
+        // deliberate `always` into `away`.
         a.notifyMode = undefined;
         saveAccess(a);
         access = a;
-        ctx.ui.notify("telegram: away off — ask prompts and pings stay on this terminal", "info");
+        ctx.ui.notify("telegram: notify off — ask prompts and pings stay on this terminal", "info");
         return;
       }
       if (!a.notifyChat && !(ownTopic && a.topicsChat)) {
