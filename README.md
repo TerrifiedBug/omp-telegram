@@ -88,7 +88,7 @@ Inside **omp control**:
 /spawn new <branch> [space]    Create a worktree from a space and start omp
 /spawn dir <absolute-path>     Create a herdr workspace and start omp
 /sessions                      See live, unattached, and stale sessions
-/cleanup [go]                   Tidy topics of exited sessions (delete in DM, close in group); go performs it
+/cleanup                       Preview exited-session topics, then tap to delete (DM) or close (group); /cleanup go skips the tap
 /status                        Check the bridge
 /help                          Show Telegram commands
 ```

@@ -89,7 +89,116 @@ export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): 
   return !hasUI && activeTools.includes("yield");
 }
 
-const SUBCOMMANDS = ["status", "doctor", "daemon", "token", "on", "off", "pair", "deny", "allow", "remove", "policy", "group", "set", "notify", "topics"];
+/**
+ * Argument-completion grammar for `/telegram <sub> …`. Each key is a token
+ * offered at that position; a nested record describes the next position and
+ * `null` marks a terminal (a free-form value or the end of the grammar). This
+ * is the single source of truth for both the completion dropdown and the
+ * subcommand list, so the accepted and suggested surfaces cannot drift.
+ */
+type CompletionNode = { [token: string]: CompletionNode | null };
+const TELEGRAM_ARGS: CompletionNode = {
+  status: null,
+  doctor: null,
+  daemon: { status: null, restart: null, stop: null },
+  token: null,
+  on: null,
+  off: null,
+  pair: null,
+  deny: null,
+  allow: null,
+  remove: null,
+  policy: { pairing: null, allowlist: null, disabled: null },
+  group: { add: null, rm: null },
+  set: {
+    ackReaction: null,
+    replyToMode: { off: null, first: null, all: null },
+    textChunkLimit: null,
+    chunkMode: { length: null, newline: null },
+    mentionPatterns: null,
+    deliverAs: { steer: null, followUp: null },
+    streaming: { true: null, false: null },
+    transcribeCommand: null,
+  },
+  notify: { off: null, away: null, always: null, status: null, clear: null },
+  topics: { on: null, off: null, status: null, tidy: { on: null, off: null, status: null } },
+};
+const SUBCOMMANDS = Object.keys(TELEGRAM_ARGS);
+
+/** One-line orientation for each top-level subcommand in the completion dropdown. */
+const SUBCOMMAND_HELP: Record<string, string> = {
+  status: "bridge and session health",
+  doctor: "diagnose bridge configuration",
+  daemon: "control the background poller",
+  token: "set the bot token",
+  on: "start the bridge",
+  off: "stop the bridge",
+  pair: "pair a pending code",
+  deny: "reject a pending code",
+  allow: "set the owner by user id",
+  remove: "remove a paired user",
+  policy: "who may DM the bot",
+  group: "manage group access",
+  set: "tune bridge options",
+  notify: "idle / blocked-input pings",
+  topics: "per-project session topics",
+};
+
+/** Short descriptions for `/telegram set <key>` — these keys are otherwise opaque. */
+const SET_KEY_HELP: Record<string, string> = {
+  ackReaction: "emoji reaction on received messages",
+  replyToMode: "thread replies: off | first | all",
+  textChunkLimit: "max characters per message (1-4096)",
+  chunkMode: "split long output on length | newline",
+  mentionPatterns: "JSON array of mention regexes",
+  deliverAs: "steer | followUp delivery",
+  streaming: "stream partial output: true | false",
+  transcribeCommand: "JSON argv for voice transcription",
+};
+
+/**
+ * Nested Tab-completions for `/telegram`. Walks {@link TELEGRAM_ARGS} along the
+ * already-typed tokens and offers the tokens valid at the current position;
+ * `dynamic` supplies live values (pending pairing codes, paired owners) for the
+ * free-form single-argument subcommands. Each item's `value` is the FULL
+ * argument replacement (the TUI swaps the whole argument text), so nested
+ * positions round-trip correctly. Returns `null` to fall through when the
+ * position takes a free value with nothing to suggest.
+ */
+export function telegramArgumentCompletions(
+  prefix: string,
+  dynamic: { pending: () => string[]; owners: () => string[] } = { pending: () => [], owners: () => [] },
+): Array<{ value: string; label: string; description?: string }> | null {
+  // Match tokens case-sensitively, matching the handler switch and the camelCase
+  // `set` keys (e.g. `replyToMode`); lowercasing would make those unreachable.
+  const trailingSpace = /\s$/.test(prefix);
+  const typed = prefix.split(/\s+/).filter(Boolean);
+  const fragment = trailingSpace ? "" : (typed.pop() ?? "");
+  const done = typed;
+  const base = done.length ? `${done.join(" ")} ` : "";
+  const build = (options: string[], help?: Record<string, string>) => {
+    const matched = options.filter((o) => o.startsWith(fragment));
+    if (matched.length === 0) return null;
+    return matched.map((o) => ({ value: `${base}${o} `, label: o, ...(help?.[o] ? { description: help[o] } : {}) }));
+  };
+
+  // Free-form single-argument subcommands: complete from live state.
+  if (done.length === 1) {
+    if (done[0] === "pair" || done[0] === "deny") return build(dynamic.pending());
+    if (done[0] === "remove") return build(dynamic.owners());
+  }
+
+  // Static grammar walk along the already-typed tokens.
+  let node: CompletionNode | null = TELEGRAM_ARGS;
+  for (const token of done) {
+    if (node === null || !(token in node)) return null; // terminal reached, or an unknown/free token
+    node = node[token];
+  }
+  if (node === null) return null; // current position takes a free-form value
+  const help = done.length === 0 ? SUBCOMMAND_HELP : done.length === 1 && done[0] === "set" ? SET_KEY_HELP : undefined;
+  return build(Object.keys(node), help);
+}
+
 const BATCH_WINDOW_MS = 800;
 const BLOCK_PING_DELAY_MS = 2_000;
 const THINKING_LEVELS: Record<string, true> = {
@@ -1558,10 +1667,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("telegram", {
     description: "Telegram bridge: status, pairing, access, config",
-    getArgumentCompletions: (prefix) => {
-      if (prefix.includes(" ")) return null; // only complete the first token
-      return SUBCOMMANDS.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s }));
-    },
+    getArgumentCompletions: (prefix) =>
+      telegramArgumentCompletions(prefix, {
+        pending: () => Object.keys(loadAccess(warn).pending),
+        owners: () => loadAccess(warn).allowFrom,
+      }),
     handler: async (args, ctx) => {
       lastCtx = ctx;
       const parts = args.trim().length > 0 ? args.trim().split(/\s+/) : [];

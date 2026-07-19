@@ -65,6 +65,15 @@ function message(text: string, topic?: number): TgMessage {
   };
 }
 
+type InlineButton = { text: string; callback_data: string };
+/** Read the inline keyboard the bridge attached to a captured sendMessage payload. */
+function keyboardOf(call: { payload: Record<string, unknown> } | undefined): InlineButton[][] {
+  const markup = call?.payload.reply_markup;
+  if (!markup || typeof markup !== "object" || !("inline_keyboard" in markup)) throw new Error("payload has no inline keyboard");
+  const rows = markup.inline_keyboard; // unknown after the `in` narrow
+  return rows as InlineButton[][]; // known Bot API shape in these tests
+}
+
 describe("shared bridge routing", () => {
   test("forwards a live foreign topic through the filesystem spool", async () => {
     saveRegistry({
@@ -159,13 +168,17 @@ describe("cleanup command", () => {
       },
     });
 
-  test("bare /cleanup previews only stale topics and acts on nothing", async () => {
+  test("bare /cleanup previews only stale topics, with tidy buttons, and acts on nothing", async () => {
     seedStale("42");
     await handleUpdate(makeHost(), { update_id: 10, message: message("/cleanup") });
-    const preview = calls.find((c) => String(c.payload.text ?? "").includes("Run /cleanup go"))?.payload.text as string;
-    expect(preview).toContain("#100 stale — /stale");
-    expect(preview).not.toContain("#101");
-    expect(preview).not.toContain("#99");
+    const preview = calls.find((c) => c.method === "sendMessage" && String(c.payload.text ?? "").includes("Delete these 1 topic"));
+    expect(String(preview?.payload.text)).toContain("#100 stale — /stale");
+    expect(String(preview?.payload.text)).not.toContain("#101");
+    expect(String(preview?.payload.text)).not.toContain("#99");
+    const keyboard = keyboardOf(preview);
+    expect(keyboard[0][0].callback_data.startsWith("cl:go:")).toBe(true);
+    expect(keyboard[0][0].text).toContain("Delete 1 topic");
+    expect(keyboard[1][0].callback_data.startsWith("cl:x:")).toBe(true);
     expect(calls.some((c) => c.method === "deleteForumTopic" || c.method === "closeForumTopic")).toBe(false);
     expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]);
   });
@@ -221,6 +234,67 @@ describe("cleanup command", () => {
     await handleUpdate(host, { update_id: 14, message: message("/cleanup go") });
     expect(calls.some((c) => String(c.payload.text ?? "").includes("🧹 closed 0 stale topics (1 failed"))).toBe(true);
     expect(Object.keys(loadRegistry().threads)).toEqual(["100"]);
+  });
+
+  // A host whose sendMessage echoes a real Message so the preview registers a picker.
+  const previewHost = (messageId: number) =>
+    makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method === "sendMessage") return { message_id: messageId, date: 1, chat: { id: 42, type: "private" } };
+        return undefined;
+      }) as unknown as TelegramCall, // test double: mixed return branches
+    });
+  const previewButton = (row: number) =>
+    keyboardOf(calls.find((c) => c.method === "sendMessage" && c.payload.reply_markup != null))[row][0].callback_data;
+
+  test("the confirm tap re-derives stale topics and deletes them", async () => {
+    seedStale("42");
+    const host = previewHost(555);
+    await handleUpdate(host, { update_id: 30, message: message("/cleanup") });
+    const confirm = previewButton(0);
+    calls.length = 0;
+    await handleUpdate(host, {
+      update_id: 31,
+      callback_query: { id: "cb1", from: { id: 42 }, data: confirm, message: { message_id: 555, chat: { id: 42, type: "private" } } },
+    });
+    expect(calls.filter((c) => c.method === "deleteForumTopic").map((c) => c.payload.message_thread_id)).toEqual([100]);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["101", "99"]);
+    expect(calls.some((c) => c.method === "editMessageText" && String(c.payload.text).includes("🧹 deleted 1 stale topic"))).toBe(true);
+  });
+
+  test("the cancel tap dismisses the preview and touches nothing", async () => {
+    seedStale("42");
+    const host = previewHost(556);
+    await handleUpdate(host, { update_id: 32, message: message("/cleanup") });
+    const cancel = previewButton(1);
+    calls.length = 0;
+    await handleUpdate(host, {
+      update_id: 33,
+      callback_query: { id: "cb2", from: { id: 42 }, data: cancel, message: { message_id: 556, chat: { id: 42, type: "private" } } },
+    });
+    expect(calls.some((c) => c.method === "deleteForumTopic" || c.method === "closeForumTopic")).toBe(false);
+    expect(calls.some((c) => c.method === "editMessageText" && String(c.payload.text).includes("Cleanup cancelled"))).toBe(true);
+    expect(Object.keys(loadRegistry().threads).sort()).toEqual(["100", "101", "99"]);
+  });
+
+  test("rejects a cleanup tap from a non-owner", async () => {
+    const host = previewHost(557);
+    await handleUpdate(host, {
+      update_id: 34,
+      callback_query: { id: "cb3", from: { id: 99 }, data: "cl:go:whatever", message: { message_id: 557, chat: { id: 42, type: "private" } } },
+    });
+    expect(calls.some((c) => c.method === "answerCallbackQuery" && String(c.payload.text).includes("restricted to the paired owner"))).toBe(true);
+    expect(calls.some((c) => c.method === "deleteForumTopic")).toBe(false);
+  });
+
+  test("reports an expired cleanup when the nonce is unknown", async () => {
+    const host = previewHost(558);
+    await handleUpdate(host, {
+      update_id: 35,
+      callback_query: { id: "cb4", from: { id: 42 }, data: "cl:go:missing", message: { message_id: 558, chat: { id: 42, type: "private" } } },
+    });
+    expect(calls.some((c) => c.method === "answerCallbackQuery" && String(c.payload.text).includes("This cleanup expired"))).toBe(true);
   });
 });
 

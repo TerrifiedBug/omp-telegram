@@ -139,7 +139,7 @@ notice in the originating topic.
 | `/spawn new <branch> [space]` | Create an unfocused git worktree from the selected source space, then run omp in its root pane. |
 | `/spawn dir <absolute-path>` | Create an unfocused herdr workspace rooted at an existing absolute directory, then run omp there. |
 | `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
-| `/cleanup [go]` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews; `/cleanup go` performs the tidy. |
+| `/cleanup` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews with a confirm button (tap to tidy); `/cleanup go` skips the confirmation. The confirm tap re-derives the stale set, so it never acts on a stale preview. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
@@ -372,8 +372,8 @@ and its stale-topic auto-resume identity), and in a **forum supergroup** it is
 *closed* (parked, history kept) and **reopened** automatically when the next omp run
 in that directory re-adopts it. A crash or `kill -9` skips the clean-exit path; sweep
 those leftovers with the owner `/cleanup` command — `/cleanup` previews the stale
-topics and `/cleanup go` deletes (DM host) or closes (group host) them, never
-touching live sessions or `omp control`. Either way, `/spawn` from Telegram always
+topics with a confirm button (or `/cleanup go`) and then deletes (DM host) or closes
+(group host) them, never touching live sessions or `omp control`. Either way, `/spawn` from Telegram always
 starts a fresh session in a brand-new topic.
 
 ## Security
