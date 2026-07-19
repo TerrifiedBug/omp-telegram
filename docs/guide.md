@@ -139,7 +139,7 @@ notice in the originating topic.
 | `/spawn new <branch> [space]` | Create an unfocused git worktree from the selected source space, then run omp in its root pane. |
 | `/spawn dir <absolute-path>` | Create an unfocused herdr workspace rooted at an existing absolute directory, then run omp there. |
 | `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
-| `/cleanup` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews with a confirm button (tap to tidy); `/cleanup go` skips the confirmation. The confirm tap re-derives the stale set, so it never acts on a stale preview. |
+| `/cleanup` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews with a confirm button; the tap acts only on the previewed topics that are still stale, so it never deletes a topic that went stale after the preview or one that has since resumed. `/cleanup go` skips the preview and tidies all currently-stale topics. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |

@@ -278,6 +278,10 @@ interface CleanupPicker {
   ownerId: string;
   chatId: string;
   messageId: number;
+  /** Host chat the preview was derived against; the stored ids are chat-local. */
+  topicsChat: string;
+  /** Exact stale topic ids the preview showed; the tap acts only on these. */
+  threadIds: number[];
   expiresAt: number;
 }
 
@@ -329,8 +333,9 @@ function cleanupResultText(cleaned: number, failed: number, deletes: boolean): s
 
 /**
  * Preview the stale topics with a confirm/cancel keyboard so the owner can tidy
- * with one tap instead of typing `/cleanup go`. The confirm button re-derives
- * the stale set when tapped, so it never acts on a snapshot that has gone stale.
+ * with one tap instead of typing `/cleanup go`. The picker records the exact
+ * previewed topic ids so the tap acts only on those (revalidated as still
+ * stale) — never on a topic that went stale, or resumed, after the preview.
  */
 async function sendCleanupPreview(
   host: BridgeHost,
@@ -369,6 +374,8 @@ async function sendCleanupPreview(
       ownerId,
       chatId: String(sent.chat.id),
       messageId: sent.message_id,
+      topicsChat,
+      threadIds: stale.map(([threadId]) => threadId),
       expiresAt: Date.now() + CLEANUP_TTL_MS,
     });
   }
@@ -432,16 +439,20 @@ export async function handleCleanupCallback(host: BridgeHost, query: TgCallbackQ
 
   const registry = loadRegistry(host.warn);
   const topicsChat = registry.chatId || access.topicsChat;
-  if (!topicsChat) {
+  // Act only on the exact topics this preview showed, revalidated as still
+  // stale. A topic that went stale AFTER the preview was never confirmed (don't
+  // delete its unpreviewed history); one that resumed since must be spared.
+  if (!topicsChat || topicsChat !== picker.topicsChat) {
     await answerCallback(host, query.id);
-    await editCleanupMessage(host, message, "Topics mode is off — nothing to clean.");
+    await editCleanupMessage(host, message, "The topic host changed since this preview. Run /cleanup again.");
     return true;
   }
   const controlExclude = topicsChat === ownerId ? access.controlThreadId : undefined;
-  const stale = staleThreads(registry, isAlive, controlExclude);
+  const previewed = new Set(picker.threadIds);
+  const stale = staleThreads(registry, isAlive, controlExclude).filter(([threadId]) => previewed.has(threadId));
   if (stale.length === 0) {
     await answerCallback(host, query.id);
-    await editCleanupMessage(host, message, "Nothing to clean — no stale session topics.");
+    await editCleanupMessage(host, message, "Nothing to clean — those topics are gone or back in use.");
     return true;
   }
   await answerCallback(host, query.id, "Cleaning up…");
