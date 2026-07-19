@@ -8,12 +8,17 @@ import telegramExtension from "./index";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
+type ToolResult = { content: { type: string; text: string }[]; isError?: true };
+type ToolShape = {
+  name: string;
+  execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
+};
 
 // A structural fake ExtensionAPI that captures registrations and tool-set
 // mutations so we can drive the real extension handlers without a live bridge.
 // These are runtime-populated collections keyed dynamically, hence Map.
 function harness(initialTools: string[]) {
-  const tools = new Map<string, { name: string }>();
+  const tools = new Map<string, ToolShape>();
   const commands = new Map<string, { handler: CommandHandler }>();
   const handlers = new Map<string, EventHandler[]>();
   const setActiveCalls: string[][] = [];
@@ -24,7 +29,7 @@ function harness(initialTools: string[]) {
   const pi = {
     typebox: { Type: anyType },
     logger: { warn() {}, debug() {}, info() {}, error() {} },
-    registerTool: (tool: { name: string }) => tools.set(tool.name, tool),
+    registerTool: (tool: ToolShape) => tools.set(tool.name, tool),
     registerCommand: (name: string, opts: { handler: CommandHandler }) => commands.set(name, opts),
     registerFlag: () => {},
     registerShortcut: () => {},
@@ -126,5 +131,74 @@ describe("extension wiring", () => {
     await h.commands.get("away")?.handler("", { ui: { notify: (_message: string, level?: string) => (warned ||= level === "warning") } });
     expect(warned).toBe(true);
     expect(loadAccess().notifyMode).toBeUndefined();
+  });
+});
+
+type DialogQuestion = { id: string; question: string; options: { label: string }[]; multi?: boolean };
+
+describe("telegram_ask execute (dual-surface)", () => {
+  const questions = [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }];
+  const submit = async (qs: DialogQuestion[], selected: string[] = ["A"], note?: string) => ({
+    kind: "submit",
+    results: qs.map((q) => ({
+      id: q.id,
+      question: q.question,
+      options: q.options.map((o) => o.label),
+      multi: false,
+      selectedOptions: selected,
+      ...(note == null ? {} : { note }),
+    })),
+  });
+
+  test("maps a terminal submit to the answer", async () => {
+    const h = harness(["ask"]);
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
+      hasUI: true,
+      ui: { askDialog: (qs: DialogQuestion[]) => submit(qs) },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain("User selected: A");
+  });
+
+  test("preserves a terminal note", async () => {
+    const h = harness(["ask"]);
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
+      hasUI: true,
+      ui: { askDialog: (qs: DialogQuestion[]) => submit(qs, ["A"], "double-check") },
+    });
+    expect(res.content[0].text).toContain("User added a note: double-check");
+  });
+
+  test("returns an error result on terminal cancel", async () => {
+    const h = harness(["ask"]);
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
+      hasUI: true,
+      ui: { askDialog: async () => undefined },
+    });
+    expect(res.isError).toBe(true);
+  });
+
+  test("passes through a terminal chat redirect", async () => {
+    const h = harness(["ask"]);
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
+      hasUI: true,
+      ui: { askDialog: async () => ({ kind: "chat" }) },
+    });
+    expect(res.content[0].text.toLowerCase()).toContain("chat about this");
+  });
+
+  test("terminal wins when the Telegram surface fails fast", async () => {
+    writeAccess({ allowFrom: [] }); // responder isn't authorized → Telegram surface rejects before any network call
+    const h = harness(["ask", "read"]);
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>', systemPrompt: [] },
+      {},
+    );
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
+      hasUI: true,
+      ui: { askDialog: (qs: DialogQuestion[]) => submit(qs, ["B"]) },
+    });
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain("User selected: B");
   });
 });
