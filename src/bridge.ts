@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -10,7 +11,7 @@ import {
   pairedOwnerId,
   saveAccess,
 } from "./access";
-import { isMissingThreadError, type Logger, TgError, type TgMessage, type TgUpdate } from "./api";
+import { isMissingThreadError, type Logger, type TgCallbackQuery, TgError, type TgMessage, type TgUpdate } from "./api";
 import {
   type TelegramCall,
   type SpawnController,
@@ -271,6 +272,184 @@ async function commandReply(host: BridgeHost, access: Access, msg: TgMessage, te
   await sendCommandMessage({ access, callTelegram: host.callTelegram, msg, text, useControlTopic, warn: host.warn });
 }
 
+type InlineKeyboard = { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+
+interface CleanupPicker {
+  ownerId: string;
+  chatId: string;
+  messageId: number;
+  expiresAt: number;
+}
+
+const cleanupPickers = new Map<string, CleanupPicker>();
+const CLEANUP_TTL_MS = 5 * 60_000;
+
+function pruneCleanupPickers(now: number): void {
+  for (const [nonce, picker] of cleanupPickers) {
+    if (picker.expiresAt <= now) cleanupPickers.delete(nonce);
+  }
+}
+
+/** Delete (DM host) or close (group host) each stale topic; reconcile the local registry. */
+async function executeCleanup(
+  host: BridgeHost,
+  topicsChat: string,
+  stale: Array<[number, ThreadEntry]>,
+): Promise<{ cleaned: number; failed: number; deletes: boolean }> {
+  const deletes = isDmChat(topicsChat);
+  let cleaned = 0;
+  let failed = 0;
+  for (const [threadId, entry] of stale) {
+    try {
+      const mode = await tidyRemoteTopic(host.callTelegram, topicsChat, threadId);
+      if (mode === "deleted") {
+        releaseThread(threadId, entry.pid, host.warn);
+        purgeRouteDir(threadId);
+      }
+      cleaned++;
+    } catch (err) {
+      if (!isMissingThreadError(err)) {
+        host.warn(`could not tidy topic #${threadId}: ${String(err)}`);
+        failed++;
+        continue;
+      }
+      releaseThread(threadId, entry.pid, host.warn); // remote topic already gone
+      purgeRouteDir(threadId);
+      cleaned++;
+    }
+  }
+  return { cleaned, failed, deletes };
+}
+
+function cleanupResultText(cleaned: number, failed: number, deletes: boolean): string {
+  const verb = deletes ? "deleted" : "closed";
+  const suffix = failed > 0 ? ` (${failed} failed — see omp logs)` : "";
+  return `🧹 ${verb} ${cleaned} stale topic${cleaned === 1 ? "" : "s"}${suffix}`;
+}
+
+/**
+ * Preview the stale topics with a confirm/cancel keyboard so the owner can tidy
+ * with one tap instead of typing `/cleanup go`. The confirm button re-derives
+ * the stale set when tapped, so it never acts on a snapshot that has gone stale.
+ */
+async function sendCleanupPreview(
+  host: BridgeHost,
+  access: Access,
+  msg: TgMessage,
+  topicsChat: string,
+  stale: Array<[number, ThreadEntry]>,
+): Promise<void> {
+  const ownerId = pairedOwnerId(access);
+  if (!ownerId) return;
+  const deletes = isDmChat(topicsChat);
+  const plural = stale.length === 1 ? "" : "s";
+  const lines = stale.map(([threadId, entry]) => `#${threadId} ${entry.name} — ${entry.cwd}`).join("\n");
+  const prompt = deletes
+    ? `Delete these ${stale.length} topic${plural} and their message history?`
+    : `Close these ${stale.length} topic${plural}? History is kept and reopened on re-adoption.`;
+  const nonce = randomBytes(6).toString("base64url");
+  pruneCleanupPickers(Date.now());
+  const keyboard: InlineKeyboard = {
+    inline_keyboard: [
+      [{ text: `🧹 ${deletes ? "Delete" : "Close"} ${stale.length} topic${plural}`, callback_data: `cl:go:${nonce}` }],
+      [{ text: "Cancel", callback_data: `cl:x:${nonce}` }],
+    ],
+  };
+  const sent = await sendCommandMessage({
+    access,
+    callTelegram: host.callTelegram,
+    msg,
+    text: `${lines}\n\n${prompt}`,
+    replyMarkup: keyboard,
+    redirectText: 'Continue in the "omp control" topic.',
+    warn: host.warn,
+  });
+  if (sent) {
+    cleanupPickers.set(nonce, {
+      ownerId,
+      chatId: String(sent.chat.id),
+      messageId: sent.message_id,
+      expiresAt: Date.now() + CLEANUP_TTL_MS,
+    });
+  }
+}
+
+async function answerCallback(host: BridgeHost, id: string, text?: string, showAlert = false): Promise<void> {
+  await host
+    .callTelegram("answerCallbackQuery", {
+      callback_query_id: id,
+      ...(text ? { text } : {}),
+      ...(showAlert ? { show_alert: true } : {}),
+    })
+    .catch(() => undefined);
+}
+
+async function editCleanupMessage(host: BridgeHost, message: NonNullable<TgCallbackQuery["message"]>, text: string): Promise<void> {
+  await host
+    .callTelegram("editMessageText", {
+      chat_id: String(message.chat.id),
+      message_id: message.message_id,
+      text,
+      reply_markup: { inline_keyboard: [] },
+    })
+    .catch((err) => host.warn(`cleanup edit failed: ${String(err)}`));
+}
+
+/**
+ * Handle a `/cleanup` confirm/cancel tap. Owner-authenticated and nonce-guarded
+ * like the /spawn picker; the confirm path re-derives the stale set so double
+ * taps or a redelivered callback cannot act on a stale preview. Returns false
+ * only for callbacks this handler does not own.
+ */
+export async function handleCleanupCallback(host: BridgeHost, query: TgCallbackQuery): Promise<boolean> {
+  const data = query.data;
+  if (!data?.startsWith("cl:")) return false;
+  const access = loadAccess(host.warn);
+  const ownerId = pairedOwnerId(access);
+  const message = query.message;
+  if (!message || !ownerId || !isPairedOwnerDm(String(query.from.id), String(message.chat.id), message.chat.type, access)) {
+    await answerCallback(host, query.id, "This control is restricted to the paired owner.", true);
+    return true;
+  }
+  const [, action, nonce] = data.split(":");
+  pruneCleanupPickers(Date.now());
+  const picker = cleanupPickers.get(nonce ?? "");
+  if (!picker || picker.ownerId !== ownerId || picker.chatId !== String(message.chat.id) || picker.messageId !== message.message_id) {
+    await answerCallback(host, query.id, "This cleanup expired. Run /cleanup again.", true);
+    return true;
+  }
+  cleanupPickers.delete(nonce); // consume before any side effect; a redelivered tap sees it expired
+
+  if (action === "x") {
+    await answerCallback(host, query.id);
+    await editCleanupMessage(host, message, "Cleanup cancelled.");
+    return true;
+  }
+  if (action !== "go") {
+    await answerCallback(host, query.id);
+    return true;
+  }
+
+  const registry = loadRegistry(host.warn);
+  const topicsChat = registry.chatId || access.topicsChat;
+  if (!topicsChat) {
+    await answerCallback(host, query.id);
+    await editCleanupMessage(host, message, "Topics mode is off — nothing to clean.");
+    return true;
+  }
+  const controlExclude = topicsChat === ownerId ? access.controlThreadId : undefined;
+  const stale = staleThreads(registry, isAlive, controlExclude);
+  if (stale.length === 0) {
+    await answerCallback(host, query.id);
+    await editCleanupMessage(host, message, "Nothing to clean — no stale session topics.");
+    return true;
+  }
+  await answerCallback(host, query.id, "Cleaning up…");
+  const { cleaned, failed, deletes } = await executeCleanup(host, topicsChat, stale);
+  await editCleanupMessage(host, message, cleanupResultText(cleaned, failed, deletes));
+  return true;
+}
+
 export async function handleGlobalCommand(
   host: BridgeHost,
   msg: TgMessage,
@@ -335,38 +514,11 @@ export async function handleGlobalCommand(
       if (stale.length === 0) {
         await commandReply(host, access, msg, "Nothing to clean — no stale session topics. Live sessions and omp control remain.");
       } else if (args === "") {
-        const lines = stale.map(([threadId, entry]) => `#${threadId} ${entry.name} — ${entry.cwd}`).join("\n");
-        const action = isDmChat(topicsChat)
-          ? `Run /cleanup go to DELETE these ${stale.length} topic${stale.length === 1 ? "" : "s"} and their message history.`
-          : `Run /cleanup go to close these ${stale.length} topic${stale.length === 1 ? "" : "s"} (history kept; reopened on re-adoption).`;
-        await commandReply(host, access, msg, `${lines}\n\n${action}`);
+        await sendCleanupPreview(host, access, msg, topicsChat, stale);
       } else {
         // args === "go": re-derived above; never act on the preview.
-        const deletes = isDmChat(topicsChat);
-        let cleaned = 0;
-        let failed = 0;
-        for (const [threadId, entry] of stale) {
-          try {
-            const mode = await tidyRemoteTopic(host.callTelegram, topicsChat, threadId);
-            if (mode === "deleted") {
-              releaseThread(threadId, entry.pid, host.warn);
-              purgeRouteDir(threadId);
-            }
-            cleaned++;
-          } catch (err) {
-            if (!isMissingThreadError(err)) {
-              host.warn(`could not tidy topic #${threadId}: ${String(err)}`);
-              failed++;
-              continue;
-            }
-            releaseThread(threadId, entry.pid, host.warn); // remote topic already gone
-            purgeRouteDir(threadId);
-            cleaned++;
-          }
-        }
-        const verb = deletes ? "deleted" : "closed";
-        const suffix = failed > 0 ? ` (${failed} failed — see omp logs)` : "";
-        await commandReply(host, access, msg, `🧹 ${verb} ${cleaned} stale topic${cleaned === 1 ? "" : "s"}${suffix}`);
+        const { cleaned, failed, deletes } = await executeCleanup(host, topicsChat, stale);
+        await commandReply(host, access, msg, cleanupResultText(cleaned, failed, deletes));
       }
     }
   } else {
@@ -429,6 +581,7 @@ async function handleDaemonSessionCommand(host: BridgeHost, access: Access, msg:
 export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<void> {
   if (update.callback_query) {
     if (await host.promptController.handleCallback(update.callback_query)) return;
+    if (await handleCleanupCallback(host, update.callback_query)) return;
     await host.spawnController.handleCallback(update.callback_query);
     return;
   }

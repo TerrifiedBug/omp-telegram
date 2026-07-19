@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, consumeOutsidePrivateChat } from "./bridge";
-import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
+import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, telegramArgumentCompletions, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -126,5 +126,66 @@ describe("stale topic auto-resume policy", () => {
     expect(canAutoResumeTopic({ ...ownerMessage, from: { id: 99 } }, access, entry)).toBe(false);
     expect(canAutoResumeTopic({ ...ownerMessage, chat: { id: -1001, type: "supergroup" } }, access, entry)).toBe(false);
     expect(canAutoResumeTopic(ownerMessage, access, { ...entry, workspaceTerminalIds: undefined })).toBe(false);
+  });
+});
+
+describe("/telegram argument completions", () => {
+  const labels = (prefix: string, dynamic?: { pending: () => string[]; owners: () => string[] }) =>
+    (telegramArgumentCompletions(prefix, dynamic) ?? []).map((item) => item.label);
+  const values = (prefix: string) => (telegramArgumentCompletions(prefix) ?? []).map((item) => item.value);
+
+  test("offers every subcommand at the top level with descriptions", () => {
+    const items = telegramArgumentCompletions("") ?? [];
+    expect(items.map((i) => i.label)).toEqual([
+      "status", "doctor", "daemon", "token", "on", "off", "pair", "deny",
+      "allow", "remove", "policy", "group", "set", "notify", "topics",
+    ]);
+    expect(items.find((i) => i.label === "topics")?.description).toBe("per-project session topics");
+  });
+
+  test("filters the top level by the typed fragment", () => {
+    expect(labels("to")).toEqual(["token", "topics"]);
+    expect(telegramArgumentCompletions("TO")).toBeNull(); // case-sensitive, like the handler switch
+  });
+
+  test("completes nested subcommands past the first token", () => {
+    expect(labels("topics ")).toEqual(["on", "off", "status", "tidy"]);
+    expect(labels("topics ti")).toEqual(["tidy"]);
+    expect(labels("topics tidy ")).toEqual(["on", "off", "status"]);
+    expect(labels("daemon ")).toEqual(["status", "restart", "stop"]);
+    expect(labels("policy ")).toEqual(["pairing", "allowlist", "disabled"]);
+    expect(labels("notify ")).toEqual(["off", "away", "always", "status", "clear"]);
+  });
+
+  test("completes set keys and their enum values", () => {
+    expect(labels("set ")).toContain("replyToMode");
+    const setKey = (telegramArgumentCompletions("set ") ?? []).find((i) => i.label === "replyToMode");
+    expect(setKey?.description).toBe("thread replies: off | first | all");
+    expect(labels("set replyToMode ")).toEqual(["off", "first", "all"]);
+    expect(labels("set chunkMode ")).toEqual(["length", "newline"]);
+    expect(labels("set streaming ")).toEqual(["true", "false"]);
+  });
+
+  test("value replaces the whole argument so nested picks round-trip", () => {
+    expect(values("topics ti")).toEqual(["topics tidy "]);
+    expect(values("topics tidy of")).toEqual(["topics tidy off "]); // "of" matches only off (on also starts with "o")
+    expect(values("se")).toEqual(["set "]);
+  });
+
+  test("returns null where the position takes a free-form value", () => {
+    expect(telegramArgumentCompletions("token ")).toBeNull(); // bot token
+    expect(telegramArgumentCompletions("notify 123")).toBeNull(); // chat id
+    expect(telegramArgumentCompletions("topics -100200")).toBeNull(); // chat id
+    expect(telegramArgumentCompletions("bogus ")).toBeNull(); // unknown subcommand
+    expect(telegramArgumentCompletions("daemon status extra")).toBeNull(); // past a terminal
+  });
+
+  test("completes free-form single-argument subcommands from live state", () => {
+    const dynamic = { pending: () => ["ab12", "cd34"], owners: () => ["42", "77"] };
+    expect(labels("pair ", dynamic)).toEqual(["ab12", "cd34"]);
+    expect(labels("pair c", dynamic)).toEqual(["cd34"]);
+    expect(labels("deny ", dynamic)).toEqual(["ab12", "cd34"]);
+    expect(labels("remove ", dynamic)).toEqual(["42", "77"]);
+    expect(telegramArgumentCompletions("pair ")).toBeNull(); // no dynamic source → nothing to suggest
   });
 });
