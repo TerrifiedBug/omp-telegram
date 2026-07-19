@@ -33,6 +33,7 @@ import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
+import { BlockedPings, askQuestionSummary } from "./blocked";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
@@ -83,14 +84,6 @@ interface PendingApproval {
   approved?: boolean;
 }
 
-interface PendingBlock {
-  chatId: string;
-  threadId?: number;
-  timer?: NodeJS.Timeout;
-  messageId?: number;
-  resolved?: boolean;
-}
-
 /** Task sessions are headless and always carry the required yield tool. */
 export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): boolean {
   return !hasUI && activeTools.includes("yield");
@@ -135,22 +128,6 @@ export function approvalPingTarget(
   awayTarget: { chatId: string; threadId?: number } | undefined,
 ): { chatId: string; threadId?: number } | undefined {
   return telegramActive ? activeTarget : awayTarget;
-}
-
-/**
- * Summarize an `ask` tool call for a blocked-input ping: the first question,
- * plus a count of any others. Returns "" when the args carry no question text.
- */
-export function askQuestionSummary(args: unknown): string {
-  if (!args || typeof args !== "object" || !("questions" in args)) return "";
-  const questions = args.questions;
-  if (!Array.isArray(questions) || questions.length === 0) return "";
-  const first = questions[0];
-  if (!first || typeof first !== "object" || !("question" in first)) return "";
-  const q = first.question;
-  if (typeof q !== "string" || !q.trim()) return "";
-  const more = questions.length > 1 ? ` (+${questions.length - 1} more)` : "";
-  return `:\n${q.trim()}${more}`;
 }
 
 /** Replace every `{file}` placeholder without invoking a shell. */
@@ -301,7 +278,22 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   const batches = new Map<string, Batch>();
   const notified = new Set<string>();
   const pendingApprovals = new Map<string, PendingApproval>();
-  const pendingBlocks = new Map<string, PendingBlock>();
+  const blockedPings = new BlockedPings({
+    send: (chatId, text, threadId) => outbound.send(chatId, text, { threadId }).then((ids) => ids[0]),
+    edit: (chatId, messageId, text) =>
+      tg(token, "editMessageText", { chat_id: chatId, message_id: messageId, text }).then(
+        () => undefined,
+        () => undefined,
+      ),
+    schedule: (cb, ms) => {
+      const timer = setTimeout(cb, ms);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    },
+    delayMs: BLOCK_PING_DELAY_MS,
+    resumedText: () => `[ANSWERED] omp resumed in ${basename(process.cwd())}`,
+    onError: (err) => log.debug(`[telegram] blocked ping failed: ${String(err)}`),
+  });
   const lockPath = statePath("bot.lock");
   const bridgeHost: BridgeHost = {
     isDaemon: false,
@@ -1721,12 +1713,6 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       text: `${event.approved ? "[APPROVED]" : "[DENIED]"} ${event.toolName}`,
     }).catch(() => {});
   });
-  const editBlockResolved = (pending: PendingBlock): Promise<unknown> =>
-    tg(token, "editMessageText", {
-      chat_id: pending.chatId,
-      message_id: pending.messageId,
-      text: `[ANSWERED] omp resumed in ${basename(process.cwd())}`,
-    }).catch(() => {});
   pi.on("tool_execution_start", (event, ctx) => {
     lastCtx = ctx;
     if (event.toolName !== "ask") return;
@@ -1739,50 +1725,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       notifyTarget(false, currentAccess, token.length > 0, ownTarget),
     );
     if (!target) return;
-    clearTimeout(pendingBlocks.get(event.toolCallId)?.timer);
-    const pending: PendingBlock = { chatId: target.chatId, threadId: target.threadId };
-    pending.timer = setTimeout(() => {
-      if (pendingBlocks.get(event.toolCallId) !== pending) return;
-      pending.timer = undefined;
-      const question = askQuestionSummary(event.args);
-      void outbound
-        .send(
-          pending.chatId,
-          `[BLOCKED] omp is waiting for your input in ${basename(process.cwd())}${question}\nAnswer at the terminal.`,
-          { threadId: pending.threadId },
-        )
-        .then((ids) => {
-          if (pendingBlocks.get(event.toolCallId) !== pending) return;
-          pending.messageId = ids[0];
-          if (pending.resolved && pending.messageId != null) {
-            void editBlockResolved(pending);
-            pendingBlocks.delete(event.toolCallId);
-          }
-        })
-        .catch((err) => {
-          pendingBlocks.delete(event.toolCallId);
-          log.debug(`[telegram] blocked ping failed: ${String(err)}`);
-        });
-    }, BLOCK_PING_DELAY_MS);
-    pending.timer.unref?.();
-    pendingBlocks.set(event.toolCallId, pending);
+    blockedPings.start(
+      event.toolCallId,
+      target,
+      () => `[BLOCKED] omp is waiting for your input in ${basename(process.cwd())}${askQuestionSummary(event.args)}\nAnswer at the terminal.`,
+    );
   });
   pi.on("tool_execution_end", (event, ctx) => {
     lastCtx = ctx;
     if (event.toolName !== "ask") return;
-    const pending = pendingBlocks.get(event.toolCallId);
-    if (!pending) return;
-    if (pending.timer) {
-      clearTimeout(pending.timer);
-      pendingBlocks.delete(event.toolCallId);
-      return;
-    }
-    if (pending.messageId == null) {
-      pending.resolved = true;
-      return;
-    }
-    pendingBlocks.delete(event.toolCallId);
-    void editBlockResolved(pending);
+    blockedPings.end(event.toolCallId);
   });
   pi.on("message_update", (e, ctx) => {
     lastCtx = ctx;
@@ -1808,8 +1760,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       clearTimeout(pending.timer);
     }
     pendingApprovals.clear();
-    for (const pending of pendingBlocks.values()) clearTimeout(pending.timer);
-    pendingBlocks.clear();
+    blockedPings.clear();
     const wasActive = outbound.isActive();
     await outbound.onAgentEnd();
     await restorePromptTools();
