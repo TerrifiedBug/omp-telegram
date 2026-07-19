@@ -42,7 +42,7 @@ Install the published extension:
 
 ```bash
 omp plugin install omp-telegram
-omp plugin list        # → omp-telegram@0.7.0
+omp plugin list        # → omp-telegram@0.8.0
 ```
 
 There is no build step and no runtime dependency install. The extension uses
@@ -303,8 +303,10 @@ Set it up:
 
 - `/away` — the quick toggle. Turns mirroring **on** when you step away and
   **off** when you're back; run it again to flip. This is all you need day to day.
-  It auto-clears the next time you type a prompt at this terminal — a phone reply
-  never counts, so answering from your phone keeps it armed.
+  It auto-clears the next time you submit a prompt or command at this terminal — a
+  phone reply never counts, so answering from your phone keeps it armed. (The
+  `.`/`c` continue shortcut and focused-subagent steering don't disarm it — run
+  `/away` if you need to.)
 - `/telegram notify <chat_id>` picks the destination (grab your `<chat_id>` from
   `/whoami` in the bot DM); `/telegram notify clear` drops it.
 - `/telegram notify away | always | off` is the full surface for the same modes:

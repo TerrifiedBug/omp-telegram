@@ -1956,12 +1956,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   });
   pi.on("input", (event, ctx) => {
-    // `away` tracks the human at this terminal, so any interactive local prompt
-    // means they're back — disarm it. A phone reply (source "extension") or an
-    // rpc-driven turn is not presence and never clears it; `always` is the
-    // deliberate opt-out for juggling sessions you aren't watching. The one
-    // carve-out is the `/away` toggle itself: it reads the current mode, so
-    // clearing here first would make it re-arm — let its handler toggle instead.
+    // `away` tracks the human at this terminal: submitting a prompt or command
+    // to the main session fires an interactive `input` event, so treat that as
+    // "they're back" and disarm. A phone reply (source "extension") or an rpc
+    // turn is not presence and never clears it; `always` is the deliberate
+    // opt-out. Note OMP's `.`/`c` continue shortcuts and focused-subagent
+    // steering bypass this event, so they don't disarm — `/away` is the manual
+    // escape. The `/away` toggle itself is skipped here: it reads the current
+    // mode, so clearing first would re-arm it — let its handler toggle instead.
     if (event.source !== "interactive") return;
     if (event.text.trim().split(/\s+/)[0] === "/away") return;
     const a = loadAccess(warn);
