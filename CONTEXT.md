@@ -35,8 +35,9 @@ goes idle.
 _Avoid_: current chat, live chat
 
 **Notify chat**:
-The chat that receives a notification when a local run goes idle. Distinct from
-an active chat.
+The destination that receives a local run's notifications — an idle ping when a
+run finishes and a blocked ping when it parks for input. Distinct from an active
+chat.
 _Avoid_: alert chat
 
 **Telegram-initiated run**:
@@ -99,13 +100,14 @@ A Telegram forum thread. Qualify it as a control topic or session topic when
 the distinction matters.
 _Avoid_: space, session
 
-**Approval wait ping**:
-A Telegram notification sent after an omp tool approval has remained unresolved
-for two seconds. It is informational; approval remains terminal-local.
+**Blocked ping**:
+A Telegram notification sent when a local run parks for input past a two-second
+grace — a tool approval (`[WAIT]`) or an `ask` prompt (`[BLOCKED]`). It is
+informational; the input is answered terminal-local.
 _Avoid_: remote approval, approval prompt
 
-**Away**:
-A state the user sets to signal they have stepped away from the machine. While
-away, the result of a local run is delivered to Telegram instead of only
-appearing on screen. Cleared by returning to the keyboard or turning it off.
-_Avoid_: AFK, absent
+**Notify mode**:
+Whether local runs notify Telegram, set via `/telegram notify`. `away` notifies
+while the user has stepped away and auto-clears on the next local keystroke;
+`always` notifies regardless (for unwatched herdr sessions); `off` is silent.
+_Avoid_: AFK, absent, away flag

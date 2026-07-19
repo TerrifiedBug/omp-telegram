@@ -1,37 +1,36 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { type Access, awayNotifyTarget, defaultAccess, loadAccess, saveAccess } from "./access";
-import { mkdtempSync, rmSync } from "node:fs";
+import { type Access, notifyTarget, defaultAccess, loadAccess, saveAccess } from "./access";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const mk = (over: Partial<Access>): Access => ({ ...defaultAccess(), ...over });
 
-describe("awayNotifyTarget", () => {
-  test("targets the notify chat for a local run when away is on", () => {
-    expect(awayNotifyTarget(false, mk({ away: true, notifyChat: "123" }), true)).toEqual({ chatId: "123" });
-    expect(awayNotifyTarget(false, mk({ away: true, notifyChat: "-1001234567890" }), true)).toEqual({ chatId: "-1001234567890" });
+describe("notifyTarget", () => {
+  test("targets the notify chat for a local run when a mode is active", () => {
+    expect(notifyTarget(false, mk({ notifyMode: "away", notifyChat: "123" }), true)).toEqual({ chatId: "123" });
+    expect(notifyTarget(false, mk({ notifyMode: "always", notifyChat: "-1001234567890" }), true)).toEqual({ chatId: "-1001234567890" });
   });
 
   test("prefers this session's topic over the notify chat", () => {
-    const target = awayNotifyTarget(false, mk({ away: true, notifyChat: "123", topicsChat: "-100999" }), true, { chatId: "-100999", threadId: 42 });
+    const target = notifyTarget(false, mk({ notifyMode: "away", notifyChat: "123", topicsChat: "-100999" }), true, { chatId: "-100999", threadId: 42 });
     expect(target).toEqual({ chatId: "-100999", threadId: 42 });
   });
 
-  test("stays silent when away is off — user is present at the machine", () => {
-    expect(awayNotifyTarget(false, mk({ away: false, notifyChat: "123" }), true)).toBeUndefined();
-    expect(awayNotifyTarget(false, mk({ notifyChat: "123" }), true)).toBeUndefined();
+  test("stays silent when notify mode is off — user is present at the machine", () => {
+    expect(notifyTarget(false, mk({ notifyChat: "123" }), true)).toBeUndefined();
   });
 
   test("skips Telegram-initiated runs so the phone isn't double-pinged", () => {
-    expect(awayNotifyTarget(true, mk({ away: true, notifyChat: "123" }), true)).toBeUndefined();
+    expect(notifyTarget(true, mk({ notifyMode: "away", notifyChat: "123" }), true)).toBeUndefined();
   });
 
   test("skips when no bot token is configured", () => {
-    expect(awayNotifyTarget(false, mk({ away: true, notifyChat: "123" }), false)).toBeUndefined();
+    expect(notifyTarget(false, mk({ notifyMode: "away", notifyChat: "123" }), false)).toBeUndefined();
   });
 
-  test("skips when away is on but no target is configured", () => {
-    expect(awayNotifyTarget(false, mk({ away: true }), true)).toBeUndefined();
+  test("skips when a mode is active but no target is configured", () => {
+    expect(notifyTarget(false, mk({ notifyMode: "always" }), true)).toBeUndefined();
   });
 });
 
@@ -51,20 +50,20 @@ describe("loadAccess field preservation", () => {
 
   // Regression: optional state once vanished during field-by-field rebuilds;
   // every persistent target/control field must survive the same load path.
-  test("round-trips notify, topic, control, away, and transcription fields", () => {
+  test("round-trips notify, topic, control, mode, and transcription fields", () => {
     saveAccess({
       ...defaultAccess(),
       notifyChat: "1",
       topicsChat: "2",
       controlThreadId: 42,
-      away: true,
+      notifyMode: "always",
       transcribeCommand: ["whisper-cli", "-f", "{file}"],
     });
     const a = loadAccess();
     expect(a.notifyChat).toBe("1");
     expect(a.topicsChat).toBe("2");
     expect(a.controlThreadId).toBe(42);
-    expect(a.away).toBe(true);
+    expect(a.notifyMode).toBe("always");
     expect(a.transcribeCommand).toEqual(["whisper-cli", "-f", "{file}"]);
   });
 
@@ -74,7 +73,17 @@ describe("loadAccess field preservation", () => {
     expect(a.notifyChat).toBeUndefined();
     expect(a.topicsChat).toBeUndefined();
     expect(a.controlThreadId).toBeUndefined();
-    expect(a.away).toBeUndefined();
+    expect(a.notifyMode).toBeUndefined();
     expect(a.transcribeCommand).toBeUndefined();
+  });
+
+  test("migrates a legacy away:true flag to notify away mode", () => {
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), away: true }));
+    expect(loadAccess().notifyMode).toBe("away");
+  });
+
+  test("legacy away:false migrates to notify off", () => {
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), away: false }));
+    expect(loadAccess().notifyMode).toBeUndefined();
   });
 });

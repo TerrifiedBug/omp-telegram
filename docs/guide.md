@@ -254,34 +254,56 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
   multi-step run reads as a sequence of messages. `set streaming false` skips the
   live preview and sends only the finalized message per turn.
 
-## AFK notifications
+## Notifications
 
 By default the bridge is reactive — it only messages a chat that messaged it
 first, and a **locally-started** run (one you kick off at the terminal) mirrors
-nothing. `/telegram notify <chat_id>` opts one chat into an idle ping: when a
-locally-started run finishes and the session goes idle, the bot sends a short
-`✅ omp idle in <dir> — your turn.` to that chat. Arm it before you step away,
-`/telegram notify off` when you're back; grab your `<chat_id>` from `/whoami` in
-the bot DM.
+nothing. Notifications opt one destination into two kinds of ping for local runs:
+
+- **Idle** — a locally-started run finishes and the session goes idle: the bot
+  sends `✅ omp idle in <dir> — your turn.`
+- **Blocked** — the run parks mid-turn waiting for you (a tool approval, or an
+  `ask` prompt). After a two-second grace the bot sends
+  `[BLOCKED] omp is waiting for your input in <dir>` with the question — the
+  state herdr shows as `blocked`. Answering at the terminal edits it to
+  `[ANSWERED]`.
+
+Set it up in two moves:
+
+- `/telegram notify <chat_id>` picks the destination (grab your `<chat_id>` from
+  `/whoami` in the bot DM); `/telegram notify clear` drops it.
+- `/telegram notify away | always | off` picks when to ping:
+  - **away** — only while you've stepped away; the next interactive keystroke at
+    any session clears it back to off.
+  - **always** — keep pinging regardless, for juggling several herdr sessions you
+    aren't actively watching.
+  - **off** — nothing pings. `/telegram here` is a shortcut ("I'm back").
 
 - Only **locally-started** runs ping — Telegram-initiated runs already stream
   their reply back, so they never double-notify.
-- The target is a single chat you set at the terminal, never "the last active
-  chat", so a ping can't leak to whoever DMed the bot most recently.
+- With **topics mode** on, a session's ping lands in its own topic; otherwise it
+  goes to the flat notify chat. Status and arming report the destination that
+  will actually be used (topic first).
 - Sending doesn't need the poll lock, so in a multi-session setup any session
-  with the token configured pings on its own idle — including the `<dir>` so you
-  can tell which one finished.
+  with the token configured pings on its own — including the `<dir>` so you can
+  tell which one.
 - Requires the bridge to be running — arming while it's off warns you, and pings
   only start once you run `/telegram on`.
 
-## Approval wait pings
+## Blocked pings in detail
 
-With omp 17, a tool approval wait that remains unresolved for two seconds sends
-`[WAIT] omp is waiting for approval: <tool>` to the active Telegram session
-topic, or to the configured away destination for a local run. A resolution
-before two seconds cancels the ping. Telegram cannot approve or deny the tool:
-finish the approval at the terminal. Session shutdown and agent completion clear
-pending timers.
+A **blocked** ping fires when a run parks for input and stays parked past a
+two-second grace (a resolution before then cancels it), honoring the notify mode
+above (a live Telegram turn instead pings its own session topic):
+
+- **Tool approval** — `[WAIT] omp is waiting for approval: <tool>`. Telegram
+  cannot approve or deny; finish it at the terminal. Resolving edits the message
+  to `[APPROVED]` / `[DENIED]`.
+- **`ask` prompt** — `[BLOCKED] omp is waiting for your input in <dir>` with the
+  question. `ask` is read-approval, so it never triggers the approval ping on its
+  own; this is what surfaces it. Answering edits the message to `[ANSWERED]`.
+
+Session shutdown and agent completion clear pending timers.
 
 ## Per-session topics
 

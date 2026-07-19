@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, consumeOutsidePrivateChat } from "./bridge";
-import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
+import { approvalPingTarget, askQuestionSummary, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, transcribeVoice } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -36,6 +36,21 @@ describe("approval ping targeting", () => {
     expect(approvalPingTarget(false, active, away)).toEqual(away);
     expect(approvalPingTarget(true, undefined, away)).toBeUndefined();
     expect(approvalPingTarget(false, undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe("askQuestionSummary", () => {
+  test("summarizes the first question and counts the rest", () => {
+    expect(askQuestionSummary({ questions: [{ question: "Cut the release?" }] })).toBe(":\nCut the release?");
+    expect(askQuestionSummary({ questions: [{ question: "A?" }, { question: "B?" }, { question: "C?" }] })).toBe(":\nA? (+2 more)");
+  });
+
+  test("returns empty string when no question text is present", () => {
+    expect(askQuestionSummary(undefined)).toBe("");
+    expect(askQuestionSummary({})).toBe("");
+    expect(askQuestionSummary({ questions: [] })).toBe("");
+    expect(askQuestionSummary({ questions: [{ id: "x" }] })).toBe("");
+    expect(askQuestionSummary({ questions: [{ question: "  " }] })).toBe("");
   });
 });
 
