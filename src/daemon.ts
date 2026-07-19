@@ -172,7 +172,7 @@ export async function runDaemon(): Promise<void> {
   if (existing && daemonAlive(existing) && existing.pid !== process.pid) return;
 
   const version = packageVersion();
-  saveDaemonState({ pid: process.pid, version, startedAt: Date.now() });
+  const startedAt = Date.now();
   const lockPath = statePath("bot.lock");
   let poller: Poller | undefined;
   let stopping = false;
@@ -205,9 +205,13 @@ export async function runDaemon(): Promise<void> {
 
       const lock = acquireLock(lockPath);
       if (!lock.ok) {
-        await sleep(5_000);
-        continue;
+        log.info(`[telegram daemon] another poller (pid ${lock.holder}) holds the lock; exiting`);
+        break;
       }
+      // Publish ownership only after the lock is held, so daemon.json.pid always
+      // names the live poller — ensureDaemon's version-upgrade path stops exactly
+      // that PID, and a starter that loses the lock never claims daemon.json.
+      saveDaemonState({ pid: process.pid, version, startedAt });
 
       let botUsername = "";
       let botHasTopics: boolean | undefined;

@@ -3,7 +3,8 @@
 // `Poller`, and a single-poller PID lock. No filesystem-layout knowledge beyond
 // the lock path handed in by the caller.
 
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { linkSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 
@@ -202,40 +203,106 @@ export async function downloadFileBytes(token: string, filePath: string, timeout
 
 // ---- Single-poller lock --------------------------------------------------
 
+/** Whether a PID is a live process (EPERM means it exists but is owned elsewhere). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function readLockPid(lockPath: string): number {
+  try {
+    return Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Atomically create `target` by hard-linking a pid-stamped temp into place.
+ * `link` fails with EEXIST if the target already exists, so the filesystem —
+ * not a racy read-then-write — decides the single winner, and the target is
+ * populated the instant it appears (no empty mid-write window).
+ */
+function linkClaim(target: string, pid: number): boolean {
+  const temp = `${target}.${pid}.${randomBytes(6).toString("hex")}`;
+  writeFileSync(temp, String(pid), { mode: 0o600 });
+  try {
+    linkSync(temp, target);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return false;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+/** A reaper lock older than this is treated as abandoned by a crashed reclaimer. */
+const REAPER_TTL_MS = 10_000;
+
 /**
  * Claim the poll lock at `lockPath`. Fails only when a *live* foreign PID holds
  * it; a stale lock (dead PID) is reclaimed. DM chat_id == user_id so exactly one
  * poller per token is required — Telegram rejects concurrent getUpdates with 409.
+ *
+ * `pid`/`alive` are injectable for tests; production uses this process and a real
+ * liveness probe.
  */
-export function acquireLock(lockPath: string): { ok: true } | { ok: false; holder: number } {
-  let holder = 0;
-  try {
-    holder = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-  } catch {
-    holder = 0;
-  }
-  if (holder > 1 && holder !== process.pid) {
-    try {
-      process.kill(holder, 0); // throws ESRCH if the process is gone
-      return { ok: false, holder };
-    } catch {
-      /* stale lock — fall through and claim it */
-    }
-  }
+export function acquireLock(
+  lockPath: string,
+  options: { pid?: number; alive?: (pid: number) => boolean } = {},
+): { ok: true } | { ok: false; holder: number } {
+  const pid = options.pid ?? process.pid;
+  const alive = options.alive ?? pidAlive;
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
-  writeFileSync(lockPath, String(process.pid));
-  return { ok: true };
+
+  // Fast path: atomically claim an absent lock. Simultaneous starters can never
+  // both win here (the previous read-then-write could).
+  if (linkClaim(lockPath, pid)) return { ok: true };
+  let holder = readLockPid(lockPath);
+  if (holder === pid) return { ok: true }; // already ours (re-entrant)
+  if (holder > 1 && alive(holder)) return { ok: false, holder }; // live foreign poller
+
+  // Stale (dead holder) or garbage lock. Reclaim under an exclusive reaper so two
+  // starters can't both unlink and re-link, clobbering each other's fresh claim.
+  // A reaper abandoned by a crashed reclaimer is cleared by age; a fresh one means
+  // another starter is mid-reclaim, so report the lock as held.
+  const reapPath = `${lockPath}.reap`;
+  if (!linkClaim(reapPath, pid)) {
+    let mtime = 0;
+    try {
+      mtime = statSync(reapPath).mtimeMs;
+    } catch {
+      mtime = 0;
+    }
+    if (Date.now() - mtime < REAPER_TTL_MS) return { ok: false, holder: holder > 1 ? holder : 0 };
+    rmSync(reapPath, { force: true });
+    if (!linkClaim(reapPath, pid)) return { ok: false, holder: readLockPid(lockPath) || (holder > 1 ? holder : 0) };
+  }
+  try {
+    // Only the reaper owner may touch the main lock. If we lost the reaper (a
+    // contender force-cleared it as expired while we stalled), bail rather than
+    // race the new owner. Then re-validate the holder in case it was reclaimed.
+    if (readLockPid(reapPath) !== pid) return { ok: false, holder: readLockPid(lockPath) || (holder > 1 ? holder : 0) };
+    holder = readLockPid(lockPath);
+    if (holder === pid) return { ok: true };
+    if (holder > 1 && alive(holder)) return { ok: false, holder };
+    rmSync(lockPath, { force: true });
+    return linkClaim(lockPath, pid) ? { ok: true } : { ok: false, holder: readLockPid(lockPath) || 0 };
+  } finally {
+    // Release the reaper only if we still own it, so we never delete a reaper a
+    // contender legitimately took over.
+    if (readLockPid(reapPath) === pid) rmSync(reapPath, { force: true });
+  }
 }
 
 /** Release the lock only if we still own it. */
-export function releaseLock(lockPath: string): void {
-  try {
-    if (Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10) === process.pid) {
-      rmSync(lockPath, { force: true });
-    }
-  } catch {
-    /* nothing to release */
-  }
+export function releaseLock(lockPath: string, pid: number = process.pid): void {
+  if (readLockPid(lockPath) === pid) rmSync(lockPath, { force: true });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
