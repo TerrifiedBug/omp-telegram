@@ -42,8 +42,13 @@ export type Access = {
   chunkMode?: "length" | "newline";
   /** Inbound queueing mode while the agent is busy. Default "followUp". */
   deliverAs?: "steer" | "followUp";
-  /** Stream partial output to Telegram (draft/edit). Default true. */
-  streaming?: boolean;
+  /**
+   * Outbound verbosity. `true` (default) = live draft/edit streaming plus a
+   * finalized message per assistant turn; `false` = per-turn messages with no
+   * live preview; `"final"` = suppress previews and per-turn messages, sending
+   * only the run's final message.
+   */
+  streaming?: boolean | "final";
   /** Optional argv template for voice-note transcription. Each `{file}` substring is replaced with the downloaded path. */
   transcribeCommand?: string[];
   /** Chat to ping when a locally-started run goes idle. Unset = off. Set via `/telegram notify`. */

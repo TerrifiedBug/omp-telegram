@@ -117,7 +117,7 @@ const TELEGRAM_ARGS: CompletionNode = {
     chunkMode: { length: null, newline: null },
     mentionPatterns: null,
     deliverAs: { steer: null, followUp: null },
-    streaming: { true: null, false: null },
+    streaming: { true: null, false: null, final: null },
     transcribeCommand: null,
   },
   notify: { off: null, away: null, always: null, status: null, clear: null },
@@ -152,7 +152,7 @@ const SET_KEY_HELP: Record<string, string> = {
   chunkMode: "split long output on length | newline",
   mentionPatterns: "JSON array of mention regexes",
   deliverAs: "steer | followUp delivery",
-  streaming: "stream partial output: true | false",
+  streaming: "output: true (stream) | false (per-turn) | final (one message)",
   transcribeCommand: "JSON argv for voice transcription",
 };
 
@@ -1192,7 +1192,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       `Owner: ${pairedOwnerId(a) ?? (a.allowFrom.length > 1 ? `ambiguous (${a.allowFrom.join(", ")})` : "unpaired")}`,
       `Pending codes: ${Object.keys(a.pending).length ? Object.keys(a.pending).join(", ") : "none"}`,
       `Groups: ${Object.keys(a.groups).length ? Object.keys(a.groups).join(", ") : "none"}`,
-      `Streaming: ${a.streaming === false ? "off" : "on"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
+      `Streaming: ${a.streaming === false ? "off" : a.streaming === "final" ? "final" : "on"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
       `Notify: ${a.notifyMode ?? "off"}${a.notifyChat ? ` · chat ${a.notifyChat}` : ""}`,
       `Voice transcription: ${a.transcribeCommand?.length ? a.transcribeCommand.join(" ") : "off"}`,
       `Control topic: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`,
@@ -1525,8 +1525,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (value !== "steer" && value !== "followUp") return ctx.ui.notify("deliverAs: steer | followUp", "warning");
       a.deliverAs = value;
     } else if (key === "streaming") {
-      if (value !== "true" && value !== "false") return ctx.ui.notify("streaming: true | false", "warning");
-      a.streaming = value === "true";
+      if (value !== "true" && value !== "false" && value !== "final") return ctx.ui.notify("streaming: true | false | final", "warning");
+      a.streaming = value === "final" ? "final" : value === "true";
     } else if (key === "transcribeCommand") {
       if (!value) {
         a.transcribeCommand = undefined;
@@ -2109,7 +2109,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     pendingApprovals.clear();
     blockedPings.clear();
     const wasActive = outbound.isActive();
-    await outbound.onAgentEnd();
+    const finalText = finalAssistantText(e.messages);
+    await outbound.onAgentEnd(finalText);
     await restorePromptTools();
     await captureOwnSpace(ctx);
     refreshTopicClaim(ctx);
@@ -2117,8 +2118,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const topic = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
     const target = notifyTarget(wasActive, a, token.length > 0, topic);
     if (!target) return;
-    const text = finalAssistantText(e.messages);
-    const body = text || `✅ omp idle in ${basename(process.cwd())} — your turn.`;
+    const body = finalText || `✅ omp idle in ${basename(process.cwd())} — your turn.`;
     await outbound.send(target.chatId, body, { threadId: target.threadId }).catch((err) => log.debug(`[telegram] idle notify failed: ${String(err)}`));
   });
   pi.on("session_switch", async (_e, ctx) => {

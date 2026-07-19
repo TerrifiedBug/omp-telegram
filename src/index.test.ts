@@ -167,7 +167,7 @@ describe("/telegram argument completions", () => {
     expect(setKey?.description).toBe("thread replies: off | first | all");
     expect(labels("set replyToMode ")).toEqual(["off", "first", "all"]);
     expect(labels("set chunkMode ")).toEqual(["length", "newline"]);
-    expect(labels("set streaming ")).toEqual(["true", "false"]);
+    expect(labels("set streaming ")).toEqual(["true", "false", "final"]);
   });
 
   test("value replaces the whole argument so nested picks round-trip", () => {

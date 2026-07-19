@@ -145,4 +145,48 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onAgentEnd();
     outbound.shutdown();
   });
+
+  test("streaming 'final' suppresses per-turn messages and sends only the run's final text", async () => {
+    const sent: string[] = [];
+    const methods: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      methods.push(method);
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 40 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: "final" }));
+    outbound.setToken("secret");
+    outbound.markActive("42", 9);
+    // Intermediate turns must not leak — no live preview (draft/edit) and no per-turn message.
+    outbound.onMessageUpdate(assistant("thinking out loud"));
+    await outbound.onTurnEnd(assistant("step one"));
+    await outbound.onTurnEnd(assistant("step two"));
+    expect(methods.filter((m) => m !== "sendChatAction")).toEqual([]);
+    // Only the run's final visible assistant text is delivered.
+    await outbound.onAgentEnd(finalAssistantText([assistant("step two"), assistant("the answer")]));
+    expect(sent).toEqual(["the answer"]);
+    expect(outbound.isActive()).toBe(false);
+    outbound.shutdown();
+  });
+
+  test("streaming 'final' with no final text delivers nothing", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 41 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: "final" }));
+    outbound.setToken("secret");
+    outbound.markActive("42");
+    await outbound.onTurnEnd(assistant("interim"));
+    await outbound.onAgentEnd("");
+    expect(sent).toEqual([]);
+    outbound.shutdown();
+  });
 });
