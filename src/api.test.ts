@@ -1,5 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { Poller, TgError, downloadFileBytes, tg, webhookConflictHint } from "./api";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Poller, TgError, acquireLock, downloadFileBytes, releaseLock, tg, webhookConflictHint } from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -105,5 +108,110 @@ describe("Telegram Bot API transport", () => {
     expect(handled).toBe(true);
     expect(payloads[0].allowed_updates).toEqual(["message", "edited_message", "callback_query"]);
     expect(payloads[1].offset).toBe(13);
+  });
+});
+
+describe("single-poller lock", () => {
+  let dir: string;
+  let lockPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "omp-tg-lock-"));
+    lockPath = join(dir, "bot.lock");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  test("a live foreign holder blocks a second starter without clobbering the lock", () => {
+    expect(acquireLock(lockPath, { pid: 1001, alive: () => true })).toEqual({ ok: true });
+    expect(readFileSync(lockPath, "utf8")).toBe("1001");
+    expect(acquireLock(lockPath, { pid: 1002, alive: () => true })).toEqual({ ok: false, holder: 1001 });
+    expect(readFileSync(lockPath, "utf8")).toBe("1001"); // loser must not overwrite the owner
+  });
+
+  test("re-acquiring with the same pid is idempotent", () => {
+    acquireLock(lockPath, { pid: 1001, alive: () => true });
+    expect(acquireLock(lockPath, { pid: 1001, alive: () => true })).toEqual({ ok: true });
+  });
+
+  test("a stale (dead) holder is reclaimed", () => {
+    acquireLock(lockPath, { pid: 1001, alive: () => true });
+    expect(acquireLock(lockPath, { pid: 1002, alive: (p) => p !== 1001 })).toEqual({ ok: true });
+    expect(readFileSync(lockPath, "utf8")).toBe("1002");
+  });
+
+  test("releaseLock removes the lock only for its owner", () => {
+    acquireLock(lockPath, { pid: 1001, alive: () => true });
+    releaseLock(lockPath, 2002); // not the owner
+    expect(existsSync(lockPath)).toBe(true);
+    releaseLock(lockPath, 1001); // owner
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("backs off when another reclaimer holds a fresh reaper", () => {
+    writeFileSync(lockPath, "1001"); // stale main lock (1001 dead)
+    const reapPath = `${lockPath}.reap`;
+    writeFileSync(reapPath, "1002"); // a live reclaimer is mid-reclaim
+    expect(acquireLock(lockPath, { pid: 1003, alive: (p) => p === 1002 })).toEqual({ ok: false, holder: 1001 });
+    expect(readFileSync(lockPath, "utf8")).toBe("1001"); // main untouched
+    expect(readFileSync(reapPath, "utf8")).toBe("1002"); // fresh reaper untouched
+  });
+
+  test("clears an abandoned reaper and reclaims the stale lock", () => {
+    writeFileSync(lockPath, "1001"); // stale main lock
+    const reapPath = `${lockPath}.reap`;
+    writeFileSync(reapPath, "1002"); // reaper left by a crashed reclaimer
+    const aged = new Date(Date.now() - 60_000);
+    utimesSync(reapPath, aged, aged); // age it past the reaper TTL
+    expect(acquireLock(lockPath, { pid: 1003, alive: () => false })).toEqual({ ok: true });
+    expect(readFileSync(lockPath, "utf8")).toBe("1003");
+    expect(existsSync(reapPath)).toBe(false); // reaper released by its new owner
+  });
+
+  // Real cross-process contention via a static child fixture, coordinated over
+  // event-driven Bun IPC (no polling, no timers): every child announces `ready`,
+  // the parent releases them together with `go`, collects each result, then sends
+  // `release` so the winner drops the lock. The winner stays alive until then, so
+  // losers always observe a live holder.
+  const raceForLock = async (n: number): Promise<string[]> => {
+    const fixture = join(import.meta.dirname, "lock-race-fixture.ts");
+    const results: string[] = [];
+    let ready = 0;
+    const allReady = Promise.withResolvers<void>();
+    const allResults = Promise.withResolvers<void>();
+    const procs = Array.from({ length: n }, () =>
+      Bun.spawn([process.execPath, fixture, lockPath], {
+        stdout: "ignore",
+        stderr: "ignore",
+        ipc(message: unknown) {
+          if (message === "ready") {
+            if (++ready === n) allReady.resolve();
+          } else {
+            results.push(String(message));
+            if (results.length === n) allResults.resolve();
+          }
+        },
+      }),
+    );
+    await allReady.promise; // barrier: every child is at the start line
+    for (const p of procs) p.send("go"); // release them together
+    await allResults.promise; // every child has decided
+    for (const p of procs) p.send("release"); // let the winner drop the lock
+    await Promise.all(procs.map((p) => p.exited));
+    return results;
+  };
+
+  test("concurrent starters: exactly one wins a free lock", async () => {
+    const results = await raceForLock(8);
+    expect(results.filter((r) => r === "ok")).toHaveLength(1);
+    expect(results.filter((r) => r === "no")).toHaveLength(7);
+  });
+
+  test("concurrent starters: exactly one reclaims a stale lock", async () => {
+    const doomed = Bun.spawn([process.execPath, "-e", ""]); // exits at once → its PID is dead when the race runs
+    await doomed.exited;
+    writeFileSync(lockPath, String(doomed.pid));
+    const results = await raceForLock(8);
+    expect(results.filter((r) => r === "ok")).toHaveLength(1);
+    expect(results.filter((r) => r === "no")).toHaveLength(7);
   });
 });
