@@ -192,6 +192,22 @@ prints the bot token. `/telegram daemon restart` replaces a stale or
 wrong-version daemon; a live session poller takes over automatically whenever
 the daemon is unavailable.
 
+### `/spawn` (or another command) left a stray topic
+
+Symptom: running `/spawn` from Telegram creates a new empty thread instead of
+just showing the space picker, which appears in **omp control**.
+
+Cause: your bot has **"allow users to create topics"** enabled, so when you send
+a command outside an existing topic, Telegram spins up a throwaway topic to hold
+that message before the bridge sees it — the bridge never created it. `/status`
+and `/telegram doctor` flag this whenever the setting is on.
+
+Fix: in **@BotFather → your bot → Bot Settings**, turn **off** "allow users to
+create topics". The bot creates one topic per omp session itself, so this
+setting is never needed and only produces stray command topics. Type commands
+inside the **omp control** topic and the picker appears right there. Delete any
+leftover stray topics from the Telegram client.
+
 ## Groups
 
 ```
