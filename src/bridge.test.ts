@@ -238,7 +238,7 @@ describe("bot command surface", () => {
   test("the full menu drops /switch and the public menu is the pairing essentials", () => {
     expect(names(BOT_COMMANDS)).toContain("model");
     expect(names(BOT_COMMANDS)).not.toContain("switch");
-    expect(names(PUBLIC_BOT_COMMANDS)).toEqual(["start", "whoami"]);
+    expect(names(PUBLIC_BOT_COMMANDS)).toEqual(["start"]);
     for (const cmd of names(PUBLIC_BOT_COMMANDS)) expect(names(BOT_COMMANDS)).toContain(cmd);
   });
 

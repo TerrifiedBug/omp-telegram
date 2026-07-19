@@ -69,7 +69,7 @@ const COMMANDS: CommandSpec[] = [
   { command: "thinking", description: "Show or change thinking level", scope: "session", help: ["/thinking [level] — show or change thinking level"] },
   { command: "status", description: "Bridge and session health", scope: "global", help: ["/status — bridge and session health"] },
   { command: "help", description: "Show available commands", scope: "global" },
-  { command: "whoami", description: "Show your Telegram IDs", scope: "global", public: true, help: ["/whoami — show Telegram IDs"] },
+  { command: "whoami", description: "Show your Telegram IDs", scope: "global", help: ["/whoami — show Telegram IDs"] },
 ];
 
 const toMenu = (specs: CommandSpec[]): Array<{ command: string; description: string }> =>

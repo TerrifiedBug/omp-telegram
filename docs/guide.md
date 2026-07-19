@@ -123,7 +123,7 @@ message (the poller re-reads access per message).
 These commands are accepted only in the paired owner's private DM. Known bot
 commands typed in a group are consumed and never become omp user turns.
 
-Unpaired chats see a minimal command menu — only `/start` and `/whoami`; the full
+Unpaired chats see a minimal command menu — only `/start`; the full
 menu is scoped to the paired owner's DM.
 
 With owner-DM topics enabled, the bridge creates one persistent **omp control**
