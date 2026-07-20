@@ -1738,7 +1738,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     name: "telegram_ask",
     label: "Telegram Ask",
     description:
-      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on Telegram (and on the terminal for choice questions) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; use it exactly as you would use ask.",
+      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; use it exactly as you would use ask.",
     approval: "read",
     defaultInactive: true,
     parameters: T.Object({
