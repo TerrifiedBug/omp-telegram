@@ -142,9 +142,12 @@ function render(request: PromptRequest): { text: string; reply_markup: InlineKey
 
   if (request.awaitingText) {
     lines.push("", question.options.length === 0 ? "Reply with your answer as the next message, or /cancel." : "Send your custom answer as the next message, or /cancel.");
+    const textNav: Array<{ text: string; callback_data: string }> = [];
+    if (request.questionIndex > 0) textNav.push({ text: "Back", callback_data: callback(request.nonce, "b") });
+    textNav.push({ text: "Cancel", callback_data: callback(request.nonce, "x") });
     return {
       text: clip(lines.join("\n"), 4000),
-      reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: callback(request.nonce, "x") }]] },
+      reply_markup: { inline_keyboard: [textNav] },
     };
   }
 
@@ -322,7 +325,7 @@ export class TelegramPromptController {
       request.page = 0;
       request.answers = request.answers.slice(0, request.questionIndex);
       request.selectedIndices = [];
-      request.awaitingText = false;
+      request.awaitingText = request.questions[request.questionIndex].options.length === 0;
       await atomicJson(requestPath(request.nonce), request);
       await this.#answerCallback(query.id);
       await this.#render(request);
@@ -402,10 +405,18 @@ export class TelegramPromptController {
       ) {
         continue;
       }
-      if ((message.text ?? "").trim().toLowerCase() === "/cancel") {
-        await this.#finish(request, { status: "cancelled" });
-        await this.#edit(request, formatOutcome({ status: "cancelled" }), { inline_keyboard: [] });
-        return true;
+      // Mirror bridge's parseBotCommand: /cancel (and /cancel@bot) closes the prompt, while any
+      // other bot command must reach the bridge dispatcher rather than be captured as a free-text
+      // answer, so /stop and friends keep working while a prompt is awaiting text. A slash-prefixed
+      // non-command (e.g. an "/absolute/path" answer) does not match and is captured normally.
+      const slashCommand = /^\/([a-zA-Z0-9_]+)(?:@\w+)?(?:\s|$)/.exec((message.text ?? "").trim());
+      if (slashCommand) {
+        if (slashCommand[1].toLowerCase() === "cancel") {
+          await this.#finish(request, { status: "cancelled" });
+          await this.#edit(request, formatOutcome({ status: "cancelled" }), { inline_keyboard: [] });
+          return true;
+        }
+        return false;
       }
       const customInput = (message.text ?? message.caption ?? "").trim();
       if (!customInput) return true;

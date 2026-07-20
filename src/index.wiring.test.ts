@@ -258,4 +258,30 @@ describe("telegram_ask execute (dual-surface)", () => {
     expect(res.isError).toBeUndefined();
     expect(res.content[0].text).toContain("User selected: B");
   });
+
+  test("normalizes an omitted-options question into a free-text terminal dialog", async () => {
+    const h = harness(["ask"]);
+    let receivedOptions: unknown;
+    const res = await h.tools.get("telegram_ask")!.execute(
+      "t",
+      { questions: [{ id: "open", question: "What's your call?" }] }, // options omitted → free text
+      undefined,
+      undefined,
+      {
+        hasUI: true,
+        ui: {
+          askDialog: (qs: DialogQuestion[]) => {
+            receivedOptions = qs[0].options;
+            return Promise.resolve({
+              kind: "submit",
+              results: [{ id: "open", question: "What's your call?", options: [], multi: false, selectedOptions: [], customInput: "go with A" }],
+            });
+          },
+        },
+      },
+    );
+    expect(receivedOptions).toEqual([]); // normalized to [], never undefined, at the tool boundary
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain("go with A");
+  });
 });
