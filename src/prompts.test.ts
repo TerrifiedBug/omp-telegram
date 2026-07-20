@@ -157,6 +157,70 @@ describe("TelegramPromptController", () => {
     expect(formatPromptResult(outcome)).toBe("User provided custom input: My custom answer");
   });
 
+  test("asks a free-text question with no options and captures the typed reply", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42", nonce: () => "open", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42" });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("open");
+
+    // Rendered as a free-text prompt: a reply hint and only a Cancel button (no option rows / Other / Done).
+    const sent = calls.find((c) => c.method === "sendMessage")!;
+    expect(String(sent.payload.text)).toContain("Reply with your answer");
+    expect(sent.payload.reply_markup).toEqual({ inline_keyboard: [[{ text: "Cancel", callback_data: "qa:open:x" }]] });
+
+    // A typed reply from the responder is captured directly, without tapping Other first.
+    expect(await poller.handleMessage(textMessage("tidy-first, then build"))).toBe(true);
+    await advancePromptPoll();
+
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "tidy-first, then build" }],
+    });
+  });
+
+  test("does not swallow slash commands like /stop while a free-text prompt is pending", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42", nonce: () => "stopcmd", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42" });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("stopcmd");
+    // /stop must fall through to the bridge command dispatcher, not become the answer.
+    expect(await poller.handleMessage(textMessage("/stop"))).toBe(false);
+    // A real answer still lands.
+    expect(await poller.handleMessage(textMessage("go with plan A"))).toBe(true);
+    await advancePromptPoll();
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "go with plan A" }],
+    });
+  });
+
+  test("keeps free-text engaged when navigating back into an optionless question", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "mixed", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true });
+    const pending = owner.ask(target, [
+      { id: "q1", question: "Free first", options: [] },
+      { id: "q2", question: "Then choose", options: [{ label: "A" }, { label: "B" }] },
+    ]);
+    await waitForRequest("mixed");
+
+    expect(await poller.handleMessage(textMessage("my open answer"))).toBe(true); // answers q1, advances to q2
+    await poller.handleCallback(callback("qa:mixed:b", 101)); // back into q1
+    const lastEdit = calls.filter((c) => c.method === "editMessageText").at(-1)!;
+    expect(String(lastEdit.payload.text)).toContain("Reply with your answer");
+    expect(JSON.stringify(lastEdit.payload.reply_markup)).not.toContain("Other");
+
+    expect(await poller.handleMessage(textMessage("revised answer"))).toBe(true); // re-answer q1
+    await poller.handleCallback(callback("qa:mixed:s:0", 101)); // pick A for q2
+    await advancePromptPoll();
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [
+        { id: "q1", question: "Free first", selectedOptions: [], customInput: "revised answer" },
+        { id: "q2", question: "Then choose", selectedOptions: ["A"] },
+      ],
+    });
+  });
+
   test("handles button cancellation, text cancellation, abort, and dead-owner cleanup", async () => {
     const buttonOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "button-cancel", waitForPoll: waitForTestPoll });
     const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true });

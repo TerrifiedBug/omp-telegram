@@ -31,7 +31,7 @@ import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessag
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
-import { PROMPT_SUPERSEDED, type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
+import { PROMPT_SUPERSEDED, type PromptOption, type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
 import { BlockedPings, askQuestionSummary } from "./blocked";
 
@@ -70,7 +70,7 @@ interface ReactParams {
   emoji: string;
 }
 interface AskParams {
-  questions: PromptQuestion[];
+  questions: Array<{ id: string; question: string; options?: PromptOption[]; multi?: boolean; recommended?: number }>;
 }
 
 
@@ -1738,7 +1738,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     name: "telegram_ask",
     label: "Telegram Ask",
     description:
-      'Ask the user one or more selectable questions (single-select, multi-select, or free-text "Other"). While active it shows the question on BOTH the terminal and Telegram at once and returns whichever the user answers first. It replaces `ask` automatically for Telegram-originated turns and while the user is away — use it exactly as you would use `ask`.',
+      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on Telegram (and on the terminal for choice questions) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; use it exactly as you would use ask.",
     approval: "read",
     defaultInactive: true,
     parameters: T.Object({
@@ -1746,12 +1746,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         T.Object({
           id: T.String({ description: "Stable short question id" }),
           question: T.String({ description: "Question shown in Telegram" }),
-          options: T.Array(
-            T.Object({
-              label: T.String({ description: "Short button label" }),
-              description: T.Optional(T.String({ description: "Optional tradeoff detail" })),
-            }),
-            { minItems: 2, maxItems: 8 },
+          options: T.Optional(
+            T.Array(
+              T.Object({
+                label: T.String({ description: "Short button label" }),
+                description: T.Optional(T.String({ description: "Optional tradeoff detail" })),
+              }),
+              { minItems: 2, maxItems: 8 },
+            ),
           ),
           multi: T.Optional(T.Boolean({ description: "Allow several options" })),
           recommended: T.Optional(T.Number({ minimum: 0, description: "Recommended option index" })),
@@ -1761,6 +1763,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const p = params as AskParams;
+      const questions: PromptQuestion[] = p.questions.map((q) => ({ ...q, options: q.options ?? [] }));
       const target = activePromptTarget ? { ...activePromptTarget } : undefined;
       const canTerminal = ctx?.hasUI === true && typeof ctx.ui?.askDialog === "function";
       if (!target && !canTerminal) {
@@ -1770,7 +1773,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (target) {
         surfaces.push({
           run: async (sig) => {
-            const outcome = await promptController.ask(target, p.questions, sig, { supersededText: "☑️ Closed at the terminal." });
+            const outcome = await promptController.ask(target, questions, sig, { supersededText: "☑️ Closed at the terminal." });
             if (outcome.status === "answered") return { content: [{ type: "text", text: formatPromptResult(outcome) }] };
             if (outcome.status === "cancelled") return errorResult(formatPromptResult(outcome));
             return undefined; // expired, or superseded because the terminal was answered first
@@ -1781,7 +1784,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         surfaces.push({
           run: async (sig) => {
             const result = await ctx.ui.askDialog!(
-              p.questions.map((q) => ({
+              questions.map((q) => ({
                 id: q.id,
                 question: q.question,
                 options: q.options.map((o) => ({ label: o.label, ...(o.description ? { description: o.description } : {}) })),
@@ -2000,8 +2003,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       systemPrompt: [
         ...event.systemPrompt,
         telegramTarget
-          ? "This turn came from Telegram. Use telegram_ask instead of ask whenever selectable user input is required; its answer will arrive from the originating Telegram user."
-          : "The user is away from this terminal. Use telegram_ask instead of ask whenever selectable user input is required; it shows the question on both this terminal and Telegram, and returns whichever the user answers first.",
+          ? "This turn came from Telegram. Use telegram_ask instead of ask for any question that needs user input: give 2-8 options for a choice, or omit options for a free-text answer. Its answer arrives from the originating Telegram user."
+          : "The user is away from this terminal. Use telegram_ask instead of ask for any question that needs user input (2-8 options for a choice, or omit options for free text); it shows on both this terminal and Telegram and returns whichever the user answers first.",
       ],
     };
   });
