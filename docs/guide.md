@@ -241,8 +241,9 @@ count as a mention.
   free-text **Other** questions with inline keyboards. It replaces `ask` on
   Telegram-originated turns and while away/always mode is on, showing the
   question on both the terminal and Telegram at once and returning whichever the
-  user answers first. Requests are responder-, chat-, topic-, message-, nonce-,
-  and expiry-bound; cross-process answers use the shared state directory.
+  user answers first. Requests are responder-, chat-, topic-, message-, and
+  nonce-bound, stay answerable while the owning session runs, and use the shared
+  state directory for cross-process answers.
 
 `telegram_send` and `telegram_react` refuse any chat the inbound gate would not
 deliver from. `telegram_ask` responds only to the exact user who originated the turn.
@@ -256,7 +257,7 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `.env` | `TELEGRAM_BOT_TOKEN=…` (0600; the real process env wins over this file) |
 | `access.json` | Access + config state (atomic writes) |
 | `inbox/` | Downloaded attachments; each file is ≤ 20 MiB, and startup/download cleanup removes files older than 7 days then prunes oldest files above 250 MiB total |
-| `prompts/` | Expiring cross-process selectable-question requests and answers |
+| `prompts/` | Cross-process selectable-question requests (live while their owning session is) and their answers (GC'd after a short grace) |
 | `bot.lock` | Poller PID lock |
 | `daemon.json` | Standalone daemon PID, plugin version, and start time |
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
@@ -451,7 +452,7 @@ starts a fresh session in a brand-new topic.
   messages are untrusted and must not drive access changes.
 - **Bound prompt answers:** selectable questions accept callbacks or Other text
   only from the originating responder in the same chat, topic, and Telegram
-  message. Requests expire after five minutes and survive poll-lock handoff.
+  message. Requests stay answerable while the owning session is alive instead of timing out, and survive poll-lock handoff; a request orphaned by a dead session is reaped.
 - **One poller per token:** Telegram allows a single `getUpdates` consumer per
   bot token. The standalone daemon and session fallback share a PID lock
   (`bot.lock`), preventing 409 conflicts during takeover.
