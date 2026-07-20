@@ -257,7 +257,7 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `.env` | `TELEGRAM_BOT_TOKEN=…` (0600; the real process env wins over this file) |
 | `access.json` | Access + config state (atomic writes) |
 | `inbox/` | Downloaded attachments; each file is ≤ 20 MiB, and startup/download cleanup removes files older than 7 days then prunes oldest files above 250 MiB total |
-| `prompts/` | Expiring cross-process selectable-question requests and answers |
+| `prompts/` | Cross-process selectable-question requests (live while their owning session is) and their answers (GC'd after a short grace) |
 | `bot.lock` | Poller PID lock |
 | `daemon.json` | Standalone daemon PID, plugin version, and start time |
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
