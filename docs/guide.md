@@ -166,7 +166,7 @@ configured groups never receive process-spawning authority.
 
 | Key | Values | Default |
 |---|---|---|
-| `streaming` | `true` \| `false` | `true` |
+| `streaming` | `true` (live preview) \| `false` (per turn) \| `final` (last message only) | `true` |
 | `deliverAs` | `steer` \| `followUp` — how inbound queues while the agent is busy | `followUp` |
 | `chunkMode` | `length` \| `newline` | `newline` |
 | `textChunkLimit` | `1`–`4096` | `4096` |
@@ -271,8 +271,10 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 - **Groups** (and draft-unsupported DMs) send a preview message and edit it in
   place with a `▍` cursor, throttled and split when it would exceed 4096 chars.
 - Each assistant **turn** finalizes into its own real Telegram message, so a
-  multi-step run reads as a sequence of messages. `set streaming false` skips the
-  live preview and sends only the finalized message per turn.
+  multi-step run reads as a sequence of messages. Two settings trim this.
+  `set streaming false` keeps one message per turn but drops the live preview.
+  `set streaming final` drops both and sends only the run's last message once
+  the agent finishes. The typing indicator still runs in `final` mode.
 
 ## Notifications
 
