@@ -1,6 +1,6 @@
 {
   "name": "omp-telegram",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Standalone Telegram bridge, session topics, and herdr control plane for omp",
   "type": "module",
   "license": "MIT",
