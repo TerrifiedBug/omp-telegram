@@ -141,7 +141,7 @@ function render(request: PromptRequest): { text: string; reply_markup: InlineKey
   }
 
   if (request.awaitingText) {
-    lines.push("", "Send your custom answer as the next message, or /cancel.");
+    lines.push("", question.options.length === 0 ? "Reply with your answer as the next message, or /cancel." : "Send your custom answer as the next message, or /cancel.");
     return {
       text: clip(lines.join("\n"), 4000),
       reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: callback(request.nonce, "x") }]] },
@@ -264,7 +264,7 @@ export class TelegramPromptController {
       questionIndex: 0,
       answers: [],
       selectedIndices: [],
-      awaitingText: false,
+      awaitingText: questions[0].options.length === 0,
       ownerPid: this.#pid,
     };
     const first = render(request);
@@ -456,7 +456,7 @@ export class TelegramPromptController {
       request.questionIndex += 1;
       request.page = 0;
       request.selectedIndices = [];
-      request.awaitingText = false;
+      request.awaitingText = request.questions[request.questionIndex].options.length === 0;
       await atomicJson(requestPath(request.nonce), request);
       await this.#render(request);
       return;

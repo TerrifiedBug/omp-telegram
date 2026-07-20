@@ -237,8 +237,9 @@ count as a mention.
   else as documents (≤ 50 MB each).
 - **`telegram_react`** — react to a message with a Telegram whitelist emoji
   (👍 👎 ❤ 🔥 👀 🎉 …).
-- **`telegram_ask`** — ask the user one or more single-select, multi-select, or
-  free-text **Other** questions with inline keyboards. It replaces `ask` on
+- **`telegram_ask`** — ask the user one or more questions with inline keyboards:
+  give 2-8 options for a single- or multi-select choice, or omit options for a
+  free-text question the user answers by replying with a message. It replaces `ask` on
   Telegram-originated turns and while away/always mode is on, showing the
   question on both the terminal and Telegram at once and returning whichever the
   user answers first. Requests are responder-, chat-, topic-, message-, and

@@ -157,6 +157,27 @@ describe("TelegramPromptController", () => {
     expect(formatPromptResult(outcome)).toBe("User provided custom input: My custom answer");
   });
 
+  test("asks a free-text question with no options and captures the typed reply", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42", nonce: () => "open", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42" });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("open");
+
+    // Rendered as a free-text prompt: a reply hint and only a Cancel button (no option rows / Other / Done).
+    const sent = calls.find((c) => c.method === "sendMessage")!;
+    expect(String(sent.payload.text)).toContain("Reply with your answer");
+    expect(sent.payload.reply_markup).toEqual({ inline_keyboard: [[{ text: "Cancel", callback_data: "qa:open:x" }]] });
+
+    // A typed reply from the responder is captured directly, without tapping Other first.
+    expect(await poller.handleMessage(textMessage("tidy-first, then build"))).toBe(true);
+    await advancePromptPoll();
+
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "tidy-first, then build" }],
+    });
+  });
+
   test("handles button cancellation, text cancellation, abort, and dead-owner cleanup", async () => {
     const buttonOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "button-cancel", waitForPoll: waitForTestPoll });
     const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true });
