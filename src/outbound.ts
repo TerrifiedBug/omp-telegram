@@ -133,7 +133,8 @@ export class Outbound {
 
   onMessageUpdate(message: unknown): void {
     if (!this.#token || this.#active.size === 0) return;
-    if (this.#getAccess().streaming === false) return;
+    const streaming = this.#getAccess().streaming;
+    if (streaming === false || streaming === "final") return;
     const text = assistantText(message);
     if (text.trim().length === 0) return;
     for (const key of this.#active) {
@@ -145,6 +146,7 @@ export class Outbound {
 
   async onTurnEnd(message: unknown): Promise<void> {
     if (!this.#token || this.#active.size === 0) return;
+    if (this.#getAccess().streaming === "final") return; // one message per run, delivered at agent end
     const text = assistantText(message);
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
@@ -154,11 +156,18 @@ export class Outbound {
     }
   }
 
-  async onAgentEnd(): Promise<void> {
+  /** End of the whole run. In "final" mode deliver `finalText` here; otherwise flush any dirty stream. */
+  async onAgentEnd(finalText?: string): Promise<void> {
+    const finalOnly = this.#getAccess().streaming === "final";
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
-      if (st?.dirty) await this.#finalize(st, st.acc);
-      if (st) this.#stopTyping(st);
+      if (!st) continue;
+      if (finalOnly) {
+        if (finalText && finalText.trim().length > 0) await this.#finalize(st, finalText);
+      } else if (st.dirty) {
+        await this.#finalize(st, st.acc);
+      }
+      this.#stopTyping(st);
     }
     this.#active.clear();
   }
