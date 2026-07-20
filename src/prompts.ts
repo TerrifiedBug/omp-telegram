@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { statePath } from "./access";
 import type { TgCallbackQuery, TgMessage } from "./api";
 import type { TelegramCall } from "./control";
+import { isAlive } from "./topics";
 
-const PROMPT_TTL_MS = 5 * 60_000;
+const PROMPT_TTL_MS = 5 * 60_000; // GC grace for orphaned answer artifacts (requests expire by owner-pid liveness)
 const POLL_INTERVAL_MS = 200;
 
 const OPTIONS_PER_PAGE = 8;
@@ -62,7 +63,7 @@ interface PromptRequest extends PromptTarget {
   answers: PromptAnswer[];
   selectedIndices: number[];
   awaitingText: boolean;
-  expiresAt: number;
+  ownerPid: number;
 }
 interface PromptAnswerEnvelope {
   expiresAt: number;
@@ -219,6 +220,8 @@ export class TelegramPromptController {
   readonly #now: () => number;
   readonly #nonce: () => string;
   readonly #waitForPoll: (signal?: AbortSignal) => Promise<void>;
+  readonly #alive: (pid: number) => boolean;
+  readonly #pid: number;
 
   constructor(options: {
     callTelegram: TelegramCall;
@@ -226,12 +229,16 @@ export class TelegramPromptController {
     now?: () => number;
     nonce?: () => string;
     waitForPoll?: (signal?: AbortSignal) => Promise<void>;
+    alive?: (pid: number) => boolean;
+    pid?: number;
   }) {
     this.#call = options.callTelegram;
     this.#authorize = options.authorize;
     this.#now = options.now ?? Date.now;
     this.#nonce = options.nonce ?? (() => randomBytes(8).toString("base64url"));
     this.#waitForPoll = options.waitForPoll ?? waitForPoll;
+    this.#alive = options.alive ?? isAlive;
+    this.#pid = options.pid ?? process.pid;
   }
 
   async ask(
@@ -258,7 +265,7 @@ export class TelegramPromptController {
       answers: [],
       selectedIndices: [],
       awaitingText: false,
-      expiresAt: this.#now() + PROMPT_TTL_MS,
+      ownerPid: this.#pid,
     };
     const first = render(request);
     const sent = await this.#call<TgMessage>("sendMessage", {
@@ -272,7 +279,7 @@ export class TelegramPromptController {
 
     let outcome: PromptOutcome;
     try {
-      outcome = await this.#wait(nonce, request.expiresAt, signal);
+      outcome = await this.#wait(nonce, signal);
     } finally {
       await remove(requestPath(nonce));
     }
@@ -293,7 +300,7 @@ export class TelegramPromptController {
     if (
       !request ||
       !message ||
-      request.expiresAt <= this.#now() ||
+      !this.#alive(request.ownerPid) ||
       String(query.from.id) !== request.responderId ||
       String(message.chat.id) !== request.chatId ||
       message.message_id !== request.messageId ||
@@ -388,7 +395,7 @@ export class TelegramPromptController {
       if (
         !request ||
         !request.awaitingText ||
-        request.expiresAt <= this.#now() ||
+        !this.#alive(request.ownerPid) ||
         request.responderId !== responderId ||
         request.chatId !== chatId ||
         !sameThread(message, request.threadId)
@@ -422,8 +429,15 @@ export class TelegramPromptController {
     for (const name of names) {
       if (!name.endsWith(".json") || name.includes(".tmp-")) continue;
       const path = join(promptsDir(), name);
-      const value = await readJson<PromptRequest | PromptAnswerEnvelope>(path);
-      if (!value || value.expiresAt > this.#now()) continue;
+      // Answer artifacts GC by wall clock; live requests GC by owner-pid liveness
+      // so a prompt never expires while its owning process is still waiting on it.
+      if (name.endsWith(".answer.json")) {
+        const answer = await readJson<PromptAnswerEnvelope>(path);
+        if (!answer || answer.expiresAt > this.#now()) continue;
+      } else {
+        const request = await readJson<PromptRequest>(path);
+        if (!request || this.#alive(request.ownerPid)) continue;
+      }
       await remove(path);
       removed += 1;
     }
@@ -456,14 +470,16 @@ export class TelegramPromptController {
     await remove(requestPath(request.nonce));
   }
 
-  async #wait(nonce: string, expiresAt: number, signal?: AbortSignal): Promise<PromptOutcome> {
-    while (this.#now() < expiresAt) {
+  async #wait(nonce: string, signal?: AbortSignal): Promise<PromptOutcome> {
+    // No wall-clock deadline: while this process is alive and waiting, the prompt
+    // stays answerable (like the terminal picker). It settles only on an answer,
+    // or when the parent turn aborts.
+    for (;;) {
       if (signal?.aborted) return { status: "aborted" };
       const answer = await readJson<PromptAnswerEnvelope>(answerPath(nonce));
       if (answer) return answer.outcome;
       await this.#waitForPoll(signal);
     }
-    return { status: "expired" };
   }
 
   async #hasPending(target: PromptTarget): Promise<boolean> {
@@ -479,7 +495,7 @@ export class TelegramPromptController {
       const request = await readJson<PromptRequest>(join(promptsDir(), name));
       if (
         request &&
-        request.expiresAt > this.#now() &&
+        this.#alive(request.ownerPid) &&
         request.responderId === target.responderId &&
         request.chatId === target.chatId &&
         request.threadId === target.threadId

@@ -157,7 +157,7 @@ describe("TelegramPromptController", () => {
     expect(formatPromptResult(outcome)).toBe("User provided custom input: My custom answer");
   });
 
-  test("handles button cancellation, text cancellation, abort, and expiry", async () => {
+  test("handles button cancellation, text cancellation, abort, and dead-owner cleanup", async () => {
     const buttonOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "button-cancel", waitForPoll: waitForTestPoll });
     const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true });
     const buttonPending = buttonOwner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }]);
@@ -183,15 +183,37 @@ describe("TelegramPromptController", () => {
     abort.abort();
     await expect(abortPending).resolves.toEqual({ status: "aborted" });
 
-    let now = 0;
+    // A prompt whose owning process has died is treated as gone, not answerable.
     nextMessageId = 103;
-    const expiryOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "expiry", now: () => now, waitForPoll: waitForTestPoll });
-    const expiryPending = expiryOwner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }]);
-    await waitForRequest("expiry");
+    const deadAbort = new AbortController();
+    const deadOwner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "dead", waitForPoll: waitForTestPoll, pid: 4242 });
+    const deadPending = deadOwner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }], deadAbort.signal);
+    await waitForRequest("dead");
+    const deadPoller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, alive: () => false });
+    expect(await deadPoller.handleCallback(callback("qa:dead:s:0", 104))).toBe(true);
+    expect(calls.at(-1)?.payload.text).toBe("This question expired or belongs to another user.");
+    expect(await deadPoller.pruneExpired()).toBeGreaterThanOrEqual(1);
+    deadAbort.abort();
+    await expect(deadPending).resolves.toEqual({ status: "aborted" });
+  });
+
+  test("never wall-clock expires while the owning process is alive", async () => {
+    let now = 0;
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "live", now: () => now, waitForPoll: waitForTestPoll, pid: 7777 });
+    const poller = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, alive: (p) => p === 7777 });
+    const pending = owner.ask(target, [{ id: "q", question: "Choose", options: [{ label: "A" }, { label: "B" }] }]);
+    await waitForRequest("live");
+    // Advance the clock far past the old 5-minute TTL and pump the poll loop.
+    now = 60 * 60_000;
     await advancePromptPoll();
-    now = 5 * 60_000 + 1;
     await advancePromptPoll();
-    await expect(expiryPending).resolves.toEqual({ status: "expired" });
+    // Still live: an answer that arrives much later is accepted.
+    expect(await poller.handleCallback(callback("qa:live:s:0", 101))).toBe(true);
+    await advancePromptPoll();
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "q", question: "Choose", selectedOptions: ["A"] }],
+    });
   });
 
   test("closes as answered-elsewhere on a superseded abort, task-stopped on a plain abort", async () => {
