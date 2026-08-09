@@ -50,6 +50,34 @@ export function isMissingThreadError(err: unknown): boolean {
   return err instanceof TgError && err.code === 400 && /message thread not found|topic_id_invalid/i.test(err.message);
 }
 
+/** Attempts to re-send a request Telegram rate-limited before giving up on it. */
+const RATE_LIMIT_RETRIES = 3;
+/** Upper bound on one `retry_after` wait, so a long ban cannot stall a turn indefinitely. */
+const MAX_RETRY_WAIT_MS = 30_000;
+
+/**
+ * Run a Telegram request, waiting out `retry_after` when Telegram rate-limits
+ * it. Every text delivery path goes through this: without it a 429 on part 2 of
+ * a split message throws, the caller gives up, and the reader silently keeps a
+ * truncated reply. `sleep` is a test seam.
+ */
+export async function withRateLimit<T>(
+  op: () => Promise<T>,
+  options: { sleep?: (ms: number) => Promise<void>; log?: Logger } = {},
+): Promise<T> {
+  const pause = options.sleep ?? sleep;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (err) {
+      const retryAfter = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? (err.retryAfter ?? 1) : undefined;
+      if (retryAfter == null || attempt >= RATE_LIMIT_RETRIES) throw err;
+      options.log?.debug(`[telegram] rate limited — retrying in ${retryAfter}s`);
+      await pause(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
+    }
+  }
+}
+
 // ---- Wire types (only the fields we read) --------------------------------
 
 export interface TgUser {

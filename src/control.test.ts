@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess } from "./access";
-import type { TgCallbackQuery, TgMessage } from "./api";
+import { type TgCallbackQuery, type TgMessage, TgError } from "./api";
 import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
 import type { ThreadRegistry } from "./topics";
 
@@ -331,6 +331,57 @@ describe("sendCommandMessage", () => {
     };
     await sendCommandMessage({ access, callTelegram, msg, text: "Stopped.", useControlTopic: false });
     expect(calls).toEqual([{ chat_id: "42", message_thread_id: 3061, text: "Stopped." }]);
+  });
+
+  test("a /sessions listing longer than one message is split, not dropped", async () => {
+    // 200 stale topics is an ordinary long-lived bridge; the listing is unbounded.
+    const registry: ThreadRegistry = { version: 1, chatId: "42", threads: {} };
+    for (let i = 0; i < 200; i++) {
+      registry.threads[String(1000 + i)] = { pid: 2_000_000_000 + i, cwd: `/work/project-${i}`, name: `project-${i}`, claimedAt: 1 };
+    }
+    const listing = formatSessions([], registry, () => false);
+    expect(listing.length).toBeGreaterThan(4096); // one sendMessage would be rejected outright
+
+    const sent: string[] = [];
+    const markups: unknown[] = [];
+    const callTelegram: TelegramCall = async <T>(_method: string, payload: Record<string, unknown>) => {
+      sent.push(String(payload.text));
+      markups.push(payload.reply_markup);
+      return { ...msg, message_id: sent.length } as T;
+    };
+    const keyboard = { inline_keyboard: [[{ text: "Confirm", callback_data: "cl:y:1" }]] };
+    const last = await sendCommandMessage({ access, callTelegram, msg, text: listing, replyMarkup: keyboard, useControlTopic: false });
+
+    const parts = sent.filter((text) => text !== 'Handled in the "omp control" topic.');
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.every((part) => part.length <= 4096)).toBe(true);
+    // Splitting consumes the newline it breaks on, so compare lines: each one, once, in order.
+    expect(parts.flatMap((part) => part.replace(/^\(\d+\/\d+\)\n/, "").split("\n"))).toEqual(listing.split("\n"));
+    // The keyboard rides the final part, and that is the message pickers track.
+    expect(markups.slice(0, -1).every((markup) => markup === undefined)).toBe(true);
+    expect(markups.at(-1)).toEqual(keyboard);
+    expect(last?.message_id).toBe(parts.length);
+  });
+
+  test("a rate-limited command part is retried, not abandoned mid-listing", async () => {
+    const listing = Array.from({ length: 300 }, (_, i) => `[stale topic] project-${i} — thread ${1000 + i}, no live owner`).join("\n");
+    const sent: string[] = [];
+    const waits: number[] = [];
+    let limited = false;
+    const callTelegram: TelegramCall = async <T>(_method: string, payload: Record<string, unknown>) => {
+      if (!limited && String(payload.text).startsWith("(2/")) {
+        limited = true;
+        throw new TgError("Too Many Requests: retry later", 429, 2);
+      }
+      sent.push(String(payload.text));
+      return { ...msg, message_id: sent.length } as T;
+    };
+    await sendCommandMessage({ access, callTelegram, msg, text: listing, useControlTopic: false, sleep: async (ms) => void waits.push(ms) });
+
+    expect(limited).toBe(true);
+    expect(waits).toEqual([2250]);
+    // The 429 must not truncate the listing: every line still arrives, once, in order.
+    expect(sent.flatMap((part) => part.replace(/^\(\d+\/\d+\)\n/, "").split("\n"))).toEqual(listing.split("\n"));
   });
 });
 
