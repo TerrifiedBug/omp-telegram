@@ -8,7 +8,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Access } from "./access";
 import { controlTopicTarget, isPairedOwnerDm, messageLimit, pairedOwnerId } from "./access";
-import type { TgCallbackQuery, TgMessage } from "./api";
+import { type TgCallbackQuery, type TgMessage, withRateLimit } from "./api";
 import { chunkLabeled } from "./markdown";
 import type { ThreadEntry, ThreadRegistry } from "./topics";
 
@@ -355,6 +355,8 @@ export interface CommandMessageOptions {
   useControlTopic?: boolean;
   redirectText?: string;
   warn?: (message: string) => void;
+  /** Test seam for the rate-limit back-off; production waits for real. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -376,11 +378,15 @@ export async function sendCommandMessage(options: CommandMessageOptions): Promis
   const deliver = async (target: Record<string, unknown>): Promise<TgMessage> => {
     let last: TgMessage | undefined;
     for (const [i, part] of parts.entries()) {
-      last = await callTelegram<TgMessage>("sendMessage", {
-        ...target,
-        text: part,
-        ...(replyMarkup && i === parts.length - 1 ? { reply_markup: replyMarkup } : {}),
-      });
+      last = await withRateLimit(
+        () =>
+          callTelegram<TgMessage>("sendMessage", {
+            ...target,
+            text: part,
+            ...(replyMarkup && i === parts.length - 1 ? { reply_markup: replyMarkup } : {}),
+          }),
+        { sleep: options.sleep },
+      );
     }
     return last as TgMessage; // parts is non-empty, so the loop always assigns
   };

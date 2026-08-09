@@ -7,7 +7,7 @@
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { type Access, assertSendable, messageLimit } from "./access";
-import { isMissingThreadError, type Logger, TgError, tg, tgUpload } from "./api";
+import { isMissingThreadError, type Logger, TgError, tg, tgUpload, withRateLimit } from "./api";
 import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, chunkLabeled, mdToMarkdownV2 } from "./markdown";
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
@@ -16,17 +16,6 @@ const CURSOR = " \u258f"; // ▍ streaming caret appended to live previews
 const DRAFT_THROTTLE_MS = 600;
 const EDIT_THROTTLE_MS = 1250;
 const TYPING_INTERVAL_MS = 5000;
-/** Attempts to re-send a message Telegram rate-limited before giving up on it. */
-const RATE_LIMIT_RETRIES = 3;
-/** Upper bound on one `retry_after` wait, so a long ban cannot stall a turn indefinitely. */
-const MAX_RETRY_WAIT_MS = 30_000;
-
-const wait = (ms: number): Promise<void> => {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms).unref?.();
-  return promise;
-};
-
 /** Map a chat + optional forum topic to a single #chats / #active key. */
 const targetKey = (chatId: string, threadId?: number): string => (threadId != null ? `${chatId}#${threadId}` : chatId);
 
@@ -94,14 +83,14 @@ export class Outbound {
   #token = "";
   readonly #getAccess: () => Access;
   readonly #log?: Logger;
-  readonly #sleep: (ms: number) => Promise<void>;
+  readonly #sleep?: (ms: number) => Promise<void>;
   readonly #chats = new Map<string, ChatState>();
   readonly #active = new Set<string>();
   #draftUnsupported = false;
   #lastTarget: { chatId: string; threadId?: number } | undefined;
   #missingThreadHandler?: (chatId: string, threadId: number) => Promise<number | undefined>;
 
-  constructor(getAccess: () => Access, log?: Logger, sleep: (ms: number) => Promise<void> = wait) {
+  constructor(getAccess: () => Access, log?: Logger, sleep?: (ms: number) => Promise<void>) {
     this.#getAccess = getAccess;
     this.#log = log;
     this.#sleep = sleep;
@@ -513,22 +502,9 @@ export class Outbound {
     return sent.message_id;
   }
 
-  /**
-   * Retry a delivery Telegram rate-limited. Without this a 429 on part 2 of a
-   * split answer throws, `#finalize` swallows it, and the reader silently keeps
-   * a truncated answer.
-   */
-  async #rateLimited<T>(op: () => Promise<T>): Promise<T> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await op();
-      } catch (err) {
-        const retryAfter = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? (err.retryAfter ?? 1) : undefined;
-        if (retryAfter == null || attempt >= RATE_LIMIT_RETRIES) throw err;
-        this.#log?.debug(`[telegram] rate limited — retrying in ${retryAfter}s`);
-        await this.#sleep(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
-      }
-    }
+  /** Run a Telegram delivery with the shared rate-limit retry (and this instance's test seam). */
+  #rateLimited<T>(op: () => Promise<T>): Promise<T> {
+    return withRateLimit(op, { sleep: this.#sleep, log: this.#log });
   }
 
   #onStreamError(st: ChatState, err: unknown): void {

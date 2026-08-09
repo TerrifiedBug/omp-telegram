@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess } from "./access";
-import type { TgCallbackQuery, TgMessage } from "./api";
+import { type TgCallbackQuery, type TgMessage, TgError } from "./api";
 import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
 import type { ThreadRegistry } from "./topics";
 
@@ -361,6 +361,27 @@ describe("sendCommandMessage", () => {
     expect(markups.slice(0, -1).every((markup) => markup === undefined)).toBe(true);
     expect(markups.at(-1)).toEqual(keyboard);
     expect(last?.message_id).toBe(parts.length);
+  });
+
+  test("a rate-limited command part is retried, not abandoned mid-listing", async () => {
+    const listing = Array.from({ length: 300 }, (_, i) => `[stale topic] project-${i} — thread ${1000 + i}, no live owner`).join("\n");
+    const sent: string[] = [];
+    const waits: number[] = [];
+    let limited = false;
+    const callTelegram: TelegramCall = async <T>(_method: string, payload: Record<string, unknown>) => {
+      if (!limited && String(payload.text).startsWith("(2/")) {
+        limited = true;
+        throw new TgError("Too Many Requests: retry later", 429, 2);
+      }
+      sent.push(String(payload.text));
+      return { ...msg, message_id: sent.length } as T;
+    };
+    await sendCommandMessage({ access, callTelegram, msg, text: listing, useControlTopic: false, sleep: async (ms) => void waits.push(ms) });
+
+    expect(limited).toBe(true);
+    expect(waits).toEqual([2250]);
+    // The 429 must not truncate the listing: every line still arrives, once, in order.
+    expect(sent.flatMap((part) => part.replace(/^\(\d+\/\d+\)\n/, "").split("\n"))).toEqual(listing.split("\n"));
   });
 });
 
