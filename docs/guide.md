@@ -281,6 +281,12 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
   `set streaming false` keeps one message per turn but drops the live preview.
   `set streaming final` drops both and sends only the run's last message once
   the agent finishes. The typing indicator still runs in `final` mode.
+- An answer too long for one Telegram message (4096 chars, or `textChunkLimit`)
+  is split at a paragraph, line, or word boundary (`chunkMode`) and each part is
+  prefixed `(i/n)`, so a long reply arrives complete and in order rather than
+  cut off. Code fences are closed and reopened across the split.
+- A part Telegram rate-limits (`429`) is retried up to three times, honouring
+  `retry_after`, instead of dropping the rest of the answer.
 
 ## Notifications
 

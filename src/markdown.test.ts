@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { escapeMdV2, mdToMarkdownV2, chunk, TELEGRAM_MAX_CHARS, MARKDOWN_HEADROOM } from "./markdown";
+import { escapeMdV2, mdToMarkdownV2, chunk, chunkLabeled, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, MARKDOWN_HEADROOM } from "./markdown";
 
 // The exact MarkdownV2 special set that escapeMdV2 must prefix with a backslash.
 const SPECIALS = ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!", "\\"];
@@ -149,6 +149,33 @@ describe("chunk", () => {
   test("newline mode hard-cuts when no break is available", () => {
     const chunks = chunk("x".repeat(25), 10, "newline");
     expect(chunks.map((c) => c.length)).toEqual([10, 10, 5]);
+  });
+});
+
+describe("chunkLabeled", () => {
+  // 240 chars against a 100 limit: 3 parts once the label reserve is taken out.
+  const text = "x".repeat(240);
+
+  test("a message that fits is left unlabelled", () => {
+    expect(chunkLabeled("hello", 100, "length")).toEqual(["hello"]);
+    expect(chunkLabeled("", 100, "length")).toEqual([]);
+  });
+
+  test("a split message labels every part and each part still fits the limit", () => {
+    const parts = chunkLabeled(text, 100, "length");
+    expect(parts.map((part) => part.slice(0, part.indexOf("\n")))).toEqual(["(1/3)", "(2/3)", "(3/3)"]);
+    expect(parts.every((part) => part.length <= 100)).toBe(true);
+    expect(parts.map((part) => part.slice(part.indexOf("\n") + 1)).join("")).toBe(text);
+  });
+
+  test("priorParts continues the numbering of an answer already part-delivered", () => {
+    // One message went out mid-stream, so the remainder is parts 2..n of n.
+    expect(chunkLabeled("tail", 100, "length", 1)).toEqual(["(2/2)\ntail"]);
+    expect(chunkLabeled(text, 100, "length", 2).map((part) => part.slice(0, 5))).toEqual(["(3/5)", "(4/5)", "(5/5)"]);
+  });
+
+  test("the label reserve leaves room for the widest realistic label", () => {
+    expect(`(${99}/${99})\n`.length).toBeLessThanOrEqual(PART_LABEL_RESERVE);
   });
 });
 

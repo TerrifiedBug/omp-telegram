@@ -1,4 +1,4 @@
-import { afterEach, test, expect, describe } from "bun:test";
+import { afterEach, test, expect, describe, setSystemTime } from "bun:test";
 import { defaultAccess } from "./access";
 import { Outbound, assistantText, finalAssistantText } from "./outbound";
 
@@ -8,6 +8,7 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  setSystemTime();
 });
 
 describe("assistantText", () => {
@@ -187,6 +188,132 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onTurnEnd(assistant("interim"));
     await outbound.onAgentEnd("");
     expect(sent).toEqual([]);
+    outbound.shutdown();
+  });
+});
+
+describe("Outbound long answers", () => {
+  /** Prose with word boundaries, so the newline chunker has somewhere to cut. */
+  const prose = (chars: number): string => {
+    let out = "";
+    let i = 0;
+    while (out.length < chars) out += `word${i++} `;
+    return out.slice(0, chars);
+  };
+  /** Recorded Telegram text back to source form: drop MarkdownV2 escapes and the (i/n) label. */
+  const unlabel = (text: string): string => text.replace(/\\/g, "").replace(/^\(\d+\/\d+\)\n/, "");
+  /** Flush pending microtasks — the fetch double resolves without real I/O. */
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 200; i++) await Promise.resolve();
+  };
+
+  test("a 9k answer is delivered whole, as labelled consecutive parts", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 50 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }));
+    outbound.setToken("secret");
+    outbound.markActive("42");
+    const text = prose(9000);
+    await outbound.onTurnEnd(assistant(text));
+    await outbound.onAgentEnd();
+
+    expect(sent.length).toBe(3);
+    expect(sent.every((part) => part.length <= 4096)).toBe(true);
+    expect(sent.map((part) => /^\\\((\d)\/(\d)\\\)\n/.exec(part)?.slice(1).join("/"))).toEqual(["1/3", "2/3", "3/3"]);
+    expect(sent.map(unlabel).join("")).toBe(text);
+    outbound.shutdown();
+  });
+
+  test("a short answer carries no part label", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (_url, init) => {
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 51 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }));
+    outbound.setToken("secret");
+    await outbound.send("42", "short answer");
+    expect(sent).toEqual(["short answer"]);
+    outbound.shutdown();
+  });
+
+  test("a rate-limited part is retried instead of dropping the rest of the answer", async () => {
+    const sent: string[] = [];
+    const waits: number[] = [];
+    let limited = false;
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method !== "sendMessage") return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+      if (!limited && String(payload.text).startsWith("\\(2/3\\)")) {
+        limited = true;
+        return new Response(
+          JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 3 } }),
+          { status: 200 },
+        );
+      }
+      sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 52 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(
+      () => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }),
+      undefined,
+      async (ms) => {
+        waits.push(ms);
+      },
+    );
+    outbound.setToken("secret");
+    outbound.markActive("42");
+    const text = prose(9000);
+    await outbound.onTurnEnd(assistant(text));
+
+    expect(limited).toBe(true);
+    expect(waits).toEqual([3250]);
+    expect(sent.length).toBe(3);
+    expect(sent.map(unlabel).join("")).toBe(text);
+    outbound.shutdown();
+  });
+
+  test("an overflowed stream turn reads as one numbered answer, delivered once", async () => {
+    // Model the chat: sends append a message, edits replace one in place.
+    const chat = new Map<number, string>();
+    let nextId = 60;
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") chat.set(++nextId, String(payload.text));
+      if (method === "editMessageText") chat.set(Number(payload.message_id), String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: nextId } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["-100"], streaming: true }));
+    outbound.setToken("secret");
+    setSystemTime(new Date(1_000_000));
+    outbound.markActive("-100", 3); // group chat -> edit-based preview, not drafts
+    const text = prose(9000);
+
+    outbound.onMessageUpdate(assistant(text.slice(0, 500)));
+    await flush();
+    setSystemTime(new Date(1_000_000 + 5_000)); // past the edit throttle
+    outbound.onMessageUpdate(assistant(text)); // overflows: commits the head, drops the preview
+    await flush();
+    await outbound.onTurnEnd(assistant(text));
+    await outbound.onAgentEnd();
+
+    const messages = [...chat.values()];
+    expect(messages.length).toBe(3);
+    // The head committed mid-stream is numbered too, once the total is known.
+    expect(messages.map((m) => /^\\\((\d)\/(\d)\\\)\n/.exec(m)?.slice(1).join("/"))).toEqual(["1/3", "2/3", "3/3"]);
+    expect(messages.map(unlabel).join("")).toBe(text); // every source char exactly once
     outbound.shutdown();
   });
 });

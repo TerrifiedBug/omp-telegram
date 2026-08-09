@@ -135,3 +135,22 @@ export function chunk(text: string, limit: number, mode: "length" | "newline"): 
   }
   return out;
 }
+
+/** Width reserved for the `(i/n)` label prepended to every part of a split message. */
+export const PART_LABEL_RESERVE = 16;
+
+/**
+ * Chunk like {@link chunk}, but when the message does not arrive in one piece
+ * prepend `(i/n)` to every part so a reader can see the answer continues. The
+ * text is re-split against a smaller budget so the label always fits.
+ *
+ * `priorParts` counts messages of the same answer already delivered (a stream
+ * preview committed mid-turn), so the numbering spans the whole answer.
+ */
+export function chunkLabeled(text: string, limit: number, mode: "length" | "newline", priorParts = 0): string[] {
+  const parts = chunk(text, limit, mode);
+  if (parts.length <= 1 && priorParts === 0) return parts;
+  const labelled = chunk(text, Math.max(1, limit - PART_LABEL_RESERVE), mode);
+  const total = priorParts + labelled.length;
+  return labelled.map((part, i) => `(${priorParts + i + 1}/${total})\n${part}`);
+}

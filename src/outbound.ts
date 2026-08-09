@@ -8,7 +8,7 @@ import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { type Access, assertSendable } from "./access";
 import { isMissingThreadError, type Logger, TgError, tg, tgUpload } from "./api";
-import { MARKDOWN_HEADROOM, TELEGRAM_MAX_CHARS, chunk, mdToMarkdownV2 } from "./markdown";
+import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, chunkLabeled, mdToMarkdownV2 } from "./markdown";
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -16,6 +16,16 @@ const CURSOR = " \u258f"; // ▍ streaming caret appended to live previews
 const DRAFT_THROTTLE_MS = 600;
 const EDIT_THROTTLE_MS = 1250;
 const TYPING_INTERVAL_MS = 5000;
+/** Attempts to re-send a message Telegram rate-limited before giving up on it. */
+const RATE_LIMIT_RETRIES = 3;
+/** Upper bound on one `retry_after` wait, so a long ban cannot stall a turn indefinitely. */
+const MAX_RETRY_WAIT_MS = 30_000;
+
+const wait = (ms: number): Promise<void> => {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms).unref?.();
+  return promise;
+};
 
 /** Map a chat + optional forum topic to a single #chats / #active key. */
 const targetKey = (chatId: string, threadId?: number): string => (threadId != null ? `${chatId}#${threadId}` : chatId);
@@ -33,6 +43,8 @@ interface ChatState {
   acc: string;
   /** Source chars already finalized into prior preview messages (edit overflow). */
   sentUpTo: number;
+  /** Messages of this turn's answer already delivered, kept so `(i/n)` can be filled in at the end. */
+  committed: Array<{ messageId: number; text: string }>;
   /** Throttle timestamp of the last stream push. */
   lastEditAt: number;
   /** True while this turn has unfinalized streamed content. */
@@ -82,15 +94,17 @@ export class Outbound {
   #token = "";
   readonly #getAccess: () => Access;
   readonly #log?: Logger;
+  readonly #sleep: (ms: number) => Promise<void>;
   readonly #chats = new Map<string, ChatState>();
   readonly #active = new Set<string>();
   #draftUnsupported = false;
   #lastTarget: { chatId: string; threadId?: number } | undefined;
   #missingThreadHandler?: (chatId: string, threadId: number) => Promise<number | undefined>;
 
-  constructor(getAccess: () => Access, log?: Logger) {
+  constructor(getAccess: () => Access, log?: Logger, sleep: (ms: number) => Promise<void> = wait) {
     this.#getAccess = getAccess;
     this.#log = log;
+    this.#sleep = sleep;
   }
 
   setToken(token: string): void {
@@ -202,7 +216,7 @@ export class Outbound {
   async send(chatId: string, text: string, opts?: { replyTo?: number; format?: "text" | "markdown"; threadId?: number }): Promise<number[]> {
     const access = this.#getAccess();
     const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
-    const parts = chunk(text, budget, access.chunkMode ?? "newline");
+    const parts = chunkLabeled(text, budget, access.chunkMode ?? "newline");
     if (parts.length === 0) return [];
     const replyMode = access.replyToMode ?? "first";
     const useMd = (opts?.format ?? "markdown") === "markdown";
@@ -244,11 +258,13 @@ export class Outbound {
         if (destinationThreadId != null) fields.message_thread_id = destinationThreadId;
         const reply = this.#threadTarget(replyTo, replyMode, i);
         if (reply != null) fields.reply_parameters = JSON.stringify({ message_id: reply });
-        return tgUpload<{ message_id: number }>(
-          this.#token,
-          isPhoto ? "sendPhoto" : "sendDocument",
-          fields,
-          { field: isPhoto ? "photo" : "document", path: file },
+        return this.#rateLimited(() =>
+          tgUpload<{ message_id: number }>(
+            this.#token,
+            isPhoto ? "sendPhoto" : "sendDocument",
+            fields,
+            { field: isPhoto ? "photo" : "document", path: file },
+          ),
         );
       };
       try {
@@ -327,17 +343,25 @@ export class Outbound {
 
   async #streamEdit(st: ChatState, text: string): Promise<void> {
     const access = this.#getAccess();
+    const mode = access.chunkMode ?? "newline";
     const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
+    // A committed segment gets an `(i/n)` label once the total is known, so cut
+    // one label short of the budget — for the preview too, so both agree on
+    // where the segment ends.
+    const segBudget = budget - PART_LABEL_RESERVE;
+    const seg = text.slice(st.sentUpTo);
     if (st.previewMsgId != null && text.length - st.sentUpTo > budget) {
-      // Overflow: finalize the current preview at a source boundary, start fresh.
-      const seg = text.slice(st.sentUpTo);
-      const head = seg.slice(0, this.#boundary(seg, budget, access.chunkMode ?? "newline"));
+      // Overflow: commit the current preview at a source boundary, start fresh.
+      const head = seg.slice(0, this.#boundary(seg, segBudget, mode));
+      const messageId = st.previewMsgId;
       await this.#finalizePreview(st, head, true);
       st.sentUpTo += head.length;
+      st.committed.push({ messageId, text: head });
       st.previewMsgId = undefined;
       return; // remainder rendered as a new preview on the next update
     }
-    const body = text.slice(st.sentUpTo) + CURSOR;
+    // The first preview of a turn can already exceed the budget (a fast first burst).
+    const body = seg.slice(0, this.#boundary(seg, segBudget, mode)) + CURSOR;
     if (st.previewMsgId == null) {
       const sent = await tg<{ message_id: number }>(this.#token, "sendMessage", {
         chat_id: st.chatId,
@@ -363,16 +387,22 @@ export class Outbound {
   /** Finalize a live preview: MarkdownV2 attempt then plain fallback, cursor removed. */
   async #finalizePreview(st: ChatState, text: string, useMd: boolean): Promise<void> {
     if (st.previewMsgId == null) return;
-    const id = st.previewMsgId;
+    await this.#editDelivered(st.chatId, st.previewMsgId, text, useMd);
+  }
+
+  /** Edit an already-delivered message: MarkdownV2 attempt then plain fallback. */
+  async #editDelivered(chatId: string, messageId: number, text: string, useMd: boolean): Promise<void> {
     if (useMd) {
       try {
-        await tg(this.#token, "editMessageText", { chat_id: st.chatId, message_id: id, text: mdToMarkdownV2(text), parse_mode: "MarkdownV2" });
+        await this.#rateLimited(() =>
+          tg(this.#token, "editMessageText", { chat_id: chatId, message_id: messageId, text: mdToMarkdownV2(text), parse_mode: "MarkdownV2" }),
+        );
         return;
       } catch (err) {
         if (isMissingThreadError(err) || !(err instanceof TgError && err.code === 400)) throw err;
       }
     }
-    await tg(this.#token, "editMessageText", { chat_id: st.chatId, message_id: id, text });
+    await this.#rateLimited(() => tg(this.#token, "editMessageText", { chat_id: chatId, message_id: messageId, text }));
   }
 
   /** Finalize one turn into real message(s), then reset per-turn state. */
@@ -381,13 +411,20 @@ export class Outbound {
     const access = this.#getAccess();
     const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
     const mode = access.chunkMode ?? "newline";
+    const prior = st.committed.length;
     try {
       if (st.previewMsgId != null) {
-        const parts = chunk(fullText.slice(st.sentUpTo), budget, mode);
-        await this.#finalizePreview(st, parts[0] ?? fullText.slice(st.sentUpTo), true);
+        const rest = fullText.slice(st.sentUpTo);
+        const parts = chunkLabeled(rest, budget, mode, prior);
+        await this.#finalizePreview(st, parts[0] ?? rest, true);
         for (let i = 1; i < parts.length; i++) await this.#sendOne(st.chatId, parts[i], true, undefined, st.threadId);
+        await this.#labelCommitted(st, prior + Math.max(parts.length, 1));
       } else {
-        for (const part of chunk(fullText, budget, mode)) await this.#sendOne(st.chatId, part, true, undefined, st.threadId);
+        // `sentUpTo` is non-zero when stream overflow already committed a head
+        // message this turn — resending from 0 would duplicate it.
+        const parts = chunkLabeled(fullText.slice(st.sentUpTo), budget, mode, prior);
+        for (const part of parts) await this.#sendOne(st.chatId, part, true, undefined, st.threadId);
+        await this.#labelCommitted(st, prior + parts.length);
         if (st.draftId != null) {
           // Clear the ephemeral draft so it doesn't linger beside the real message.
           await tg(this.#token, "sendMessageDraft", {
@@ -405,7 +442,8 @@ export class Outbound {
           if (replacement != null) {
             st.previewMsgId = undefined;
             st.draftId = undefined;
-            st.sentUpTo = 0;
+            st.sentUpTo = 0; // the old topic is gone — redeliver the whole answer
+            st.committed = [];
             await this.#finalize(st, fullText, false);
             return;
           }
@@ -416,6 +454,20 @@ export class Outbound {
       this.#log?.warn(`[telegram] finalize failed ${st.chatId}: ${String(err)}`);
     } finally {
       this.#resetTurn(st);
+    }
+  }
+
+  /**
+   * Backfill `(i/n)` on the segments committed mid-stream: their number is only
+   * known once the turn ends, so the label is edited in afterwards. A failed
+   * relabel costs a label, never content.
+   */
+  async #labelCommitted(st: ChatState, total: number): Promise<void> {
+    if (total < 2) return;
+    for (const [i, part] of st.committed.entries()) {
+      await this.#editDelivered(st.chatId, part.messageId, `(${i + 1}/${total})\n${part.text}`, true).catch((err) =>
+        this.#log?.debug(`[telegram] relabel ${st.chatId}#${part.messageId} failed: ${String(err)}`),
+      );
     }
   }
 
@@ -441,20 +493,42 @@ export class Outbound {
     const thread = threadId != null ? { message_thread_id: threadId } : {};
     if (useMd) {
       try {
-        const sent = await tg<{ message_id: number }>(this.#token, "sendMessage", {
-          chat_id: chatId,
-          text: mdToMarkdownV2(text),
-          parse_mode: "MarkdownV2",
-          ...thread,
-          ...reply,
-        });
+        const sent = await this.#rateLimited(() =>
+          tg<{ message_id: number }>(this.#token, "sendMessage", {
+            chat_id: chatId,
+            text: mdToMarkdownV2(text),
+            parse_mode: "MarkdownV2",
+            ...thread,
+            ...reply,
+          }),
+        );
         return sent.message_id;
       } catch (err) {
         if (isMissingThreadError(err) || !(err instanceof TgError && err.code === 400)) throw err;
       }
     }
-    const sent = await tg<{ message_id: number }>(this.#token, "sendMessage", { chat_id: chatId, text, ...thread, ...reply });
+    const sent = await this.#rateLimited(() =>
+      tg<{ message_id: number }>(this.#token, "sendMessage", { chat_id: chatId, text, ...thread, ...reply }),
+    );
     return sent.message_id;
+  }
+
+  /**
+   * Retry a delivery Telegram rate-limited. Without this a 429 on part 2 of a
+   * split answer throws, `#finalize` swallows it, and the reader silently keeps
+   * a truncated answer.
+   */
+  async #rateLimited<T>(op: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await op();
+      } catch (err) {
+        const retryAfter = err instanceof TgError && (err.retryAfter != null || err.code === 429) ? (err.retryAfter ?? 1) : undefined;
+        if (retryAfter == null || attempt >= RATE_LIMIT_RETRIES) throw err;
+        this.#log?.debug(`[telegram] rate limited — retrying in ${retryAfter}s`);
+        await this.#sleep(Math.min(retryAfter * 1000 + 250, MAX_RETRY_WAIT_MS));
+      }
+    }
   }
 
   #onStreamError(st: ChatState, err: unknown): void {
@@ -500,7 +574,7 @@ export class Outbound {
     const key = targetKey(chatId, threadId);
     let st = this.#chats.get(key);
     if (!st) {
-      st = { chatId, threadId, acc: "", sentUpTo: 0, lastEditAt: 0, dirty: false, busy: false };
+      st = { chatId, threadId, acc: "", sentUpTo: 0, committed: [], lastEditAt: 0, dirty: false, busy: false };
       this.#chats.set(key, st);
     }
     return st;
@@ -511,6 +585,7 @@ export class Outbound {
     st.previewMsgId = undefined;
     st.acc = "";
     st.sentUpTo = 0;
+    st.committed = [];
     st.lastEditAt = 0;
     st.dirty = false;
   }
