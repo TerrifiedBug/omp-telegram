@@ -283,13 +283,16 @@ describe("Outbound long answers", () => {
     outbound.shutdown();
   });
 
-  test("an overflowed stream preview is not resent when the turn ends", async () => {
-    const delivered: Array<{ method: string; text: string }> = [];
+  test("an overflowed stream turn reads as one numbered answer, delivered once", async () => {
+    // Model the chat: sends append a message, edits replace one in place.
+    const chat = new Map<number, string>();
+    let nextId = 60;
     globalThis.fetch = (async (url, init) => {
       const method = String(url).split("/").pop()!;
       const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      if (method === "sendMessage" || method === "editMessageText") delivered.push({ method, text: String(payload.text) });
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 53 } }), { status: 200 });
+      if (method === "sendMessage") chat.set(++nextId, String(payload.text));
+      if (method === "editMessageText") chat.set(Number(payload.message_id), String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: nextId } }), { status: 200 });
     }) as typeof fetch;
 
     const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["-100"], streaming: true }));
@@ -306,10 +309,11 @@ describe("Outbound long answers", () => {
     await outbound.onTurnEnd(assistant(text));
     await outbound.onAgentEnd();
 
-    // The committed head plus the labelled remainder — every source char exactly once.
-    const finalized = delivered.filter((call) => !call.text.endsWith("\u258f"));
-    expect(finalized.map((call) => call.method)).toEqual(["editMessageText", "sendMessage", "sendMessage"]);
-    expect(finalized.map((call) => unlabel(call.text)).join("")).toBe(text);
+    const messages = [...chat.values()];
+    expect(messages.length).toBe(3);
+    // The head committed mid-stream is numbered too, once the total is known.
+    expect(messages.map((m) => /^\\\((\d)\/(\d)\\\)\n/.exec(m)?.slice(1).join("/"))).toEqual(["1/3", "2/3", "3/3"]);
+    expect(messages.map(unlabel).join("")).toBe(text); // every source char exactly once
     outbound.shutdown();
   });
 });
