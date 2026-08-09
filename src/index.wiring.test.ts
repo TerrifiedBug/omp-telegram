@@ -13,11 +13,18 @@ type ToolShape = {
   name: string;
   execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
 };
+type Harness = {
+  tools: Map<string, ToolShape>;
+  commands: Map<string, { handler: CommandHandler }>;
+  handlers: Map<string, EventHandler[]>;
+  setActiveCalls: string[][];
+  active: () => string[];
+};
 
 // A structural fake ExtensionAPI that captures registrations and tool-set
 // mutations so we can drive the real extension handlers without a live bridge.
 // These are runtime-populated collections keyed dynamically, hence Map.
-function harness(initialTools: string[]) {
+function harness(initialTools: string[]): Harness {
   const tools = new Map<string, ToolShape>();
   const commands = new Map<string, { handler: CommandHandler }>();
   const handlers = new Map<string, EventHandler[]>();
@@ -57,20 +64,36 @@ function harness(initialTools: string[]) {
 }
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
+const previousToken = process.env.TELEGRAM_BOT_TOKEN;
 let dir: string;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "omp-tg-wiring-"));
   process.env.OMP_TELEGRAM_STATE_DIR = dir;
+  delete process.env.TELEGRAM_BOT_TOKEN; // a real token in the dev environment must never leak into these tests
 });
 afterEach(() => {
   if (previousStateDir === undefined) delete process.env.OMP_TELEGRAM_STATE_DIR;
   else process.env.OMP_TELEGRAM_STATE_DIR = previousStateDir;
+  if (previousToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+  else process.env.TELEGRAM_BOT_TOKEN = previousToken;
   rmSync(dir, { recursive: true, force: true });
 });
 
 function writeAccess(over: Partial<Access>): void {
   writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), ...over }));
+}
+
+/**
+ * Bring the extension's in-session bot token online — the gate that decides
+ * whether telegram_ask can be mounted — without touching the network: a
+ * daemon record for this (live) pid makes startBot skip both the daemon spawn
+ * and the getMe/poll launch.
+ */
+async function startBridge(h: Harness): Promise<void> {
+  writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+  writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: "test", startedAt: Date.now() }));
+  await h.handlers.get("session_start")?.[0]?.({ type: "session_start" }, { hasUI: true, ui: { notify() {} } });
 }
 
 describe("extension wiring", () => {
@@ -102,6 +125,32 @@ describe("extension wiring", () => {
     await beforeStart?.({ type: "before_agent_start", prompt: "just do the thing", systemPrompt: [] }, {});
     expect(h.setActiveCalls.every((call) => !call.includes("telegram_ask"))).toBe(true);
     expect(h.active()).toContain("ask");
+  });
+
+  test("before_agent_start mounts telegram_ask alongside ask on a locally injected turn once the bridge is live", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] }); // notifyMode off, no notifyChat — the reported conductor state
+    const h = harness(["ask", "read"]);
+    await startBridge(h);
+    await h.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "scheduled tick", systemPrompt: [] }, {});
+    const mounted = h.setActiveCalls.at(-1);
+    expect(mounted).toContain("telegram_ask"); // discovery: the tool's own no-surface guard replaces `No such tool`
+    expect(mounted).toContain("ask"); // ...but a local turn keeps the native ask; only away/always and Telegram turns swap
+  });
+
+  test("before_agent_start adds no away nudge when telegram_ask is merely mounted", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const result = await h.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "scheduled tick", systemPrompt: [] }, {});
+    expect(result).toBeUndefined();
+  });
+
+  test("before_agent_start still leaves telegram_ask unmounted when no owner is paired", async () => {
+    writeAccess({ enabled: true, allowFrom: [] });
+    const h = harness(["ask", "read"]);
+    await startBridge(h);
+    await h.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "scheduled tick", systemPrompt: [] }, {});
+    expect(h.setActiveCalls.every((call) => !call.includes("telegram_ask"))).toBe(true);
   });
 
   test("/away toggles away mode on and off in access.json", async () => {
@@ -283,5 +332,38 @@ describe("telegram_ask execute (dual-surface)", () => {
     expect(receivedOptions).toEqual([]); // normalized to [], never undefined, at the tool boundary
     expect(res.isError).toBeUndefined();
     expect(res.content[0].text).toContain("go with A");
+  });
+
+  test("a headless turn with no resolved target asks the paired owner's DM", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] }); // notify off: nothing pre-resolves a target
+    const h = harness(["ask"]);
+    await startBridge(h);
+    await h.handlers.get("before_agent_start")?.[0]?.({ type: "before_agent_start", prompt: "scheduled tick", systemPrompt: [] }, {});
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const stop = new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ method: String(input).split("/").pop()!, body: JSON.parse(String(init?.body ?? "{}")) });
+      stop.abort(); // the question is posted, then the turn stops — enough to prove where it went
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, stop.signal, undefined, { hasUI: false });
+      expect(res.isError).toBe(true); // aborted, not "no surface available"
+      expect(res.content[0].text).not.toContain("no surface available");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(calls[0]?.method).toBe("sendMessage");
+    expect(calls[0]?.body.chat_id).toBe("42");
+  });
+
+  test("a headless turn with no paired owner still reports the no-surface diagnostic", async () => {
+    writeAccess({ enabled: true, allowFrom: [] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, { hasUI: false });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("no surface available");
   });
 });

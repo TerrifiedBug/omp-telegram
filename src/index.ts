@@ -1738,7 +1738,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     name: "telegram_ask",
     label: "Telegram Ask",
     description:
-      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; use it exactly as you would use ask.",
+      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; when both are offered you are at the terminal, so prefer ask unless the question should also reach Telegram. Use it exactly as you would use ask.",
     approval: "read",
     defaultInactive: true,
     parameters: T.Object({
@@ -1764,8 +1764,19 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     async execute(_id, params, signal, _onUpdate, ctx) {
       const p = params as AskParams;
       const questions: PromptQuestion[] = p.questions.map((q) => ({ ...q, options: q.options ?? [] }));
-      const target = activePromptTarget ? { ...activePromptTarget } : undefined;
       const canTerminal = ctx?.hasUI === true && typeof ctx.ui?.askDialog === "function";
+      let resolved = activePromptTarget ? { ...activePromptTarget } : undefined;
+      if (!resolved && !canTerminal && token.length > 0) {
+        // Headless turn the bridge never resolved a destination for (a locally
+        // injected or scheduled prompt with notify off). Telegram is the only
+        // surface left, so fall back to the destination telegram_send already
+        // uses: this session's topic, else the paired owner's DM.
+        const a = loadAccess(warn);
+        const ownerId = pairedOwnerId(a);
+        const own = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
+        resolved = buildPromptTarget(own ?? (ownerId ? { chatId: ownerId } : undefined), a);
+      }
+      const target = resolved;
       if (!target && !canTerminal) {
         return errorResult("telegram_ask has no surface available — no Telegram target and no interactive terminal.");
       }
@@ -1979,26 +1990,30 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   pi.on("before_agent_start", async (event) => {
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
+    const a = loadAccess(warn);
     // Terminal-originated turn while away/always: route `ask` to Telegram too,
     // reusing the same swap. buildPromptTarget returns undefined (leaving native
     // `ask` untouched) when there is no answerable owner destination.
     let target = telegramTarget;
-    if (!target) {
-      const a = loadAccess(warn);
-      if (a.notifyMode === "away" || a.notifyMode === "always") {
-        const own = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
-        target = buildPromptTarget(notifyTarget(false, a, token.length > 0, own), a);
-      }
+    if (!target && (a.notifyMode === "away" || a.notifyMode === "always")) {
+      const own = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
+      target = buildPromptTarget(notifyTarget(false, a, token.length > 0, own), a);
     }
-    if (!target) {
+    // Mounting is discovery, not enforcement: whenever the bridge can reach the
+    // paired owner, keep telegram_ask available even for a turn with no
+    // pre-resolved target (a locally injected/scheduled prompt) so the tool's own
+    // surface check runs instead of the model seeing `No such tool`. Only a
+    // Telegram-originated or away/always turn displaces the native `ask`.
+    if (!target && !(token.length > 0 && pairedOwnerId(a))) {
       await restorePromptTools();
       return;
     }
     activePromptTarget = target;
     if (!savedPromptTools) savedPromptTools = pi.getActiveTools();
-    const tools = savedPromptTools.filter((name) => name !== "ask" && name !== "telegram_ask");
+    const tools = savedPromptTools.filter((name) => name !== "telegram_ask" && !(target && name === "ask"));
     tools.push("telegram_ask");
     await pi.setActiveTools(tools);
+    if (!target) return; // mounted alongside `ask`; no nudge — the user is at the terminal
     return {
       systemPrompt: [
         ...event.systemPrompt,
