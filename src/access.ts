@@ -8,6 +8,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
+import { TELEGRAM_MAX_CHARS } from "./markdown";
 
 export type PendingEntry = {
   senderId: string;
@@ -67,6 +68,15 @@ export type Access = {
    */
   notifyMode?: "away" | "always";
 };
+
+/**
+ * Per-message character budget for this config, clamped to Telegram's cap.
+ * Every outbound text path splits against this, so a long reply is never
+ * rejected whole or silently cut.
+ */
+export function messageLimit(access: Access): number {
+  return Math.max(1, Math.min(access.textChunkLimit ?? TELEGRAM_MAX_CHARS, TELEGRAM_MAX_CHARS));
+}
 
 // Structural contract for what `gate()`/`isMentioned()` read off a Bot API
 // message. The full wire type in api.ts (TgMessage) satisfies this. Kept local

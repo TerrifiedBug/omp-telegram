@@ -7,8 +7,9 @@ import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Access } from "./access";
-import { controlTopicTarget, isPairedOwnerDm, pairedOwnerId } from "./access";
+import { controlTopicTarget, isPairedOwnerDm, messageLimit, pairedOwnerId } from "./access";
 import type { TgCallbackQuery, TgMessage } from "./api";
+import { chunkLabeled } from "./markdown";
 import type { ThreadEntry, ThreadRegistry } from "./topics";
 
 export type RunHerdr = (args: readonly string[]) => Promise<string>;
@@ -356,7 +357,12 @@ export interface CommandMessageOptions {
   warn?: (message: string) => void;
 }
 
-/** Send a global command result home to omp control, with safe origin fallback. */
+/**
+ * Send a global command result home to omp control, with safe origin fallback.
+ * A listing longer than one Telegram message (`/sessions`, `/cleanup` previews)
+ * is split into numbered parts; the keyboard rides the last one, which is also
+ * the message returned for picker bookkeeping.
+ */
 export async function sendCommandMessage(options: CommandMessageOptions): Promise<TgMessage | undefined> {
   const { access, callTelegram, msg, text, replyMarkup } = options;
   const warn = options.warn ?? (() => undefined);
@@ -365,22 +371,28 @@ export async function sendCommandMessage(options: CommandMessageOptions): Promis
     ...(msg.is_topic_message && msg.message_thread_id != null ? { message_thread_id: msg.message_thread_id } : {}),
   };
   const control = options.useControlTopic === false ? undefined : controlTopicTarget(access);
+  const parts = chunkLabeled(text, messageLimit(access), access.chunkMode ?? "newline");
+  if (parts.length === 0) return undefined;
+  const deliver = async (target: Record<string, unknown>): Promise<TgMessage> => {
+    let last: TgMessage | undefined;
+    for (const [i, part] of parts.entries()) {
+      last = await callTelegram<TgMessage>("sendMessage", {
+        ...target,
+        text: part,
+        ...(replyMarkup && i === parts.length - 1 ? { reply_markup: replyMarkup } : {}),
+      });
+    }
+    return last as TgMessage; // parts is non-empty, so the loop always assigns
+  };
+
   let sent: TgMessage;
   try {
-    sent = await callTelegram<TgMessage>("sendMessage", {
-      ...(control ? { chat_id: control.chatId, message_thread_id: control.threadId } : origin),
-      text,
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    });
+    sent = await deliver(control ? { chat_id: control.chatId, message_thread_id: control.threadId } : origin);
   } catch (err) {
     warn(`command reply failed: ${String(err)}`);
     if (!control) return undefined;
     try {
-      return await callTelegram<TgMessage>("sendMessage", {
-        ...origin,
-        text,
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-      });
+      return await deliver(origin);
     } catch (fallbackErr) {
       warn(`command reply fallback failed: ${String(fallbackErr)}`);
       return undefined;

@@ -6,7 +6,7 @@
 
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
-import { type Access, assertSendable } from "./access";
+import { type Access, assertSendable, messageLimit } from "./access";
 import { isMissingThreadError, type Logger, TgError, tg, tgUpload } from "./api";
 import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, chunkLabeled, mdToMarkdownV2 } from "./markdown";
 
@@ -215,7 +215,7 @@ export class Outbound {
   /** Send text to a chat, chunked + MarkdownV2 (plain fallback on parse error). Returns message ids. */
   async send(chatId: string, text: string, opts?: { replyTo?: number; format?: "text" | "markdown"; threadId?: number }): Promise<number[]> {
     const access = this.#getAccess();
-    const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
+    const budget = messageLimit(access) - MARKDOWN_HEADROOM;
     const parts = chunkLabeled(text, budget, access.chunkMode ?? "newline");
     if (parts.length === 0) return [];
     const replyMode = access.replyToMode ?? "first";
@@ -344,7 +344,7 @@ export class Outbound {
   async #streamEdit(st: ChatState, text: string): Promise<void> {
     const access = this.#getAccess();
     const mode = access.chunkMode ?? "newline";
-    const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
+    const budget = messageLimit(access) - MARKDOWN_HEADROOM;
     // A committed segment gets an `(i/n)` label once the total is known, so cut
     // one label short of the budget — for the preview too, so both agree on
     // where the segment ends.
@@ -409,7 +409,7 @@ export class Outbound {
   async #finalize(st: ChatState, fullText: string, allowRecovery = true): Promise<void> {
     if (st.inflight) await st.inflight.catch(() => {}); // barrier: let any in-flight push settle
     const access = this.#getAccess();
-    const budget = this.#chunkLimit(access) - MARKDOWN_HEADROOM;
+    const budget = messageLimit(access) - MARKDOWN_HEADROOM;
     const mode = access.chunkMode ?? "newline";
     const prior = st.committed.length;
     try {
@@ -543,10 +543,6 @@ export class Outbound {
   #threadTarget(replyTo: number | undefined, mode: "off" | "first" | "all", index: number): number | undefined {
     if (replyTo == null || mode === "off") return undefined;
     return mode === "all" || index === 0 ? replyTo : undefined;
-  }
-
-  #chunkLimit(access: Access): number {
-    return Math.max(1, Math.min(access.textChunkLimit ?? TELEGRAM_MAX_CHARS, TELEGRAM_MAX_CHARS));
   }
 
   #startTyping(st: ChatState): void {

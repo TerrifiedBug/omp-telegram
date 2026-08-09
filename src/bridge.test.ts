@@ -346,6 +346,44 @@ describe("cleanup command", () => {
     });
     expect(calls.some((c) => c.method === "answerCallbackQuery" && String(c.payload.text).includes("This cleanup expired"))).toBe(true);
   });
+
+  test("an oversized preview splits, keeps the keyboard on the last part, and stays tappable", async () => {
+    // 200 stale topics is an ordinary long-lived bridge; the listing is unbounded.
+    const threads: Record<string, { pid: number; cwd: string; name: string; claimedAt: number }> = {};
+    for (let i = 0; i < 200; i++) {
+      threads[String(200 + i)] = { pid: 999999, cwd: `/work/project-${i}`, name: `project-${i}`, claimedAt: 1 };
+    }
+    saveRegistry({ version: 1, chatId: "42", threads });
+
+    const sends: Array<{ id: number; payload: Record<string, unknown> }> = [];
+    const host = makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method !== "sendMessage") return undefined;
+        const id = 700 + sends.length;
+        sends.push({ id, payload });
+        return { message_id: id, date: 1, chat: { id: 42, type: "private" } };
+      }) as unknown as TelegramCall, // test double: mixed return branches
+    });
+    await handleUpdate(host, { update_id: 50, message: message("/cleanup") });
+
+    // The reply lands in the control topic; the origin gets a one-line redirect notice.
+    const parts = sends.filter((send) => Number(send.payload.message_thread_id) === 99);
+    expect(parts.length).toBeGreaterThan(1); // a single sendMessage would have been rejected as too long
+    expect(parts.every((send) => String(send.payload.text).length <= 4096)).toBe(true);
+    expect(parts.slice(0, -1).every((send) => send.payload.reply_markup === undefined)).toBe(true);
+
+    // The picker is bound to the part that carries the buttons, so the tap still works.
+    const keyboardPart = parts.at(-1)!;
+    const confirm = keyboardOf(keyboardPart)[0][0].callback_data;
+    calls.length = 0;
+    await handleUpdate(host, {
+      update_id: 51,
+      callback_query: { id: "cb6", from: { id: 42 }, data: confirm, message: { message_id: keyboardPart.id, chat: { id: 42, type: "private" } } },
+    });
+    expect(calls.filter((c) => c.method === "deleteForumTopic")).toHaveLength(200);
+    expect(Object.keys(loadRegistry().threads)).toEqual([]);
+  });
 });
 
 describe("bot command surface", () => {
