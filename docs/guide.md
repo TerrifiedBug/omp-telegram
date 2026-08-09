@@ -242,7 +242,11 @@ count as a mention.
   free-text question the user answers by replying with a message. It replaces `ask` on
   Telegram-originated turns and while away/always mode is on, showing the
   question on both the terminal and Telegram at once and returning whichever the
-  user answers first. Requests are responder-, chat-, topic-, message-, and
+  user answers first. Otherwise it stays mounted alongside `ask` whenever the
+  bridge is running with a paired owner, so a locally injected turn (a scheduled
+  tick, an extension-composed prompt) can still reach Telegram: with no terminal
+  to ask at, the question goes to this session's topic, else the owner's DM.
+  Requests are responder-, chat-, topic-, message-, and
   nonce-bound, stay answerable while the owning session runs, and use the shared
   state directory for cross-process answers.
 
