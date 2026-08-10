@@ -8,7 +8,7 @@ Telegram in real time. One paired DM owner controls the bridge; optional group
 chat access remains separately configured from the terminal, never by the model.
 
 - **Inbound:** DMs / group mentions → injected as `<telegram-message …>` user turns (photos attached inline; other files downloaded to an inbox).
-- **Outbound:** assistant output streams live — native message **drafts** for DMs (Bot API 9.3+), **edited-message** previews for groups — then one finalized MarkdownV2 message per turn.
+- **Outbound:** assistant output streams live — native message **drafts** for DMs (Bot API 9.3+), **edited-message** previews for groups — then one finalized MarkdownV2 message per turn. A headless host can turn all of that off with `set profile daemon`, leaving `telegram_send` / `telegram_ask` as the only way out.
 - **Control:** local `/telegram` configuration, owner-only Telegram commands (`/spawn`, `/sessions`, `/cleanup`, `/stop`, `/status`), and three model tools (`telegram_send`, `telegram_react`, `telegram_ask`).
 - **Zero runtime dependencies** — the raw Bot API over Bun's `fetch`/`FormData`.
 
@@ -166,7 +166,8 @@ configured groups never receive process-spawning authority.
 
 | Key | Values | Default |
 |---|---|---|
-| `streaming` | `true` (live preview) \| `false` (per turn) \| `final` (last message only) | `true` |
+| `streaming` | `true` (live preview) \| `false` (per turn) \| `final` (last message only) \| `explicit` (nothing automatic) | `true` |
+| `profile` | `daemon` (headless host: forces `explicit`, no idle notify post, `telegram_ask` always on) \| `default` | `default` |
 | `deliverAs` | `steer` \| `followUp` — how inbound queues while the agent is busy | `followUp` |
 | `chunkMode` | `length` \| `newline` | `newline` |
 | `textChunkLimit` | `1`–`4096` | `4096` |
@@ -277,10 +278,18 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 - **Groups** (and draft-unsupported DMs) send a preview message and edit it in
   place with a `▍` cursor, throttled and split when it would exceed 4096 chars.
 - Each assistant **turn** finalizes into its own real Telegram message, so a
-  multi-step run reads as a sequence of messages. Two settings trim this.
+  multi-step run reads as a sequence of messages. Three settings trim this.
   `set streaming false` keeps one message per turn but drops the live preview.
   `set streaming final` drops both and sends only the run's last message once
-  the agent finishes. The typing indicator still runs in `final` mode.
+  the agent finishes. `set streaming explicit` sends **nothing** on its own: text
+  reaches Telegram only when the model calls `telegram_send` or `telegram_ask`.
+  The typing indicator still runs in `final` and `explicit` modes.
+- `explicit` is deliberately silent rather than best-effort. It has no
+  end-of-run fallback, because the run most likely to lack an explicit send is
+  one a message steered into mid-task, where the last visible text is that
+  task's closing line and not an answer to anyone. A missing reply is visible to
+  the person waiting and can be asked again; a leaked internal turn cannot be
+  recalled. Ask for an answer, not a transcript.
 - Any reply too long for one Telegram message (4096 chars, or `textChunkLimit`)
   is split at a paragraph, line, or word boundary (`chunkMode`) and each part is
   prefixed `(i/n)`, so it arrives complete and in order rather than cut off.
@@ -289,6 +298,30 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
   preview splits too, with the keyboard on the final part.
 - A part Telegram rate-limits (`429`) is retried up to three times, honouring
   `retry_after`, instead of dropping the rest of the answer.
+
+## Headless hosts (`profile daemon`)
+
+A host nobody is sitting at — a scheduler, a fleet orchestrator, anything whose
+runs are cron ticks rather than someone typing — wants the opposite defaults from
+a laptop. `/telegram set profile daemon` switches all of them at once:
+
+- **Output becomes explicit.** Forces `streaming: explicit`, so no live preview
+  and no per-turn message. Only `telegram_send` / `telegram_ask` reach the chat.
+  This is what stops a multi-step answer arriving as five messages, and stops a
+  message that lands mid-task from relaying the rest of that task's internal
+  turns.
+- **No idle post.** The end-of-run notification is suppressed, so a tick's
+  closing text stays on the host.
+- **`telegram_ask` is always mounted and aimed at the paired owner** — including
+  on a locally injected tick, which has no terminal to fall back to. Without
+  this, a scheduled turn that needed a decision found `ask` (which nobody can
+  answer) or no ask tool at all.
+
+It is one key rather than three so a host cannot end up half-configured, and it
+wins over a `streaming` value left in the file from before. `/telegram status`
+reports the mode actually in force plus the profile. Approval and blocked-input
+pings are unaffected: those mean something needs a human, which is the whole
+point of the bridge on a host like this.
 
 ## Notifications
 
@@ -308,7 +341,12 @@ nothing. Away mode opts one destination into mirroring for local runs:
   the desk.) Flipping away on *after* a run has already started applies from the
   next run; that in-flight run's `ask` falls back to a blocked ping (below).
 - **Idle** — a locally-started run finishes and the session goes idle: the bot
-  sends `✅ omp idle in <dir> — your turn.`
+  sends the run's final text, or `✅ omp idle in <dir> — your turn.` when it had
+  none. This is the one notification `set profile daemon` (and any `explicit`
+  streaming mode) turns off: on a host whose runs are scheduled ticks it relays
+  every run's closing prose, which is internal working text rather than anything
+  addressed to you. Ask prompts and blocked pings still fire — those are
+  "something needs you", not narration.
 - **Blocked (fallback)** — if a run parks on input that *can't* be mirrored (a
   tool approval, or an `ask` that started before away was on / has no answerable
   Telegram destination), the bot sends `[BLOCKED] omp is waiting for your input

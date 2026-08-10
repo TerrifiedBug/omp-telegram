@@ -153,6 +153,47 @@ describe("extension wiring", () => {
     expect(h.setActiveCalls.every((call) => !call.includes("telegram_ask"))).toBe(true);
   });
 
+  test("before_agent_start swaps ask -> telegram_ask on a scheduled tick under a daemon profile", async () => {
+    // The fleet state the profile exists for: a paired owner, a notify chat to
+    // reach them, and deliberately no notifyMode — which used to be required
+    // purely to keep telegram_ask answerable, arming the idle notify post as a
+    // side effect.
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    const h = harness(["ask", "read"]);
+    await startBridge(h);
+    const result = (await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "scheduled tick", systemPrompt: [] },
+      {},
+    )) as { systemPrompt: string[] } | undefined;
+    const mounted = h.setActiveCalls.at(-1);
+    expect(mounted).toContain("telegram_ask");
+    expect(mounted).not.toContain("ask"); // headless: there is no terminal to answer a native ask
+    expect(result?.systemPrompt.at(-1)).toContain("headless");
+  });
+
+  test("agent_end posts no idle notify text under a daemon profile", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const sent: string[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 60 } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "tick complete" }] }] },
+        { isIdle: () => true, ui: { notify() {} }, sessionManager: { getSessionFile: () => undefined } },
+      );
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+    expect(sent).toEqual([]);
+  });
+
   test("/away toggles away mode on and off in access.json", async () => {
     writeAccess({ allowFrom: ["42"], notifyChat: "42" });
     const h = harness(["ask"]);

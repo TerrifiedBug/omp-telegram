@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { type Access, notifyTarget, defaultAccess, loadAccess, saveAccess } from "./access";
+import { type Access, effectiveStreaming, notifyTarget, defaultAccess, loadAccess, saveAccess } from "./access";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,29 @@ describe("notifyTarget", () => {
 
   test("skips when a mode is active but no target is configured", () => {
     expect(notifyTarget(false, mk({ notifyMode: "always" }), true)).toBeUndefined();
+  });
+
+  test("a daemon profile is a destination on its own — a headless host has no terminal to ask on", () => {
+    // Requiring notifyMode here is what made the fleet set it purely to keep
+    // telegram_ask answerable, which armed the idle notify post as a side effect.
+    expect(notifyTarget(false, mk({ profile: "daemon", notifyChat: "123" }), true)).toEqual({ chatId: "123" });
+    expect(notifyTarget(false, mk({ profile: "daemon" }), true)).toBeUndefined(); // still needs somewhere to land
+    expect(notifyTarget(true, mk({ profile: "daemon", notifyChat: "123" }), true)).toBeUndefined();
+    expect(notifyTarget(false, mk({ profile: "daemon", notifyChat: "123" }), false)).toBeUndefined();
+  });
+});
+
+describe("effectiveStreaming", () => {
+  test("defaults to full streaming and passes through explicit modes", () => {
+    expect(effectiveStreaming(mk({}))).toBe(true);
+    expect(effectiveStreaming(mk({ streaming: false }))).toBe(false);
+    expect(effectiveStreaming(mk({ streaming: "final" }))).toBe("final");
+    expect(effectiveStreaming(mk({ streaming: "explicit" }))).toBe("explicit");
+  });
+
+  test("a daemon profile overrides a louder streaming value left over from before it", () => {
+    expect(effectiveStreaming(mk({ profile: "daemon", streaming: true }))).toBe("explicit");
+    expect(effectiveStreaming(mk({ profile: "daemon" }))).toBe("explicit");
   });
 });
 
@@ -85,5 +108,27 @@ describe("loadAccess field preservation", () => {
   test("legacy away:false migrates to notify off", () => {
     writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), away: false }));
     expect(loadAccess().notifyMode).toBeUndefined();
+  });
+
+  test("round-trips the streaming mode and daemon profile", () => {
+    saveAccess({ ...defaultAccess(), streaming: "explicit", profile: "daemon" });
+    const a = loadAccess();
+    expect(a.streaming).toBe("explicit");
+    expect(a.profile).toBe("daemon");
+  });
+
+  // Both keys decide whether assistant text auto-relays, so an unrecognised
+  // value must not fall through to the noisiest default: a hand-typed
+  // `"explict"` is truthy, and passed through raw it selected full streaming.
+  test("drops unrecognised streaming and profile values instead of trusting them", () => {
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), streaming: "explict", profile: "DAEMON" }));
+    const typo = loadAccess();
+    expect(typo.streaming).toBeUndefined();
+    expect(typo.profile).toBeUndefined();
+
+    writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), streaming: 1, profile: true }));
+    const junk = loadAccess();
+    expect(junk.streaming).toBeUndefined();
+    expect(junk.profile).toBeUndefined();
   });
 });

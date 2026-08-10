@@ -3,10 +3,14 @@
 // draft-unsupported), finalizes one real message per agent turn, and exposes
 // send/file/react helpers for the model tools. All Telegram I/O funnels through
 // here so the outbound-chat gate and formatting live in one place.
+//
+// How much of that is automatic depends on the configured mode
+// (`effectiveStreaming`): under `"explicit"` none of it is, and the send/file
+// helpers below are the only way text reaches Telegram.
 
 import { stat } from "node:fs/promises";
 import { extname } from "node:path";
-import { type Access, assertSendable, messageLimit } from "./access";
+import { type Access, assertSendable, effectiveStreaming, messageLimit } from "./access";
 import { isMissingThreadError, type Logger, TgError, tg, tgUpload, withRateLimit } from "./api";
 import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, chunkLabeled, mdToMarkdownV2 } from "./markdown";
 
@@ -136,8 +140,8 @@ export class Outbound {
 
   onMessageUpdate(message: unknown): void {
     if (!this.#token || this.#active.size === 0) return;
-    const streaming = this.#getAccess().streaming;
-    if (streaming === false || streaming === "final") return;
+    const streaming = effectiveStreaming(this.#getAccess());
+    if (streaming === false || streaming === "final" || streaming === "explicit") return;
     const text = assistantText(message);
     if (text.trim().length === 0) return;
     for (const key of this.#active) {
@@ -149,7 +153,9 @@ export class Outbound {
 
   async onTurnEnd(message: unknown): Promise<void> {
     if (!this.#token || this.#active.size === 0) return;
-    if (this.#getAccess().streaming === "final") return; // one message per run, delivered at agent end
+    const streaming = effectiveStreaming(this.#getAccess());
+    if (streaming === "final") return; // one message per run, delivered at agent end
+    if (streaming === "explicit") return; // nothing is automatic; the model sends or nobody hears
     const text = assistantText(message);
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
@@ -159,15 +165,27 @@ export class Outbound {
     }
   }
 
-  /** End of the whole run. In "final" mode deliver `finalText` here; otherwise flush any dirty stream. */
+  /**
+   * End of the whole run. In `"final"` mode deliver `finalText` here; in
+   * `"explicit"` mode deliver nothing at all; otherwise flush any dirty stream.
+   *
+   * `"explicit"` deliberately drops `finalText` rather than using it as a
+   * fallback for a run that never called `telegram_send`. The run that most
+   * needs a fallback is the one a message steered into mid-duty, and there
+   * `finalText` is not the answer — it is the closing line of whatever internal
+   * work was in flight. Sending it would reintroduce exactly the leak this mode
+   * exists to remove, so the mode stays silent and the discipline lives in the
+   * prompt: one `telegram_send` per answer.
+   */
   async onAgentEnd(finalText?: string): Promise<void> {
-    const finalOnly = this.#getAccess().streaming === "final";
+    const streaming = effectiveStreaming(this.#getAccess());
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
       if (!st) continue;
-      if (finalOnly) {
+      // "explicit" streams nothing, so there is never a dirty preview to flush.
+      if (streaming === "final") {
         if (finalText && finalText.trim().length > 0) await this.#finalize(st, finalText);
-      } else if (st.dirty) {
+      } else if (streaming !== "explicit" && st.dirty) {
         await this.#finalize(st, st.acc);
       }
       this.#stopTyping(st);
