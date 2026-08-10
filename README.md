@@ -117,7 +117,8 @@ Inside an omp session topic:
 - If its omp process was closed, send a normal message to queue it and resume
   the exact saved session in its original herdr space.
 
-Replies stream back while omp is working.
+Replies stream back while omp is working (unless the host is configured as a
+headless daemon — see below).
 
 ## Away mode (answer local runs from your phone)
 
@@ -132,6 +133,25 @@ stepping away, flip **away mode** so those runs reach your phone:
 - Pick the destination once with `/telegram notify <chat_id>` (or turn on
   per-session `/telegram topics`). `/telegram notify away | always | off` is the
   full surface; `always` is the standing "mirror even at my desk" mode.
+
+## Headless hosts
+
+On a machine nobody sits at — a scheduler, or a fleet orchestrator whose runs are
+cron ticks — the laptop defaults are backwards: every turn of a long task arrives
+as its own message, and each run's closing text gets posted when it goes idle.
+One key switches all of that:
+
+```text
+/telegram set profile daemon
+```
+
+Assistant text then never auto-relays: it reaches Telegram only when the agent
+calls `telegram_send` or `telegram_ask`, so an answer is one message and internal
+working text stays on the host. `telegram_ask` is also kept mounted and pointed at
+you on every turn, including scheduled ones, so a run that needs a decision can
+always reach you. Tool-approval and blocked-input pings still fire — those mean
+something needs a human. `/telegram status` shows the profile and the output mode
+actually in force.
 
 ## If something looks wrong
 

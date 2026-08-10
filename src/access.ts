@@ -47,9 +47,31 @@ export type Access = {
    * Outbound verbosity. `true` (default) = live draft/edit streaming plus a
    * finalized message per assistant turn; `false` = per-turn messages with no
    * live preview; `"final"` = suppress previews and per-turn messages, sending
-   * only the run's final message.
+   * only the run's final message; `"explicit"` = no automatic output at all —
+   * text reaches Telegram only through an explicit `telegram_send` /
+   * `telegram_ask` call.
+   *
+   * `"explicit"` exists for a session nobody is watching, where a per-turn
+   * relay is not a transcript but noise: every turn of a multi-step answer
+   * arrives as its own message, and a message steering into a long run keeps
+   * relaying that run's internal turns until it ends. It is deliberately
+   * silent rather than best-effort — an unsent answer is visible to the person
+   * waiting and can be asked again, while a leaked internal turn cannot be
+   * recalled.
    */
-  streaming?: boolean | "final";
+  streaming?: boolean | "final" | "explicit";
+  /**
+   * Headless-host contract, set via `/telegram set profile daemon`. Absent =
+   * `default` (an interactive laptop session).
+   *
+   * `daemon` is one key instead of three so a host cannot be half-configured:
+   * it forces `streaming: "explicit"`, suppresses the idle/final notify post
+   * that would otherwise relay every local run's closing text, and keeps
+   * `telegram_ask` mounted and aimed at the paired owner on every turn —
+   * including a locally injected cron tick, where a headless session has no
+   * terminal to fall back to.
+   */
+  profile?: "daemon";
   /** Optional argv template for voice-note transcription. Each `{file}` substring is replaced with the downloaded path. */
   transcribeCommand?: string[];
   /** Chat to ping when a locally-started run goes idle. Unset = off. Set via `/telegram notify`. */
@@ -76,6 +98,23 @@ export type Access = {
  */
 export function messageLimit(access: Access): number {
   return Math.max(1, Math.min(access.textChunkLimit ?? TELEGRAM_MAX_CHARS, TELEGRAM_MAX_CHARS));
+}
+
+/**
+ * The outbound verbosity actually in force, after the profile has its say.
+ *
+ * `profile: "daemon"` owns this decision rather than merely defaulting it: a
+ * headless host that also carries a stale `streaming: true` from before the
+ * profile existed must still be silent, and an operator who sets the profile
+ * should not have to know that a second key could contradict it. The raw
+ * `streaming` value is left untouched in the file, so clearing the profile
+ * restores whatever was configured before.
+ *
+ * Every outbound decision reads this, never `access.streaming` directly.
+ */
+export function effectiveStreaming(access: Access): boolean | "final" | "explicit" {
+  if (access.profile === "daemon") return "explicit";
+  return access.streaming ?? true;
 }
 
 // Structural contract for what `gate()`/`isMentioned()` read off a Bot API
@@ -167,11 +206,21 @@ export function controlTopicCreationChat(access: Access, dmTopicsAvailable: bool
 }
 
 /**
- * Resolve where a notification should land — a local run going idle, or a
- * blocked-input ping — or undefined when none should fire. Skips
- * Telegram-initiated runs (the user already sees the reply) and requires a
- * token plus an active notify mode. Targets this session's forum topic when
- * topics mode owns one, else the flat notifyChat.
+ * Resolve where a notification should land — a local run going idle, a
+ * blocked-input ping, or a `telegram_ask` prompt with no chat of its own — or
+ * undefined when none should fire. Skips Telegram-initiated runs (the user
+ * already sees the reply) and requires a token plus a reachable destination.
+ * Targets this session's forum topic when topics mode owns one, else the flat
+ * notifyChat.
+ *
+ * `profile: "daemon"` is a destination in its own right, alongside an active
+ * notify mode: on a headless host there is no terminal to fall back to, so a
+ * question that cannot resolve a target is a question that cannot be asked at
+ * all. Requiring `notifyMode` there made the fleet set it purely to keep
+ * `telegram_ask` alive, which in turn armed the idle/final notify post and
+ * relayed every local run's closing text to the operator. The profile
+ * separates the two: this stays a pure resolver, and the caller that posts
+ * idle text is the one that opts out (see the `agent_end` handler).
  */
 export function notifyTarget(
   wasTelegramActive: boolean,
@@ -179,7 +228,8 @@ export function notifyTarget(
   hasToken: boolean,
   ownTopic?: { chatId: string; threadId: number },
 ): { chatId: string; threadId?: number } | undefined {
-  if (wasTelegramActive || !hasToken || !access.notifyMode) return undefined;
+  if (wasTelegramActive || !hasToken) return undefined;
+  if (!access.notifyMode && access.profile !== "daemon") return undefined;
   if (ownTopic) return { chatId: ownTopic.chatId, threadId: ownTopic.threadId };
   if (access.notifyChat) return { chatId: access.notifyChat };
   return undefined;
@@ -208,6 +258,20 @@ export function loadAccess(warn?: (msg: string) => void): Access {
         : "away" in parsed && parsed.away === true
           ? "away"
           : undefined;
+    // Both of these decide whether assistant text auto-relays, so an
+    // unrecognised value must not be allowed to mean "whatever is loudest".
+    // Passed through raw, a hand-edited `streaming: "explict"` (or a value
+    // written by a newer build than this one) is truthy and lands on the full
+    // streaming default — the opposite of what was asked for. Narrow to the
+    // known members instead and let the defaults apply.
+    const streaming: Access["streaming"] =
+      parsed.streaming === true ||
+      parsed.streaming === false ||
+      parsed.streaming === "final" ||
+      parsed.streaming === "explicit"
+        ? parsed.streaming
+        : undefined;
+    const profile: Access["profile"] = parsed.profile === "daemon" ? "daemon" : undefined;
     return {
       enabled: parsed.enabled ?? false,
       dmPolicy: parsed.dmPolicy ?? "pairing",
@@ -220,7 +284,8 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       deliverAs: parsed.deliverAs,
-      streaming: parsed.streaming,
+      streaming,
+      profile,
       transcribeCommand: Array.isArray(parsed.transcribeCommand) && parsed.transcribeCommand.every((arg) => typeof arg === "string")
         ? parsed.transcribeCommand
         : undefined,

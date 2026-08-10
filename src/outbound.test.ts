@@ -190,6 +190,90 @@ describe("Outbound Telegram delivery", () => {
     expect(sent).toEqual([]);
     outbound.shutdown();
   });
+
+  test("streaming 'explicit' sends nothing automatically — not per turn, not at the end", async () => {
+    const sent: string[] = [];
+    const methods: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      methods.push(method);
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 50 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: "explicit" }));
+    outbound.setToken("secret");
+    outbound.markActive("42", 9);
+    outbound.onMessageUpdate(assistant("thinking out loud"));
+    await outbound.onTurnEnd(assistant("step one"));
+    await outbound.onTurnEnd(assistant("step two"));
+    // The end of the run is the leak that a final-text fallback would reopen: on a
+    // run a message steered into, the last visible text is the tick's own closing
+    // line, not an answer to anybody.
+    await outbound.onAgentEnd(finalAssistantText([assistant("step two"), assistant("tick complete")]));
+    expect(sent).toEqual([]);
+    expect(methods.filter((m) => m !== "sendChatAction")).toEqual([]);
+    expect(outbound.isActive()).toBe(false);
+    outbound.shutdown();
+  });
+
+  test("streaming 'explicit' still delivers an explicit send — the tool path is the whole point", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 51 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: "explicit" }));
+    outbound.setToken("secret");
+    outbound.markActive("42", 9);
+    await outbound.send("42", "the answer", { threadId: 9 });
+    await outbound.onTurnEnd(assistant("more internal work"));
+    await outbound.onAgentEnd("tick complete");
+    expect(sent).toEqual(["the answer"]);
+    outbound.shutdown();
+  });
+
+  test("profile 'daemon' forces explicit output over a stale streaming value", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 52 } }), { status: 200 });
+    }) as typeof fetch;
+
+    // A host that carried `streaming: true` from before the profile existed.
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: true, profile: "daemon" }));
+    outbound.setToken("secret");
+    outbound.markActive("42");
+    outbound.onMessageUpdate(assistant("thinking out loud"));
+    await outbound.onTurnEnd(assistant("step one"));
+    await outbound.onAgentEnd("tick complete");
+    expect(sent).toEqual([]);
+    outbound.shutdown();
+  });
+
+  test("a tick-shaped run (no inbound message) sends nothing whatever the mode", async () => {
+    const sent: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessage") sent.push(String(payload.text));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 53 } }), { status: 200 });
+    }) as typeof fetch;
+
+    // No markActive: nothing marked this run as having a Telegram counterpart.
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"] }));
+    outbound.setToken("secret");
+    await outbound.onTurnEnd(assistant("tick internals"));
+    await outbound.onAgentEnd("tick complete");
+    expect(sent).toEqual([]);
+    outbound.shutdown();
+  });
 });
 
 describe("Outbound long answers", () => {
