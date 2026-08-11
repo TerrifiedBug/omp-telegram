@@ -2275,6 +2275,25 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (event.toolName !== "ask") return;
     blockedPings.end(event.toolCallId);
   });
+  pi.on("message_start", (event) => {
+    if (event.message.role !== "user") return;
+    const { content } = event.message;
+    let target = typeof content === "string" ? parseTelegramPromptTarget(content) : undefined;
+    if (!target && Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type !== "text") continue;
+        target = parseTelegramPromptTarget(part.text);
+        if (target) break;
+      }
+    }
+    if (!target) return;
+    try {
+      assertAllowedChat(target.chatId, loadAccess(warn));
+    } catch {
+      return;
+    }
+    outbound.markActive(target.chatId, target.threadId);
+  });
   pi.on("message_update", (e, ctx) => {
     lastCtx = ctx;
     outbound.onMessageUpdate(e.message);

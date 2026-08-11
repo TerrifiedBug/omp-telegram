@@ -264,6 +264,8 @@ count as a mention.
   `chat_id`). Text is chunked and rendered as MarkdownV2 (plain-text fallback on
   parse errors). `files` are absolute paths: images send as photos, everything
   else as documents (≤ 50 MB each).
+  A message that steers a busy run remains the active chat for the next tool
+  call. With no Telegram context and no `chat_id`, the tool fails closed.
 - **`telegram_react`** — react to a message with a Telegram whitelist emoji
   (👍 👎 ❤ 🔥 👀 🎉 …).
 - **`telegram_ask`** — ask the user one or more questions with inline keyboards:

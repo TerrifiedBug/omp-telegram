@@ -181,6 +181,55 @@ describe("extension wiring", () => {
     expect(result?.systemPrompt.at(-1)).toContain("Telegram");
   });
 
+  test("a Telegram steering message gives telegram_send its default chat", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      calls.push({
+        method: String(input).split("/").pop()!,
+        body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>,
+      });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 8 } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await h.handlers.get("message_start")?.[0]?.(
+        {
+          type: "message_start",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: '<telegram-message from_id="42" chat_id="42" chat_type="private">go ahead</telegram-message>' }],
+            steering: true,
+          },
+        },
+        {},
+      );
+      const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {});
+      expect(result.isError).toBeUndefined();
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.(
+        { type: "session_shutdown" },
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      globalThis.fetch = previousFetch;
+    }
+    expect(calls).toEqual([
+      { method: "sendChatAction", body: { chat_id: "42", action: "typing" } },
+      { method: "sendMessage", body: { chat_id: "42", text: "done", parse_mode: "MarkdownV2" } },
+    ]);
+  });
+
+  test("telegram_send fails closed without an active Telegram context", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("no active telegram chat — pass chat_id");
+  });
+
   test("before_agent_start leaves ask untouched for a plain terminal turn with notify off", async () => {
     writeAccess({ allowFrom: ["42"], notifyChat: "42" }); // notifyMode undefined => off
     const h = harness(["ask", "read"]);
