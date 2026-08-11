@@ -157,6 +157,19 @@ describe("single-poller lock", () => {
     expect(acquireLock(lockPath, { pid: 1001, alive: () => true })).toEqual({ ok: true });
   });
 
+  test("the same numeric pid with a different nonce cannot re-enter a fresh lock", () => {
+    expect(acquireLock(lockPath, { pid: 1, nonce: "owner-a", alive: () => false })).toEqual({ ok: true });
+    expect(acquireLock(lockPath, { pid: 1, nonce: "owner-b", alive: () => false })).toMatchObject({
+      ok: false,
+      holder: 1,
+      owner: { pid: 1, nonce: "owner-a" },
+    });
+    releaseLock(lockPath, 1, "owner-b");
+    expect(readLockOwner(lockPath)).toMatchObject({ pid: 1, nonce: "owner-a" });
+    releaseLock(lockPath, 1, "owner-a");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   test("a fresh lock is live even when its holder fails the pid probe", () => {
     acquireLock(lockPath, { pid: 1001, alive: () => true });
     expect(acquireLock(lockPath, { pid: 1002, alive: () => false })).toMatchObject({
@@ -175,6 +188,7 @@ describe("single-poller lock", () => {
     expect(readLockOwner(lockPath)).toEqual({
       pid: 1001,
       startedAt: expect.any(Number),
+      nonce: expect.any(String),
       name: "fleet",
       sessionId: "session-1",
       sessionFile: "/tmp/fleet.jsonl",
@@ -200,8 +214,8 @@ describe("single-poller lock", () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 
-  test("heartbeat advances only its owner's lock mtime", () => {
-    acquireLock(lockPath, { pid: 1001, alive: () => true });
+  test("heartbeat advances only the exact owner's lock mtime", () => {
+    acquireLock(lockPath, { pid: 1001, nonce: "owner-a", alive: () => true });
     const old = new Date(Date.now() - 60_000);
     utimesSync(lockPath, old, old);
     const before = statSync(lockPath).mtimeMs;
@@ -218,12 +232,15 @@ describe("single-poller lock", () => {
       stopped = true;
     }) as typeof clearInterval;
     try {
-      const stop = startLockHeartbeat(lockPath, 1001);
+      const stop = startLockHeartbeat(lockPath, 1001, 15_000, "owner-a");
       beat?.();
       expect(statSync(lockPath).mtimeMs).toBeGreaterThan(before);
 
       const replacement = `${lockPath}.foreign`;
-      writeFileSync(replacement, "2002");
+      writeFileSync(
+        replacement,
+        `1001\n${JSON.stringify({ pid: 1001, startedAt: Date.now(), nonce: "owner-b" })}`,
+      );
       renameSync(replacement, lockPath);
       utimesSync(lockPath, old, old);
       const foreignMtime = statSync(lockPath).mtimeMs;
