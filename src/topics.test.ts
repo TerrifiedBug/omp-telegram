@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { statePath } from "./access";
 import type { TgMessage } from "./api";
 import {
+  DM_ROUTE_KEY,
   ROUTED_TTL_MS,
   type ThreadEntry,
   type ThreadRegistry,
@@ -171,6 +172,20 @@ describe("writeRouted / watchRoute", () => {
     expect(got[0].message_id).toBe(42);
     expect(got[0].text).toBe("hi");
     expect(readdirSync(statePath("route", "7"))).toHaveLength(0);
+  });
+
+  test("a watcher that no longer owns a mutable route leaves its payload for the owner", () => {
+    writeRouted(DM_ROUTE_KEY, routed(44));
+    const ignored: TgMessage[] = [];
+    const stopIgnored = watchRoute(DM_ROUTE_KEY, (m) => ignored.push(m), undefined, () => false);
+    stopIgnored();
+    expect(ignored).toHaveLength(0);
+    expect(readdirSync(statePath("route", DM_ROUTE_KEY))).toHaveLength(1);
+
+    const received: TgMessage[] = [];
+    const stopOwner = watchRoute(DM_ROUTE_KEY, (m) => received.push(m), undefined, () => true);
+    stopOwner();
+    expect(received.map((m) => m.message_id)).toEqual([44]);
   });
 
   test("a TTL-expired payload is discarded, not delivered", () => {

@@ -2,9 +2,10 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { type Access, defaultAccess, loadAccess } from "./access";
 import telegramExtension from "./index";
+import { loadDmOwner } from "./topics";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
@@ -93,7 +94,17 @@ function writeAccess(over: Partial<Access>): void {
 async function startBridge(h: Harness): Promise<void> {
   writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
   writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: "test", startedAt: Date.now() }));
-  await h.handlers.get("session_start")?.[0]?.({ type: "session_start" }, { hasUI: true, ui: { notify() {} } });
+  await h.handlers.get("session_start")?.[0]?.(
+    { type: "session_start" },
+    {
+      hasUI: true,
+      ui: { notify() {} },
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getSessionFile: () => "/tmp/session-1.jsonl",
+      },
+    },
+  );
 }
 
 describe("extension wiring", () => {
@@ -101,6 +112,58 @@ describe("extension wiring", () => {
     const h = harness(["ask", "read"]);
     expect(h.tools.has("telegram_ask")).toBe(true);
     expect(h.commands.has("away")).toBe(true);
+  });
+
+  test("startup auto-claims DM ownership and refreshes it without topics enabled", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    expect(loadDmOwner()).toMatchObject({
+      pid: process.pid,
+      sessionId: "session-1",
+      sessionFile: "/tmp/session-1.jsonl",
+    });
+
+    const switchedCtx = {
+      hasUI: true,
+      ui: { notify() {} },
+      sessionManager: {
+        getSessionId: () => "session-2",
+        getSessionFile: () => "/tmp/session-2.jsonl",
+      },
+    };
+    await h.handlers.get("session_switch")?.[0]?.({ type: "session_switch" }, switchedCtx);
+    expect(loadDmOwner()).toMatchObject({
+      pid: process.pid,
+      sessionId: "session-2",
+      sessionFile: "/tmp/session-2.jsonl",
+    });
+    await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, switchedCtx);
+  });
+
+  test("/telegram own pins, reports, and clears this session", async () => {
+    const h = harness(["ask"]);
+    const notices: string[] = [];
+    const ctx = {
+      ui: { notify: (message: string) => notices.push(message) },
+      sessionManager: {
+        getSessionId: () => "session-own",
+        getSessionFile: () => "/tmp/session-own.jsonl",
+      },
+    };
+    const command = h.commands.get("telegram");
+
+    await command?.handler("own", ctx);
+    expect(loadDmOwner()).toMatchObject({
+      pid: process.pid,
+      sessionId: "session-own",
+      sessionFile: "/tmp/session-own.jsonl",
+    });
+    await command?.handler("own status", ctx);
+    expect(notices.at(-1)).toContain(`DM owner: "${basename(process.cwd())}"`);
+    await command?.handler("own clear", ctx);
+    expect(loadDmOwner()).toBeUndefined();
+    expect(notices.at(-1)).toContain("DM owner cleared");
   });
 
   test("before_agent_start swaps ask -> telegram_ask for a Telegram-originated turn", async () => {
@@ -186,7 +249,11 @@ describe("extension wiring", () => {
     try {
       await h.handlers.get("agent_end")?.[0]?.(
         { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "tick complete" }] }] },
-        { isIdle: () => true, ui: { notify() {} }, sessionManager: { getSessionFile: () => undefined } },
+        {
+          isIdle: () => true,
+          ui: { notify() {} },
+          sessionManager: { getSessionId: () => "session-1", getSessionFile: () => undefined },
+        },
       );
     } finally {
       globalThis.fetch = previousFetch;

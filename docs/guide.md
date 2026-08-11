@@ -84,6 +84,23 @@ The bridge is enabled when **any** of these is true at session start:
 If no token is configured it stays passive and warns once (`no bot token`).
 Use `/telegram daemon status|restart|stop` to manage the standalone process.
 
+## Untopiced private DMs
+
+Topic messages still use their topic ID and session claim. Only private messages
+without a topic use the persisted **DM-owner session**.
+
+The first enabled omp session claims DM ownership. A resumed session reclaims
+ownership when its session file matches the saved record. If the saved owner is
+not running, the bot refuses the message and tells you how to resume or replace
+the owner.
+
+- Run `/telegram own` to pin the current session.
+- Run `/telegram own status` to show the saved session and process state.
+- Run `/telegram own clear` to remove the pin.
+
+Set `OMP_TELEGRAM_DM_OWNER=1` in a fleet or conductor session to force its claim
+at each start. This variable does not enable the bridge.
+
 ## Pairing
 
 Default DM policy is **pairing**, with exactly one operator:
@@ -105,9 +122,10 @@ Codes expire after 1 hour; at most 3 are pending before an owner is established.
 | `on` / `off` | Start / stop polling now; persists `enabled` |
 | `doctor` | Diagnose token, webhook, daemon, poll lock, state files, optional binaries, and herdr locally; never prints the token |
 | `daemon [status\|restart\|stop]` | Inspect, restart, or stop the standalone poller |
+| `own [status\|clear]` | Pin the current session for private DMs without a topic, show the pin, or remove it |
 | `pair <code>` | Approve a pending pairing; the bot confirms in-chat |
 | `deny <code>` | Drop a pending code |
-| `allow <user-id>` / `remove <user-id>` | Set or remove the sole DM owner; a second owner is refused |
+| `allow <user-id>` / `remove <user-id>` | Set or remove the sole paired Telegram account; a second account is refused |
 | `policy <pairing\|allowlist\|disabled>` | Set DM handling |
 | `group add <id> [--no-mention] [--allow a,b]` | Allow a group; optionally drop the mention requirement / restrict senders |
 | `group rm <id>` | Remove a group |
@@ -193,6 +211,14 @@ prints the bot token. `/telegram daemon restart` replaces a stale or
 wrong-version daemon; a live session poller takes over automatically whenever
 the daemon is unavailable.
 
+The poll lock stores the process and session identity. Its mtime is a heartbeat
+that updates every 15 seconds. A contender cannot reclaim a lock with a heartbeat
+younger than 45 seconds, even when its PID probe fails.
+
+If Telegram returns a `409` polling conflict, the losing poller stops its
+heartbeat and releases its lock. If the lock record identifies a different live
+owner, a session poller reports that owner. Then the poller waits before it retries.
+
 ### `/spawn` (or another command) left a stray topic
 
 Symptom: running `/spawn` from Telegram creates a new empty thread instead of
@@ -264,11 +290,12 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `access.json` | Access + config state (atomic writes) |
 | `inbox/` | Downloaded attachments; each file is ≤ 20 MiB, and startup/download cleanup removes files older than 7 days then prunes oldest files above 250 MiB total |
 | `prompts/` | Cross-process selectable-question requests (live while their owning session is) and their answers (GC'd after a short grace) |
-| `bot.lock` | Poller PID lock |
+| `bot.lock` | Poller PID, owner identity, and heartbeat mtime |
+| `dm-owner.json` | Session that receives private DMs without a topic |
 | `daemon.json` | Standalone daemon PID, plugin version, and start time |
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
 | `threads.json` | Topic registry — which session (pid/cwd) owns which forum topic |
-| `route/<thread_id>/` | Cross-process routed-message spool (topics mode) |
+| `route/<thread_id>/` / `route/dm/` | Cross-process routed-message spools for topics and untopiced private DMs |
 
 ## Streaming behavior
 

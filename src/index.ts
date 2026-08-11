@@ -4,7 +4,7 @@
 // is user-managed through the /telegram command and never via the model.
 
 import { execFile } from "node:child_process";
-import { constants, type Dirent, readFileSync, writeFileSync } from "node:fs";
+import { constants, type Dirent, readFileSync, statSync, writeFileSync } from "node:fs";
 import { access as fsAccess, readFile, readdir, stat } from "node:fs/promises";
 import { basename, delimiter, extname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -26,14 +26,41 @@ import {
   saveAccess,
   statePath,
 } from "./access";
-import { acquireLock, downloadFileBytes, isMissingThreadError, type TgFile, type TgMessage, type TgUser, Poller, TgError, releaseLock, tg, webhookConflictHint } from "./api";
+import {
+  acquireLock,
+  downloadFileBytes,
+  isMissingThreadError,
+  type TgFile,
+  type TgMessage,
+  type TgUser,
+  Poller,
+  readLockOwner,
+  releaseLock,
+  startLockHeartbeat,
+  TgError,
+  tg,
+  webhookConflictHint,
+} from "./api";
 import { type BridgeHost, clearOwnerBotCommands, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand, syncBotCommands, tidyRemoteTopic } from "./bridge";
 import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
 import { PROMPT_SUPERSEDED, type PromptOption, type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
-import { type ThreadEntry, claimThread, findAdoptableThread, isAlive, loadRegistry, purgeRouteDir, releaseThread, watchRoute } from "./topics";
+import {
+  DM_ROUTE_KEY,
+  type ThreadEntry,
+  claimDmOwner,
+  claimThread,
+  clearDmOwner,
+  findAdoptableThread,
+  isAlive,
+  loadDmOwner,
+  loadRegistry,
+  purgeRouteDir,
+  releaseThread,
+  watchRoute,
+} from "./topics";
 import { BlockedPings, askQuestionSummary } from "./blocked";
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
@@ -123,6 +150,7 @@ const TELEGRAM_ARGS: CompletionNode = {
     transcribeCommand: null,
   },
   notify: { off: null, away: null, always: null, status: null, clear: null },
+  own: { status: null, clear: null },
   topics: { on: null, off: null, status: null, tidy: { on: null, off: null, status: null } },
 };
 const SUBCOMMANDS = Object.keys(TELEGRAM_ARGS);
@@ -143,6 +171,7 @@ const SUBCOMMAND_HELP: Record<string, string> = {
   group: "manage group access",
   set: "tune bridge options",
   notify: "idle / blocked-input pings",
+  own: "pin this session to receive untopiced DMs",
   topics: "per-project session topics",
 };
 
@@ -505,6 +534,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let ownTopic: { threadId: number; name: string } | undefined;
   let ownSpace: { workspaceId: string; label: string; terminalIds: string[] } | undefined;
   let stopWatch: (() => void) | undefined;
+  let stopDmWatch: (() => void) | undefined;
+  let stopLockBeat: (() => void) | undefined;
   let activePromptTarget: PromptTarget | undefined;
   let savedPromptTools: string[] | undefined;
   let compacting = false;
@@ -547,6 +578,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     botHasTopics: () => botHasTopics,
     botAllowsUserTopics: () => botAllowsUserTopics,
     ownThreadId: () => ownTopic?.threadId,
+    sessionIdentity: () => ({
+      sessionId: lastCtx?.sessionManager.getSessionId(),
+      sessionFile: lastCtx?.sessionManager.getSessionFile(),
+    }),
     callTelegram: (method, payload) => tg(token, method, payload),
     warn,
     log,
@@ -589,10 +624,18 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   }
 
   function onFatal(reason: string): void {
+    stopLockBeat?.();
+    stopLockBeat = undefined;
     warn(`poller stopped: ${reason}`);
     lastCtx?.ui.notify(`telegram: ${reason}`, "error");
     releaseLock(lockPath);
     if (reason.includes("409")) {
+      const owner = readLockOwner(lockPath);
+      if (owner && owner.pid !== process.pid) {
+        const line = `live poll owner: pid ${owner.pid}${owner.name ? ` (session "${owner.name}")` : ""}`;
+        warn(line);
+        lastCtx?.ui.notify(`telegram: ${line}`, "warning");
+      }
       void webhookConflictHint(token)
         .then((hint) => {
           if (!hint) return;
@@ -607,11 +650,23 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   async function acquireAndLaunch(ctx: ExtensionContext | undefined, announce: boolean): Promise<boolean> {
     if (poller.running) return true;
     if (daemonAlive(readDaemonState())) return false;
-    const lock = acquireLock(lockPath);
+    const lock = acquireLock(lockPath, {
+      identity: {
+        name: ownTopic?.name ?? basename(process.cwd()),
+        sessionId: lastCtx?.sessionManager.getSessionId(),
+        sessionFile: lastCtx?.sessionManager.getSessionFile(),
+      },
+    });
     if (!lock.ok) {
-      notifyOnce(ctx, `telegram: bot lock held by pid ${lock.holder} — waiting (another omp session polls this token)`, "warning");
+      notifyOnce(
+        ctx,
+        `telegram: bot lock held by pid ${lock.holder}${lock.owner?.name ? ` (session "${lock.owner.name}")` : ""} — waiting (another omp session polls this token)`,
+        "warning",
+      );
       return false;
     }
+    stopLockBeat?.();
+    stopLockBeat = startLockHeartbeat(lockPath);
     try {
       const me = await tg<{ username: string; has_topics_enabled?: boolean; allows_users_to_create_topics?: boolean }>(token, "getMe");
       botUsername = me.username;
@@ -623,6 +678,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     } catch (err) {
       const detail = err instanceof TgError && err.code === 401 ? "invalid bot token (401)" : `getMe failed — ${String(err)}`;
       ctx?.ui.notify(`telegram: ${detail} — run /telegram token <token>`, "error");
+      stopLockBeat?.();
+      stopLockBeat = undefined;
       releaseLock(lockPath);
       return true; // token/network problem — don't spin the lock retry
     }
@@ -658,11 +715,26 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const daemon = ensureDaemon(warn);
     outbound.setToken(token); // outbound (telegram_send/react, idle pings) works even when another session holds the poll lock
     await ensureTopic(ctx);
+    await captureOwnSpace(ctx);
+    const claim = claimDmOwner(
+      threadEntry(ctx, process.cwd(), ownTopic?.name ?? basename(process.cwd())),
+      { force: process.env.OMP_TELEGRAM_DM_OWNER === "1" },
+      warn,
+    );
+    if (claim.ok) startDmWatch();
+    else
+      log.debug(
+        `[telegram] untopiced DMs pinned to "${claim.owner.name}" (pid ${claim.owner.pid}) — this session will not receive them`,
+      );
     const launched = daemon === "alive" || daemon === "spawned" ? false : await acquireAndLaunch(ctx, announce);
     if (!launched) armLockRetry(ctx, announce);
   }
 
   function stopBot(): void {
+    stopLockBeat?.();
+    stopLockBeat = undefined;
+    stopDmWatch?.();
+    stopDmWatch = undefined;
     poller.stop();
     releaseLock(lockPath);
     if (lockRetryTimer) {
@@ -730,17 +802,34 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     };
   }
 
-  /** Refresh the exact resumable conversation after turns and session navigation. */
-  function refreshTopicClaim(ctx: ExtensionContext): void {
-    if (!ownTopic || !access.topicsChat) return;
-    const current = loadRegistry(warn).threads[String(ownTopic.threadId)];
-    if (!current || current.pid !== process.pid) return;
-    claimThread(
-      access.topicsChat,
-      ownTopic.threadId,
-      threadEntry(ctx, process.cwd(), ownTopic.name, current.claimedAt),
-      warn,
+  /** Consume DMs spooled to this session while it owns dm-owner.json. */
+  function startDmWatch(): void {
+    stopDmWatch?.();
+    stopDmWatch = watchRoute(
+      DM_ROUTE_KEY,
+      (m) => void processLocal(m),
+      log,
+      () => loadDmOwner(warn)?.pid === process.pid,
     );
+  }
+
+  /** Refresh durable routing identities after turns and session navigation. */
+  function refreshTopicClaim(ctx: ExtensionContext): void {
+    if (ownTopic && access.topicsChat) {
+      const current = loadRegistry(warn).threads[String(ownTopic.threadId)];
+      if (current?.pid === process.pid) {
+        claimThread(
+          access.topicsChat,
+          ownTopic.threadId,
+          threadEntry(ctx, process.cwd(), ownTopic.name, current.claimedAt),
+          warn,
+        );
+      }
+    }
+    const dmOwner = loadDmOwner(warn);
+    if (dmOwner?.pid === process.pid) {
+      claimDmOwner(threadEntry(ctx, dmOwner.cwd, dmOwner.name, dmOwner.claimedAt), {}, warn);
+    }
   }
 
   /**
@@ -1202,6 +1291,12 @@ export default function telegramExtension(pi: ExtensionAPI): void {
 
   // ---- /telegram command --------------------------------------------------
 
+  function dmOwnerStatus(): string {
+    const owner = loadDmOwner(warn);
+    if (!owner) return "DM owner: none — the polling session delivers its own DMs";
+    return `DM owner: "${owner.name}" · pid ${owner.pid} (${isAlive(owner.pid) ? "live" : "stale"}) · ${owner.sessionFile ?? owner.sessionId ?? "no session identity"}`;
+  }
+
   function showStatus(ctx: ExtensionContext): void {
     const a = loadAccess(warn);
     access = a;
@@ -1226,9 +1321,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     lines.push(
       `Topics: ${a.topicsChat ?? "off"}${ownTopic ? ` · this session: #${ownTopic.threadId} (${ownTopic.name})` : ""}${dmMode} · sessions: ${liveSessions}/${Object.keys(reg.threads).length}`,
     );
+    lines.push(dmOwnerStatus());
     try {
-      const pid = readFileSync(lockPath, "utf8").trim();
-      if (pid) lines.push(`Lock: pid ${pid}`);
+      const owner = readLockOwner(lockPath);
+      if (owner) {
+        lines.push(
+          `Lock: pid ${owner.pid}${owner.name ? ` (session "${owner.name}")` : ""} · heartbeat ${Math.round((Date.now() - statSync(lockPath).mtimeMs) / 1000)}s ago`,
+        );
+      }
     } catch {
       /* no lock file */
     }
@@ -1632,6 +1732,32 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (!token) ctx.ui.notify("telegram: notify armed, but the bridge isn't running — run /telegram on so pings can fire", "warning");
   }
 
+  function cmdOwn(ctx: ExtensionContext, arg: string): void {
+    const action = arg.trim();
+    if (action === "") {
+      claimDmOwner(
+        threadEntry(ctx, process.cwd(), ownTopic?.name ?? basename(process.cwd())),
+        { force: true },
+        warn,
+      );
+      startDmWatch();
+      ctx.ui.notify("telegram: this session now receives untopiced DMs", "info");
+      return;
+    }
+    if (action === "status") {
+      ctx.ui.notify(`telegram: ${dmOwnerStatus()}`, "info");
+      return;
+    }
+    if (action === "clear") {
+      clearDmOwner();
+      stopDmWatch?.();
+      stopDmWatch = undefined;
+      ctx.ui.notify("telegram: DM owner cleared — the polling session delivers its own DMs", "info");
+      return;
+    }
+    ctx.ui.notify("usage: /telegram own [status | clear]", "warning");
+  }
+
   async function cmdTopics(ctx: ExtensionContext, arg: string): Promise<void> {
     const v = arg.trim();
     const a = loadAccess(warn);
@@ -1951,6 +2077,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           break;
         case "notify":
           cmdNotify(ctx, arg);
+          break;
+        case "own":
+          cmdOwn(ctx, arg);
           break;
         case "topics":
           await cmdTopics(ctx, arg);

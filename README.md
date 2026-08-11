@@ -83,6 +83,14 @@ run `/telegram topics tidy on` — each session's topic is deleted (DM host) or
 closed and reopened on re-adoption (group host) when it exits. Sweep leftovers from
 crashed sessions with `/cleanup`.
 
+Messages inside a session topic still route to that topic's session. A private
+DM outside a topic goes to a persisted DM-owner session. The first enabled
+session claims ownership, and a resumed session reclaims it by session file.
+Run `/telegram own [status|clear]` to manage the owner. Set
+`OMP_TELEGRAM_DM_OWNER=1` in a fleet or conductor session to force its claim at
+each start. If the saved owner is not running, the bot refuses the DM and names
+the required recovery action.
+
 ## Use it
 
 Inside **omp control**:

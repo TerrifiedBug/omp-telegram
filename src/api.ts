@@ -4,7 +4,7 @@
 // the lock path handed in by the caller.
 
 import { randomBytes } from "node:crypto";
-import { linkSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 
@@ -237,6 +237,19 @@ export async function downloadFileBytes(token: string, filePath: string, timeout
 
 // ---- Single-poller lock --------------------------------------------------
 
+/** Owner heartbeat cadence; refreshes lock mtime while polling. */
+export const LOCK_HEARTBEAT_MS = 15_000;
+/** A lock with mtime younger than this is live regardless of the pid probe. */
+export const LOCK_FRESH_MS = 45_000;
+
+export interface LockOwner {
+  pid: number;
+  startedAt: number;
+  name?: string;
+  sessionId?: string;
+  sessionFile?: string;
+}
+
 /** Whether a PID is a live process (EPERM means it exists but is owned elsewhere). */
 function pidAlive(pid: number): boolean {
   try {
@@ -255,15 +268,46 @@ function readLockPid(lockPath: string): number {
   }
 }
 
+/** Parse the lock's owner record. Legacy bare-pid locks yield `{ pid, startedAt: 0 }`. */
+export function readLockOwner(lockPath: string): LockOwner | undefined {
+  try {
+    const content = readFileSync(lockPath, "utf8").trim();
+    if (!content) return undefined;
+    const newline = content.indexOf("\n");
+    if (newline !== -1) {
+      try {
+        const owner: unknown = JSON.parse(content.slice(newline + 1));
+        if (owner && typeof owner === "object" && typeof (owner as LockOwner).pid === "number") {
+          return owner as LockOwner;
+        }
+      } catch {
+        // Fall back to the first-line pid for malformed v2 records.
+      }
+    }
+    const pid = readLockPid(lockPath);
+    return pid > 0 ? { pid, startedAt: 0 } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function lockFresh(lockPath: string, freshMs: number): boolean {
+  try {
+    return Date.now() - statSync(lockPath).mtimeMs < freshMs;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Atomically create `target` by hard-linking a pid-stamped temp into place.
  * `link` fails with EEXIST if the target already exists, so the filesystem —
  * not a racy read-then-write — decides the single winner, and the target is
  * populated the instant it appears (no empty mid-write window).
  */
-function linkClaim(target: string, pid: number): boolean {
+function linkClaim(target: string, pid: number, content: string = String(pid)): boolean {
   const temp = `${target}.${pid}.${randomBytes(6).toString("hex")}`;
-  writeFileSync(temp, String(pid), { mode: 0o600 });
+  writeFileSync(temp, content, { mode: 0o600 });
   try {
     linkSync(temp, target);
     return true;
@@ -279,27 +323,37 @@ function linkClaim(target: string, pid: number): boolean {
 const REAPER_TTL_MS = 10_000;
 
 /**
- * Claim the poll lock at `lockPath`. Fails only when a *live* foreign PID holds
- * it; a stale lock (dead PID) is reclaimed. DM chat_id == user_id so exactly one
- * poller per token is required — Telegram rejects concurrent getUpdates with 409.
+ * Claim the poll lock at `lockPath`. Fails when a foreign holder has a live PID
+ * or a fresh heartbeat; a crashed holder is reclaimable after `LOCK_FRESH_MS`.
+ * DM chat_id == user_id, so exactly one poller per token is required — Telegram
+ * rejects concurrent getUpdates with 409.
  *
- * `pid`/`alive` are injectable for tests; production uses this process and a real
- * liveness probe.
+ * `pid`/`alive`/`freshMs` are injectable for tests; production uses this process,
+ * a real liveness probe, and the default heartbeat freshness window.
  */
 export function acquireLock(
   lockPath: string,
-  options: { pid?: number; alive?: (pid: number) => boolean } = {},
-): { ok: true } | { ok: false; holder: number } {
+  options: {
+    pid?: number;
+    alive?: (pid: number) => boolean;
+    identity?: { name?: string; sessionId?: string; sessionFile?: string };
+    freshMs?: number;
+  } = {},
+): { ok: true } | { ok: false; holder: number; owner?: LockOwner } {
   const pid = options.pid ?? process.pid;
   const alive = options.alive ?? pidAlive;
+  const freshMs = options.freshMs ?? LOCK_FRESH_MS;
+  const content = `${pid}\n${JSON.stringify({ ...options.identity, pid, startedAt: Date.now() })}`;
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
 
   // Fast path: atomically claim an absent lock. Simultaneous starters can never
   // both win here (the previous read-then-write could).
-  if (linkClaim(lockPath, pid)) return { ok: true };
+  if (linkClaim(lockPath, pid, content)) return { ok: true };
   let holder = readLockPid(lockPath);
   if (holder === pid) return { ok: true }; // already ours (re-entrant)
-  if (holder > 1 && alive(holder)) return { ok: false, holder }; // live foreign poller
+  if (holder > 1 && (alive(holder) || lockFresh(lockPath, freshMs))) {
+    return { ok: false, holder, owner: readLockOwner(lockPath) };
+  }
 
   // Stale (dead holder) or garbage lock. Reclaim under an exclusive reaper so two
   // starters can't both unlink and re-link, clobbering each other's fresh claim.
@@ -313,20 +367,33 @@ export function acquireLock(
     } catch {
       mtime = 0;
     }
-    if (Date.now() - mtime < REAPER_TTL_MS) return { ok: false, holder: holder > 1 ? holder : 0 };
+    if (Date.now() - mtime < REAPER_TTL_MS) {
+      const current = holder > 1 ? holder : 0;
+      return { ok: false, holder: current, owner: readLockOwner(lockPath) };
+    }
     rmSync(reapPath, { force: true });
-    if (!linkClaim(reapPath, pid)) return { ok: false, holder: readLockPid(lockPath) || (holder > 1 ? holder : 0) };
+    if (!linkClaim(reapPath, pid)) {
+      const current = readLockPid(lockPath) || (holder > 1 ? holder : 0);
+      return { ok: false, holder: current, owner: readLockOwner(lockPath) };
+    }
   }
   try {
     // Only the reaper owner may touch the main lock. If we lost the reaper (a
     // contender force-cleared it as expired while we stalled), bail rather than
     // race the new owner. Then re-validate the holder in case it was reclaimed.
-    if (readLockPid(reapPath) !== pid) return { ok: false, holder: readLockPid(lockPath) || (holder > 1 ? holder : 0) };
+    if (readLockPid(reapPath) !== pid) {
+      const current = readLockPid(lockPath) || (holder > 1 ? holder : 0);
+      return { ok: false, holder: current, owner: readLockOwner(lockPath) };
+    }
     holder = readLockPid(lockPath);
     if (holder === pid) return { ok: true };
-    if (holder > 1 && alive(holder)) return { ok: false, holder };
+    if (holder > 1 && (alive(holder) || lockFresh(lockPath, freshMs))) {
+      return { ok: false, holder, owner: readLockOwner(lockPath) };
+    }
     rmSync(lockPath, { force: true });
-    return linkClaim(lockPath, pid) ? { ok: true } : { ok: false, holder: readLockPid(lockPath) || 0 };
+    if (linkClaim(lockPath, pid, content)) return { ok: true };
+    const current = readLockPid(lockPath) || 0;
+    return { ok: false, holder: current, owner: readLockOwner(lockPath) };
   } finally {
     // Release the reaper only if we still own it, so we never delete a reaper a
     // contender legitimately took over.
@@ -337,6 +404,25 @@ export function acquireLock(
 /** Release the lock only if we still own it. */
 export function releaseLock(lockPath: string, pid: number = process.pid): void {
   if (readLockPid(lockPath) === pid) rmSync(lockPath, { force: true });
+}
+
+/** Refresh the lock mtime while we poll. Never touches a lock we no longer own. */
+export function startLockHeartbeat(
+  lockPath: string,
+  pid: number = process.pid,
+  intervalMs: number = LOCK_HEARTBEAT_MS,
+): () => void {
+  const timer = setInterval(() => {
+    if (readLockPid(lockPath) !== pid) return;
+    try {
+      const now = new Date();
+      utimesSync(lockPath, now, now);
+    } catch {
+      // Lock vanished.
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

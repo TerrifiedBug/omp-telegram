@@ -5,7 +5,20 @@
 // per-topic watcher. No network here: this module is pure filesystem + policy,
 // so it is fully unit-testable. Telegram I/O stays in api.ts / outbound.ts.
 
-import { type FSWatcher, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  type FSWatcher,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { ensureStateDir, statePath } from "./access";
 import type { Logger, TgMessage } from "./api";
@@ -35,6 +48,8 @@ export interface ThreadRegistry {
 
 /** Time a routed payload may sit unclaimed before a watcher discards it as stale. */
 export const ROUTED_TTL_MS = 600_000;
+/** Spool key for untopiced private messages routed to the pinned DM owner. */
+export const DM_ROUTE_KEY = "dm" as const;
 
 /**
  * Load threads.json. ENOENT / read error → fresh empty registry. Corrupt JSON →
@@ -125,6 +140,82 @@ export function sameSession(left: SessionIdentity, right: SessionIdentity): bool
   return !!left.sessionId && left.sessionId === right.sessionId;
 }
 
+/** Session pinned to receive untopiced private DMs. */
+export function loadDmOwner(warn?: (msg: string) => void): ThreadEntry | undefined {
+  const file = statePath("dm-owner.json");
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    warn?.(`could not read dm-owner.json: ${String(err)}`);
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof (parsed as ThreadEntry).pid === "number" &&
+      Number.isFinite((parsed as ThreadEntry).pid)
+    ) {
+      return parsed as ThreadEntry;
+    }
+  } catch {
+    // Invalid records are moved aside below.
+  }
+  try {
+    renameSync(file, `${file}.corrupt-${Date.now()}`);
+  } catch {
+    /* best effort */
+  }
+  warn?.("dm-owner.json was corrupt — moved aside, starting unowned");
+  return undefined;
+}
+
+/** Remove the pinned DM owner. */
+export function clearDmOwner(): void {
+  rmSync(statePath("dm-owner.json"), { force: true });
+}
+
+/**
+ * Atomically pin a session as DM owner. A foreign session may only be replaced
+ * explicitly; the same durable session may refresh its record after resuming.
+ */
+export function claimDmOwner(
+  entry: ThreadEntry,
+  options: { force?: boolean } = {},
+  warn?: (msg: string) => void,
+): { ok: true } | { ok: false; owner: ThreadEntry } {
+  ensureStateDir();
+  const file = statePath("dm-owner.json");
+  const content = JSON.stringify(entry, null, 2) + "\n";
+  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(temp, content, { mode: 0o600 });
+  try {
+    linkSync(temp, file);
+    return { ok: true };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+
+  const existing = loadDmOwner(warn);
+  if (existing && !options.force && existing.pid !== entry.pid && !sameSession(existing, entry)) {
+    return { ok: false, owner: existing };
+  }
+
+  const replacement = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(replacement, content, { mode: 0o600 });
+  try {
+    renameSync(replacement, file);
+  } finally {
+    rmSync(replacement, { force: true });
+  }
+  return { ok: true };
+}
+
 
 /** Select an exact saved conversation; cwd fallback is only for unidentified legacy sessions. */
 export function findAdoptableThread(
@@ -183,13 +274,13 @@ export function decideRoute(
   return { kind: "forward", threadId, pid: entry.pid };
 }
 
-/** Per-topic spool directory for cross-process routed payloads. Writer & watcher must agree. */
-function routeDir(threadId: number): string {
+/** Per-route spool directory for cross-process payloads. Writer & watcher must agree. */
+function routeDir(threadId: number | typeof DM_ROUTE_KEY): string {
   return statePath("route", String(threadId));
 }
 
-/** Remove a topic's spool dir and any un-consumed payloads. Missing dir is a no-op. */
-export function purgeRouteDir(threadId: number): void {
+/** Remove a route's spool dir and any un-consumed payloads. Missing dir is a no-op. */
+export function purgeRouteDir(threadId: number | typeof DM_ROUTE_KEY): void {
   rmSync(routeDir(threadId), { recursive: true, force: true });
 }
 
@@ -197,7 +288,7 @@ export function purgeRouteDir(threadId: number): void {
  * Spool a raw message for the owning session to pick up. Written to a `tmp-`
  * name then renamed so a watcher never observes a half-written file.
  */
-export function writeRouted(threadId: number, msg: TgMessage): void {
+export function writeRouted(threadId: number | typeof DM_ROUTE_KEY, msg: TgMessage): void {
   const dir = routeDir(threadId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const base = `${Date.now()}-${msg.message_id}.json`;
@@ -207,19 +298,26 @@ export function writeRouted(threadId: number, msg: TgMessage): void {
 }
 
 /**
- * Watch a topic's spool dir and hand each spooled message to `onMsg`. Uses an
+ * Watch a route's spool dir and hand each spooled message to `onMsg`. Uses an
  * initial scan + fs.watch + a 5s rescan (fs.watch alone is not reliable enough).
  * Skips `tmp-*`; discards payloads older than ROUTED_TTL_MS (e.g. written just
  * before a crash). A per-lifetime processed set stops watch+rescan double-firing.
+ * `accept` lets a mutable route owner reject a file before it is consumed.
  * Returns a disposer. All fs calls are synchronous so handling is race-free.
  */
-export function watchRoute(threadId: number, onMsg: (m: TgMessage) => void, log?: Logger): () => void {
+export function watchRoute(
+  threadId: number | typeof DM_ROUTE_KEY,
+  onMsg: (m: TgMessage) => void,
+  log?: Logger,
+  accept?: () => boolean,
+): () => void {
   const dir = routeDir(threadId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const processed = new Set<string>();
 
   const handle = (name: string): void => {
     if (!name || name.startsWith("tmp-") || !name.endsWith(".json") || processed.has(name)) return;
+    if (accept && !accept()) return;
     const full = join(dir, name);
     let mtimeMs: number;
     try {

@@ -1,8 +1,27 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Poller, TgError, acquireLock, downloadFileBytes, releaseLock, tg, webhookConflictHint } from "./api";
+import {
+  Poller,
+  TgError,
+  acquireLock,
+  downloadFileBytes,
+  readLockOwner,
+  releaseLock,
+  startLockHeartbeat,
+  tg,
+  webhookConflictHint,
+} from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -123,9 +142,14 @@ describe("single-poller lock", () => {
 
   test("a live foreign holder blocks a second starter without clobbering the lock", () => {
     expect(acquireLock(lockPath, { pid: 1001, alive: () => true })).toEqual({ ok: true });
-    expect(readFileSync(lockPath, "utf8")).toBe("1001");
-    expect(acquireLock(lockPath, { pid: 1002, alive: () => true })).toEqual({ ok: false, holder: 1001 });
-    expect(readFileSync(lockPath, "utf8")).toBe("1001"); // loser must not overwrite the owner
+    const content = readFileSync(lockPath, "utf8");
+    expect(content.startsWith("1001\n")).toBe(true);
+    expect(acquireLock(lockPath, { pid: 1002, alive: () => true })).toEqual({
+      ok: false,
+      holder: 1001,
+      owner: readLockOwner(lockPath),
+    });
+    expect(readFileSync(lockPath, "utf8")).toBe(content); // loser must not overwrite the owner
   });
 
   test("re-acquiring with the same pid is idempotent", () => {
@@ -133,10 +157,39 @@ describe("single-poller lock", () => {
     expect(acquireLock(lockPath, { pid: 1001, alive: () => true })).toEqual({ ok: true });
   });
 
-  test("a stale (dead) holder is reclaimed", () => {
+  test("a fresh lock is live even when its holder fails the pid probe", () => {
     acquireLock(lockPath, { pid: 1001, alive: () => true });
-    expect(acquireLock(lockPath, { pid: 1002, alive: (p) => p !== 1001 })).toEqual({ ok: true });
-    expect(readFileSync(lockPath, "utf8")).toBe("1002");
+    expect(acquireLock(lockPath, { pid: 1002, alive: () => false })).toMatchObject({
+      ok: false,
+      holder: 1001,
+      owner: { pid: 1001 },
+    });
+  });
+
+  test("lock owner identity round-trips and legacy locks remain readable", () => {
+    acquireLock(lockPath, {
+      pid: 1001,
+      alive: () => true,
+      identity: { name: "fleet", sessionId: "session-1", sessionFile: "/tmp/fleet.jsonl" },
+    });
+    expect(readLockOwner(lockPath)).toEqual({
+      pid: 1001,
+      startedAt: expect.any(Number),
+      name: "fleet",
+      sessionId: "session-1",
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+    releaseLock(lockPath, 1001);
+    writeFileSync(lockPath, "2002");
+    expect(readLockOwner(lockPath)).toEqual({ pid: 2002, startedAt: 0 });
+  });
+
+  test("an old lock with a dead holder is reclaimed", () => {
+    acquireLock(lockPath, { pid: 1001, alive: () => true });
+    const stale = new Date(Date.now() - 1_000);
+    utimesSync(lockPath, stale, stale);
+    expect(acquireLock(lockPath, { pid: 1002, alive: () => false, freshMs: 100 })).toEqual({ ok: true });
+    expect(readLockOwner(lockPath)?.pid).toBe(1002);
   });
 
   test("releaseLock removes the lock only for its owner", () => {
@@ -147,11 +200,55 @@ describe("single-poller lock", () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 
+  test("heartbeat advances only its owner's lock mtime", () => {
+    acquireLock(lockPath, { pid: 1001, alive: () => true });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old);
+    const before = statSync(lockPath).mtimeMs;
+
+    let beat: (() => void) | undefined;
+    let stopped = false;
+    const nativeSetInterval = globalThis.setInterval;
+    const nativeClearInterval = globalThis.clearInterval;
+    globalThis.setInterval = ((callback: () => void) => {
+      beat = callback;
+      return { unref() {} } as NodeJS.Timeout;
+    }) as typeof setInterval;
+    globalThis.clearInterval = (() => {
+      stopped = true;
+    }) as typeof clearInterval;
+    try {
+      const stop = startLockHeartbeat(lockPath, 1001);
+      beat?.();
+      expect(statSync(lockPath).mtimeMs).toBeGreaterThan(before);
+
+      const replacement = `${lockPath}.foreign`;
+      writeFileSync(replacement, "2002");
+      renameSync(replacement, lockPath);
+      utimesSync(lockPath, old, old);
+      const foreignMtime = statSync(lockPath).mtimeMs;
+      beat?.();
+      expect(statSync(lockPath).mtimeMs).toBe(foreignMtime);
+
+      stop();
+      expect(stopped).toBe(true);
+    } finally {
+      globalThis.setInterval = nativeSetInterval;
+      globalThis.clearInterval = nativeClearInterval;
+    }
+  });
+
   test("backs off when another reclaimer holds a fresh reaper", () => {
     writeFileSync(lockPath, "1001"); // stale main lock (1001 dead)
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, stale, stale);
     const reapPath = `${lockPath}.reap`;
     writeFileSync(reapPath, "1002"); // a live reclaimer is mid-reclaim
-    expect(acquireLock(lockPath, { pid: 1003, alive: (p) => p === 1002 })).toEqual({ ok: false, holder: 1001 });
+    expect(acquireLock(lockPath, { pid: 1003, alive: (p) => p === 1002 })).toEqual({
+      ok: false,
+      holder: 1001,
+      owner: { pid: 1001, startedAt: 0 },
+    });
     expect(readFileSync(lockPath, "utf8")).toBe("1001"); // main untouched
     expect(readFileSync(reapPath, "utf8")).toBe("1002"); // fresh reaper untouched
   });
@@ -161,9 +258,10 @@ describe("single-poller lock", () => {
     const reapPath = `${lockPath}.reap`;
     writeFileSync(reapPath, "1002"); // reaper left by a crashed reclaimer
     const aged = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, aged, aged);
     utimesSync(reapPath, aged, aged); // age it past the reaper TTL
     expect(acquireLock(lockPath, { pid: 1003, alive: () => false })).toEqual({ ok: true });
-    expect(readFileSync(lockPath, "utf8")).toBe("1003");
+    expect(readLockOwner(lockPath)?.pid).toBe(1003);
     expect(existsSync(reapPath)).toBe(false); // reaper released by its new owner
   });
 
@@ -210,6 +308,8 @@ describe("single-poller lock", () => {
     const doomed = Bun.spawn([process.execPath, "-e", ""]); // exits at once → its PID is dead when the race runs
     await doomed.exited;
     writeFileSync(lockPath, String(doomed.pid));
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, stale, stale);
     const results = await raceForLock(8);
     expect(results.filter((r) => r === "ok")).toHaveLength(1);
     expect(results.filter((r) => r === "no")).toHaveLength(7);

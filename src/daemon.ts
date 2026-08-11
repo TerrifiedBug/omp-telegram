@@ -18,7 +18,7 @@ import {
   resolveToken,
   statePath,
 } from "./access";
-import { acquireLock, type Logger, Poller, releaseLock, tg, webhookConflictHint } from "./api";
+import { acquireLock, type Logger, Poller, releaseLock, startLockHeartbeat, tg, webhookConflictHint } from "./api";
 import { type BridgeHost, ensureControlTopic, handleUpdate, syncBotCommands } from "./bridge";
 import { SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
@@ -178,9 +178,12 @@ export async function runDaemon(): Promise<void> {
   let stopping = false;
   let fatalState: { reason?: string } = {};
   let fatalBackoff = 60_000;
+  let stopHeartbeat: (() => void) | undefined;
 
   const cleanup = (): void => {
     stopping = true;
+    stopHeartbeat?.();
+    stopHeartbeat = undefined;
     poller?.stop();
     releaseLock(lockPath);
     const current = readDaemonState();
@@ -203,15 +206,18 @@ export async function runDaemon(): Promise<void> {
         break;
       }
 
-      const lock = acquireLock(lockPath);
+      const lock = acquireLock(lockPath, { identity: { name: "telegram-daemon" } });
       if (!lock.ok) {
-        log.info(`[telegram daemon] another poller (pid ${lock.holder}) holds the lock; exiting`);
+        log.info(
+          `[telegram daemon] another poller (pid ${lock.holder}${lock.owner?.name ? `, ${lock.owner.name}` : ""}) holds the lock; exiting`,
+        );
         break;
       }
       // Publish ownership only after the lock is held, so daemon.json.pid always
       // names the live poller — ensureDaemon's version-upgrade path stops exactly
       // that PID, and a starter that loses the lock never claims daemon.json.
       saveDaemonState({ pid: process.pid, version, startedAt });
+      stopHeartbeat = startLockHeartbeat(lockPath);
 
       let botUsername = "";
       let botHasTopics: boolean | undefined;
@@ -223,6 +229,8 @@ export async function runDaemon(): Promise<void> {
         botAllowsUserTopics = me.allows_users_to_create_topics;
       } catch (err) {
         log.warn(`[telegram daemon] getMe failed: ${String(err)}`);
+        stopHeartbeat?.();
+        stopHeartbeat = undefined;
         releaseLock(lockPath);
         await sleep(fatalBackoff);
         fatalBackoff = Math.min(fatalBackoff * 2, 300_000);
@@ -259,6 +267,8 @@ export async function runDaemon(): Promise<void> {
         (update) => handleUpdate(host, update),
         (reason) => {
           fatalState.reason = reason;
+          stopHeartbeat?.();
+          stopHeartbeat = undefined;
           releaseLock(lockPath);
         },
         log,
@@ -272,6 +282,8 @@ export async function runDaemon(): Promise<void> {
         poller?.stop();
       }, 60_000);
       await poller.done();
+      stopHeartbeat?.();
+      stopHeartbeat = undefined;
       clearInterval(gateTimer);
       releaseLock(lockPath);
       if (stopping) break;

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess, saveAccess, statePath } from "./access";
@@ -7,7 +7,7 @@ import { type Logger, type TgMessage, TgError } from "./api";
 import { type BridgeHost, BOT_COMMANDS, PUBLIC_BOT_COMMANDS, handleUpdate, syncBotCommands } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
-import { loadRegistry, saveRegistry } from "./topics";
+import { DM_ROUTE_KEY, claimDmOwner, loadRegistry, saveRegistry, watchRoute } from "./topics";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 let dir: string;
@@ -122,6 +122,143 @@ describe("shared bridge routing", () => {
 
     expect(calls.at(-1)?.method).toBe("sendMessage");
     expect(calls.at(-1)?.payload.text).toContain("routes conversations through session topics");
+  });
+
+  test("routes an untopiced DM through the pinned owner instead of the polling session", async () => {
+    claimDmOwner({
+      pid: process.pid,
+      cwd: "/a",
+      name: "fleet",
+      claimedAt: Date.now(),
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+    const delivered: TgMessage[] = [];
+    const incoming = message("yeah go ahead");
+
+    await handleUpdate(
+      makeHost({
+        isDaemon: false,
+        selfPid: process.pid + 1,
+        sessionIdentity: () => ({ sessionFile: "/tmp/other.jsonl" }),
+        deliverLocal: async (msg) => void delivered.push(msg),
+      }),
+      { update_id: 30, message: incoming },
+    );
+
+    expect(delivered).toHaveLength(0);
+    expect(readdirSync(statePath("route", DM_ROUTE_KEY))).toHaveLength(1);
+    const received: TgMessage[] = [];
+    const stop = watchRoute(DM_ROUTE_KEY, (msg) => received.push(msg));
+    stop();
+    expect(received.map((msg) => msg.text)).toEqual([incoming.text]);
+  });
+
+  test("refuses a DM when its pinned owner is not running", async () => {
+    claimDmOwner({
+      pid: 2_000_000_000,
+      cwd: "/a",
+      name: "fleet",
+      claimedAt: Date.now(),
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+    const delivered: TgMessage[] = [];
+
+    await handleUpdate(
+      makeHost({
+        isDaemon: false,
+        selfPid: process.pid,
+        alive: () => false,
+        deliverLocal: async (msg) => void delivered.push(msg),
+      }),
+      { update_id: 31, message: message("continue") },
+    );
+
+    expect(delivered).toHaveLength(0);
+    expect(existsSync(statePath("route", DM_ROUTE_KEY))).toBe(false);
+    expect(calls.at(-1)?.payload.text).toBe(
+      'Direct messages are pinned to omp session "fleet" (/tmp/fleet.jsonl), which is not running. Resume it, or run /telegram own in the session that should receive DMs.',
+    );
+  });
+
+  test("keeps single-session delivery when no DM owner is recorded", async () => {
+    const delivered: TgMessage[] = [];
+    await handleUpdate(
+      makeHost({
+        isDaemon: false,
+        selfPid: process.pid,
+        deliverLocal: async (msg) => void delivered.push(msg),
+      }),
+      { update_id: 32, message: message("hello") },
+    );
+
+    expect(delivered.map((msg) => msg.text)).toEqual(["hello"]);
+  });
+
+  test("recognizes a resumed DM owner by session file instead of stale pid", async () => {
+    claimDmOwner({
+      pid: 2_000_000_000,
+      cwd: "/a",
+      name: "fleet",
+      claimedAt: Date.now(),
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+    const delivered: TgMessage[] = [];
+
+    await handleUpdate(
+      makeHost({
+        isDaemon: false,
+        selfPid: process.pid,
+        sessionIdentity: () => ({ sessionFile: "/tmp/fleet.jsonl" }),
+        alive: () => false,
+        deliverLocal: async (msg) => void delivered.push(msg),
+      }),
+      { update_id: 33, message: message("resumed") },
+    );
+
+    expect(delivered.map((msg) => msg.text)).toEqual(["resumed"]);
+    expect(calls).toEqual([]);
+  });
+
+  test("spools session commands to a live foreign DM owner", async () => {
+    claimDmOwner({
+      pid: process.pid,
+      cwd: "/a",
+      name: "fleet",
+      claimedAt: Date.now(),
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+    const sessionCommands: string[] = [];
+
+    await handleUpdate(
+      makeHost({
+        isDaemon: false,
+        selfPid: process.pid + 1,
+        sessionIdentity: () => ({ sessionFile: "/tmp/other.jsonl" }),
+        handleSessionCommand: async (_msg, parsed) => {
+          sessionCommands.push(parsed.name);
+          return true;
+        },
+      }),
+      { update_id: 34, message: message("/stop") },
+    );
+
+    expect(sessionCommands).toEqual([]);
+    expect(readdirSync(statePath("route", DM_ROUTE_KEY))).toHaveLength(1);
+  });
+
+  test("the daemon forwards untopiced DMs to a live owner", async () => {
+    claimDmOwner({
+      pid: process.pid,
+      cwd: "/a",
+      name: "fleet",
+      claimedAt: Date.now(),
+      sessionFile: "/tmp/fleet.jsonl",
+    });
+
+    await handleUpdate(makeHost(), { update_id: 35, message: message("hello") });
+
+    expect(readdirSync(statePath("route", DM_ROUTE_KEY))).toHaveLength(1);
+    expect(calls).toEqual([]);
   });
 
   test("handles global commands in the daemon", async () => {
