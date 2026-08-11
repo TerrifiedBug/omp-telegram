@@ -22,13 +22,16 @@ import {
 } from "./control";
 import type { TelegramPromptController } from "./prompts";
 import {
+  DM_ROUTE_KEY,
   type ThreadEntry,
   decideRoute,
   isAlive,
   isResumedOwner,
+  loadDmOwner,
   loadRegistry,
   purgeRouteDir,
   releaseThread,
+  sameSession,
   staleThreads,
   writeRouted,
 } from "./topics";
@@ -138,6 +141,10 @@ export interface BridgeHost {
   log: Logger;
   spawnController: SpawnController;
   promptController: TelegramPromptController;
+  /** This process's durable session identity, for DM-owner self-matching. Daemon leaves it unset. */
+  sessionIdentity?(): { sessionId?: string; sessionFile?: string };
+  /** Liveness probe seam; defaults to isAlive. */
+  alive?(pid: number): boolean;
   handleSessionCommand?(msg: TgMessage, parsed: { name: string; args: string }): Promise<boolean>;
   deliverLocal?(msg: TgMessage): Promise<void>;
   /** Test seam for the external herdr resume side effect. */
@@ -617,8 +624,9 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
   if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name)) return;
   if (msg.chat.type === "private" && parsed && Object.hasOwn(GLOBAL_COMMANDS, parsed.name) && (await handleGlobalCommand(host, msg, parsed))) return;
 
+  const aliveFn = host.alive ?? isAlive;
   const registry = loadRegistry(host.warn);
-  const route = access.topicsChat ? decideRoute(msg, access.topicsChat, registry, host.selfPid, isAlive) : { kind: "untopiced" as const };
+  const route = access.topicsChat ? decideRoute(msg, access.topicsChat, registry, host.selfPid, aliveFn) : { kind: "untopiced" as const };
   if (route.kind !== "untopiced") {
     const threadId = msg.message_thread_id;
     const result = gate(msg, host.botUsername(), access);
@@ -681,7 +689,16 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
     return;
   }
 
-  if (msg.chat.type === "private" && parsed) {
+  const owner = msg.chat.type === "private" ? loadDmOwner(host.warn) : undefined;
+  const self = host.sessionIdentity?.();
+  const ownerIsSelf =
+    !!owner &&
+    !host.isDaemon &&
+    (owner.pid === host.selfPid ||
+      sameSession(owner, { sessionId: self?.sessionId, sessionFile: self?.sessionFile }));
+  const foreignOwner = owner && !ownerIsSelf ? owner : undefined;
+
+  if (msg.chat.type === "private" && parsed && !foreignOwner) {
     if (host.isDaemon && (await handleDaemonSessionCommand(host, access, msg, parsed))) return;
     if (!host.isDaemon && host.handleSessionCommand && (await host.handleSessionCommand(msg, parsed))) return;
   }
@@ -698,6 +715,29 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
       chat_id: String(msg.chat.id),
       text: `${lead} — run in omp:\n\n/telegram pair ${result.code}`,
     }).catch(() => {});
+    return;
+  }
+  if (foreignOwner) {
+    if (aliveFn(foreignOwner.pid)) {
+      try {
+        writeRouted(DM_ROUTE_KEY, msg);
+      } catch (err) {
+        host.log.warn(`[telegram] dm route write failed: ${String(err)}`);
+        await host
+          .callTelegram("sendMessage", {
+            chat_id: String(msg.chat.id),
+            text: "Could not queue this message for the pinned DM owner session — check the bridge state directory.",
+          })
+          .catch(() => {});
+      }
+    } else {
+      await host
+        .callTelegram("sendMessage", {
+          chat_id: String(msg.chat.id),
+          text: `Direct messages are pinned to omp session "${foreignOwner.name}" (${foreignOwner.sessionFile ?? foreignOwner.sessionId ?? `pid ${foreignOwner.pid}`}), which is not running. Resume it, or run /telegram own in the session that should receive DMs.`,
+        })
+        .catch(() => {});
+    }
     return;
   }
   if (host.isDaemon) {

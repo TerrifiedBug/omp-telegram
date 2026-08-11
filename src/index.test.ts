@@ -142,7 +142,7 @@ describe("/telegram argument completions", () => {
     const items = telegramArgumentCompletions("") ?? [];
     expect(items.map((i) => i.label)).toEqual([
       "status", "doctor", "daemon", "token", "on", "off", "pair", "deny",
-      "allow", "remove", "policy", "group", "set", "notify", "topics",
+      "allow", "remove", "policy", "group", "set", "notify", "own", "topics",
     ]);
     expect(items.find((i) => i.label === "topics")?.description).toBe("per-project session topics");
   });
@@ -159,6 +159,7 @@ describe("/telegram argument completions", () => {
     expect(labels("daemon ")).toEqual(["status", "restart", "stop"]);
     expect(labels("policy ")).toEqual(["pairing", "allowlist", "disabled"]);
     expect(labels("notify ")).toEqual(["off", "away", "always", "status", "clear"]);
+    expect(labels("own ")).toEqual(["status", "clear"]);
   });
 
   test("completes set keys and their enum values", () => {
