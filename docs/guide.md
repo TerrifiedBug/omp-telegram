@@ -211,9 +211,11 @@ prints the bot token. `/telegram daemon restart` replaces a stale or
 wrong-version daemon; a live session poller takes over automatically whenever
 the daemon is unavailable.
 
-The poll lock stores the process and session identity. Its mtime is a heartbeat
-that updates every 15 seconds. A contender cannot reclaim a lock with a heartbeat
-younger than 45 seconds, even when its PID probe fails.
+The poll lock stores the PID, a random per-process nonce, and the session
+identity. Its mtime is a heartbeat that updates every 15 seconds. The nonce
+prevents a different process with the same numeric PID from re-entering,
+refreshing, or releasing the lock. A contender cannot reclaim a lock with a
+heartbeat younger than 45 seconds, even when its PID probe fails.
 
 If Telegram returns a `409` polling conflict, the losing poller stops its
 heartbeat and releases its lock. If the lock record identifies a different live
@@ -290,7 +292,7 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `access.json` | Access + config state (atomic writes) |
 | `inbox/` | Downloaded attachments; each file is ≤ 20 MiB, and startup/download cleanup removes files older than 7 days then prunes oldest files above 250 MiB total |
 | `prompts/` | Cross-process selectable-question requests (live while their owning session is) and their answers (GC'd after a short grace) |
-| `bot.lock` | Poller PID, owner identity, and heartbeat mtime |
+| `bot.lock` | Poller PID, random process nonce, owner identity, and heartbeat mtime |
 | `dm-owner.json` | Session that receives private DMs without a topic |
 | `daemon.json` | Standalone daemon PID, plugin version, and start time |
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
