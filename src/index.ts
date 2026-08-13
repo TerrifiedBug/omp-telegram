@@ -2165,6 +2165,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       canAnswerPrompt(telegramTarget.responderId, telegramTarget.chatId, telegramTarget.chatType, a)
     ) {
       token = resolveToken();
+      if (token.length > 0) outbound.setToken(token);
     }
     const enabled = bridgeEnabled(a);
     if (!telegramTarget && !enabled) {
