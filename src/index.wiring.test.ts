@@ -13,6 +13,7 @@ type ToolResult = { content: { type: string; text: string }[]; isError?: true };
 type ToolShape = {
   name: string;
   execute(id: string, params: unknown, signal: AbortSignal | undefined, onUpdate: undefined, ctx: unknown): Promise<ToolResult>;
+  defaultInactive?: boolean;
 };
 type Harness = {
   tools: Map<string, ToolShape>;
@@ -25,7 +26,7 @@ type Harness = {
 // A structural fake ExtensionAPI that captures registrations and tool-set
 // mutations so we can drive the real extension handlers without a live bridge.
 // These are runtime-populated collections keyed dynamically, hence Map.
-function harness(initialTools: string[]): Harness {
+function harness(initialTools: string[], activateRegisteredTools = false): Harness {
   const tools = new Map<string, ToolShape>();
   const commands = new Map<string, { handler: CommandHandler }>();
   const handlers = new Map<string, EventHandler[]>();
@@ -37,7 +38,10 @@ function harness(initialTools: string[]): Harness {
   const pi = {
     typebox: { Type: anyType },
     logger: { warn() {}, debug() {}, info() {}, error() {} },
-    registerTool: (tool: ToolShape) => tools.set(tool.name, tool),
+    registerTool: (tool: ToolShape) => {
+      tools.set(tool.name, tool);
+      if (activateRegisteredTools && tool.defaultInactive !== true && !active.includes(tool.name)) active.push(tool.name);
+    },
     registerCommand: (name: string, opts: { handler: CommandHandler }) => commands.set(name, opts),
     registerFlag: () => {},
     registerShortcut: () => {},
@@ -286,6 +290,53 @@ describe("extension wiring", () => {
     expect(mounted).toContain("ask"); // ...but a local turn keeps the native ask; only away/always and Telegram turns swap
   });
 
+  test("daemon profile keeps telegram_ask across agent_end for ticks that skip before_agent_start", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    const h = harness(["ask", "read"], true);
+    await startBridge(h);
+    const ctx = {
+      hasUI: false,
+      isIdle: () => true,
+      ui: { notify() {} },
+      sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" },
+    };
+
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "operator turn", systemPrompt: [] },
+      ctx,
+    );
+    await h.handlers.get("agent_end")?.[0]?.(
+      { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] },
+      ctx,
+    );
+    await h.handlers.get("turn_start")?.[0]?.({ type: "turn_start", turnIndex: 0 }, ctx);
+
+    expect(h.active()).toContain("telegram_ask");
+  });
+
+  test("daemon profile removes telegram_ask from task subagents", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    const h = harness(["ask", "read", "yield"], true);
+    expect(h.active()).toContain("telegram_ask");
+
+    await h.handlers.get("session_start")?.[0]?.({ type: "session_start" }, { hasUI: false });
+
+    expect(h.active()).not.toContain("telegram_ask");
+  });
+
+  test("changing the profile updates the persistent telegram_ask mount", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42" });
+    const h = harness(["ask", "read"]);
+    const ctx = { ui: { notify() {} } };
+    expect(h.active()).not.toContain("telegram_ask");
+
+    await h.commands.get("telegram")?.handler("set profile daemon", ctx);
+    expect(h.active()).toContain("telegram_ask");
+
+    await h.commands.get("telegram")?.handler("set profile default", ctx);
+    expect(h.active()).not.toContain("telegram_ask");
+  });
+
   test("a resumed daemon turn hydrates the bridge, mounts telegram_ask, and reaches its paired owner", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
     writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
@@ -351,14 +402,14 @@ describe("extension wiring", () => {
   test("a resumed local turn keeps telegram_ask unmounted when the bridge is disabled despite a saved token", async () => {
     writeAccess({ enabled: false, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
     writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
-    const h = harness(["ask", "read"]);
+    const h = harness(["ask", "read"], true);
 
     await h.handlers.get("before_agent_start")?.[0]?.(
       { type: "before_agent_start", prompt: "resumed scheduled tick", systemPrompt: [] },
       { hasUI: false },
     );
 
-    expect(h.active()).toEqual(["ask", "read"]);
+    expect(h.active()).not.toContain("telegram_ask");
     expect(h.setActiveCalls).toEqual([]);
   });
 
