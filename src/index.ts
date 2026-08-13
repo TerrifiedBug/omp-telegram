@@ -607,17 +607,32 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     return pi.getFlag("telegram") === true || process.env.OMP_TELEGRAM === "1" || a.enabled;
   }
 
+  function daemonAskEnabled(a: Access): boolean {
+    return a.profile === "daemon" && bridgeEnabled(a);
+  }
+
+  async function syncDaemonAskTool(a: Access): Promise<void> {
+    const tools = pi.getActiveTools();
+    const mounted = tools.includes("telegram_ask");
+    const enabled = daemonAskEnabled(a);
+    if (mounted === enabled) return;
+    await pi.setActiveTools(enabled ? [...tools, "telegram_ask"] : tools.filter((name) => name !== "telegram_ask"));
+  }
+
   function notifyOnce(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error"): void {
     if (notified.has(message)) return;
     notified.add(message);
     ctx?.ui.notify(message, level);
   }
-  async function restorePromptTools(): Promise<void> {
+  async function restorePromptTools(removeAsk = false): Promise<void> {
     activePromptTarget = undefined;
-    if (!savedPromptTools) return;
-    const tools = savedPromptTools;
+    const saved = savedPromptTools;
+    const tools = saved ?? (removeAsk ? pi.getActiveTools() : undefined);
     savedPromptTools = undefined;
-    await pi.setActiveTools(tools);
+    if (!tools) return;
+    const restored = removeAsk ? tools.filter((name) => name !== "telegram_ask") : tools;
+    if (saved === undefined && restored.length === tools.length) return;
+    await pi.setActiveTools(restored);
   }
 
 
@@ -1624,7 +1639,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function cmdSet(ctx: ExtensionContext, parts: string[]): void {
+  async function cmdSet(ctx: ExtensionContext, parts: string[]): Promise<void> {
     const [key, ...rest] = parts;
     const value = rest.join(" ");
     const a = loadAccess(warn);
@@ -1676,6 +1691,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
     saveAccess(a);
     access = a;
+    if (key === "profile") await syncDaemonAskTool(a);
     ctx.ui.notify(`telegram: set ${key}`, "info");
   }
 
@@ -1898,7 +1914,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     description:
       "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; when both are offered you are at the terminal, so prefer ask unless the question should also reach Telegram. Use it exactly as you would use ask.",
     approval: "read",
-    defaultInactive: true,
+    // Agent-initiated custom turns (including conductor ticks) bypass
+    // before_agent_start. A daemon profile therefore keeps its only interactive
+    // operator surface active for the session lifetime, not just user prompts.
+    defaultInactive: !daemonAskEnabled(loadAccess(warn)),
     parameters: T.Object({
       questions: T.Array(
         T.Object({
@@ -2050,12 +2069,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           saveAccess(access);
           ensureDaemon(warn);
           await startBot(ctx, true);
+          await syncDaemonAskTool(access);
           break;
         case "off":
           access.enabled = false;
           saveAccess(access);
           ensureDaemon(warn);
           stopBot();
+          await syncDaemonAskTool(access);
           ctx.ui.notify("telegram: bridge stopped", "info");
           break;
         case "pair":
@@ -2077,7 +2098,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           cmdGroup(ctx, rest);
           break;
         case "set":
-          cmdSet(ctx, rest);
+          await cmdSet(ctx, rest);
           break;
         case "notify":
           cmdNotify(ctx, arg);
@@ -2121,7 +2142,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_e, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
+      await restorePromptTools(true);
+      return;
+    }
     lastCtx = ctx;
     await promptController.pruneExpired().catch((err) => warn(`prompt cleanup failed: ${String(err)}`));
     access = loadAccess(warn);
@@ -2153,7 +2177,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
     const a = loadAccess(warn);
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
-      await restorePromptTools();
+      await restorePromptTools(true);
       return;
     }
     // The shared daemon can inject a Telegram turn into a resumed session that
