@@ -249,6 +249,44 @@ describe("extension wiring", () => {
     expect(mounted).toContain("ask"); // ...but a local turn keeps the native ask; only away/always and Telegram turns swap
   });
 
+  test("a resumed daemon turn mounts telegram_ask and reaches its paired owner before session_start", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    const h = harness(["ask", "read"]);
+    const result = (await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "resumed scheduled tick", systemPrompt: [] },
+      {},
+    )) as { systemPrompt: string[] } | undefined;
+
+    expect(h.active()).toContain("telegram_ask");
+    expect(h.active()).not.toContain("ask");
+    expect(result?.systemPrompt.at(-1)).toContain("headless");
+
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const stop = new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ method: String(input).split("/").pop()!, body: JSON.parse(String(init?.body ?? "{}")) });
+      stop.abort();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const askResult = await h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions: [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] },
+        stop.signal,
+        undefined,
+        { hasUI: false },
+      );
+      expect(askResult.isError).toBe(true);
+      expect(askResult.content[0].text).not.toContain("no surface available");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(calls[0]?.method).toBe("sendMessage");
+    expect(calls[0]?.body.chat_id).toBe("42");
+  });
+
   test("before_agent_start adds no away nudge when telegram_ask is merely mounted", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"] });
     const h = harness(["ask"]);

@@ -2148,6 +2148,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event) => {
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
     const a = loadAccess(warn);
+    // A resumed session can reach a turn without session_start priming this closure.
+    if (token.length === 0) token = resolveToken();
     // Terminal-originated turn while away/always: route `ask` to Telegram too,
     // reusing the same swap. buildPromptTarget returns undefined (leaving native
     // `ask` untouched) when there is no answerable owner destination.
