@@ -603,6 +603,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     return bridgeHost.ownThreadId();
   });
 
+  function bridgeEnabled(a: Access): boolean {
+    return pi.getFlag("telegram") === true || process.env.OMP_TELEGRAM === "1" || a.enabled;
+  }
+
   function notifyOnce(ctx: ExtensionContext | undefined, message: string, level: "info" | "warning" | "error"): void {
     if (notified.has(message)) return;
     notified.add(message);
@@ -2121,7 +2125,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     lastCtx = ctx;
     await promptController.pruneExpired().catch((err) => warn(`prompt cleanup failed: ${String(err)}`));
     access = loadAccess(warn);
-    if (pi.getFlag("telegram") === true || process.env.OMP_TELEGRAM === "1" || access.enabled) {
+    if (bridgeEnabled(access)) {
       await pruneInbox(statePath("inbox")).catch((err) => warn(`inbox cleanup failed: ${String(err)}`));
       await startBot(ctx);
     }
@@ -2145,11 +2149,25 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     access = a;
     ctx.ui.notify("telegram: away off — you're back at the terminal, runs stay on-screen (run /away to re-arm)", "info");
   });
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
     const a = loadAccess(warn);
-    // A resumed session can reach a turn without session_start priming this closure.
-    if (token.length === 0) token = resolveToken();
+    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
+      await restorePromptTools();
+      return;
+    }
+    const enabled = bridgeEnabled(a);
+    if (!telegramTarget && !enabled) {
+      await restorePromptTools();
+      return;
+    }
+    // A resumed session can reach a turn without session_start priming the
+    // bridge. Hydrate the same lifecycle here before deciding its tool surface.
+    if (enabled && token.length === 0) {
+      lastCtx = ctx;
+      access = a;
+      await startBot(ctx);
+    }
     // Terminal-originated turn while away/always: route `ask` to Telegram too,
     // reusing the same swap. buildPromptTarget returns undefined (leaving native
     // `ask` untouched) when there is no answerable owner destination.
