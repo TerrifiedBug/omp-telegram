@@ -182,15 +182,23 @@ describe("extension wiring", () => {
     expect(swapped).toContain("read");
     expect(result?.systemPrompt.at(-1)).toContain("Telegram");
 
-    const calls: string[] = [];
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
     const stop = new AbortController();
     const realFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      calls.push(String(input));
-      stop.abort();
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+      if (calls.length === 2) stop.abort();
       return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
     }) as typeof fetch;
     try {
+      const sendResult = await h.tools.get("telegram_send")!.execute(
+        "send",
+        { chat_id: "42", text: "reply from resumed turn" },
+        undefined,
+        undefined,
+        { hasUI: false },
+      );
+      expect(sendResult.isError).toBeUndefined();
       const askResult = await h.tools.get("telegram_ask")!.execute(
         "ask",
         { questions: [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] },
@@ -203,7 +211,11 @@ describe("extension wiring", () => {
     } finally {
       globalThis.fetch = realFetch;
     }
-    expect(calls[0]).toContain("/bot111:wiring-test/sendMessage");
+    expect(calls[0]).toMatchObject({
+      url: expect.stringContaining("/bot111:wiring-test/sendMessage"),
+      body: { chat_id: "42" },
+    });
+    expect(calls[1]?.url).toContain("/bot111:wiring-test/sendMessage");
   });
 
   test("a Telegram steering message gives telegram_send its default chat", async () => {
