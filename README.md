@@ -199,6 +199,6 @@ Architecture decisions live in [`docs/adr/`](docs/adr/).
 ## Development
 
 ```bash
-bun install --frozen-lockfile
+bun install
 bun run check
 ```

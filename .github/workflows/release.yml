@@ -31,7 +31,7 @@ jobs:
           package-manager-cache: false
       - name: Require tag to match package version
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
-      - run: bun install --frozen-lockfile
+      - run: bun install
       - run: bun run check
       - name: Install trusted-publishing-capable npm
         run: npm install --global npm@11.5.1
