@@ -290,9 +290,10 @@ describe("extension wiring", () => {
     expect(mounted).toContain("ask"); // ...but a local turn keeps the native ask; only away/always and Telegram turns swap
   });
 
-  test("daemon profile keeps telegram_ask across agent_end for ticks that skip before_agent_start", async () => {
+  test("daemon profile mounts telegram_ask at registration and preserves it across agent_end", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
     const h = harness(["ask", "read"], true);
+    expect(h.active()).toContain("telegram_ask");
     await startBridge(h);
     const ctx = {
       hasUI: false,
@@ -309,7 +310,8 @@ describe("extension wiring", () => {
       { type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] },
       ctx,
     );
-    await h.handlers.get("turn_start")?.[0]?.({ type: "turn_start", turnIndex: 0 }, ctx);
+    // Agent-initiated custom turns inherit this surface; they do not run
+    // before_agent_start and no Telegram turn_start handler remounts it.
 
     expect(h.active()).toContain("telegram_ask");
   });
