@@ -166,19 +166,44 @@ describe("extension wiring", () => {
     expect(notices.at(-1)).toContain("DM owner cleared");
   });
 
-  test("before_agent_start swaps ask -> telegram_ask for a Telegram-originated turn", async () => {
+  test("a resumed Telegram turn resolves its token, swaps ask, and reaches the originating owner", async () => {
+    writeAccess({ enabled: false, allowFrom: ["42"] });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
     const h = harness(["ask", "read", "bash"]);
     const beforeStart = h.handlers.get("before_agent_start")?.[0];
     expect(beforeStart).toBeDefined();
     const result = (await beforeStart?.(
       { type: "before_agent_start", prompt: '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>', systemPrompt: [] },
-      {},
+      { hasUI: false },
     )) as { systemPrompt: string[] } | undefined;
     const swapped = h.setActiveCalls.at(-1);
     expect(swapped).toContain("telegram_ask");
     expect(swapped).not.toContain("ask");
     expect(swapped).toContain("read");
     expect(result?.systemPrompt.at(-1)).toContain("Telegram");
+
+    const calls: string[] = [];
+    const stop = new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      stop.abort();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const askResult = await h.tools.get("telegram_ask")!.execute(
+        "ask",
+        { questions: [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] },
+        stop.signal,
+        undefined,
+        { hasUI: false },
+      );
+      expect(askResult.isError).toBe(true);
+      expect(askResult.content[0].text).not.toContain("no surface available");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(calls[0]).toContain("/bot111:wiring-test/sendMessage");
   });
 
   test("a Telegram steering message gives telegram_send its default chat", async () => {
@@ -247,6 +272,96 @@ describe("extension wiring", () => {
     const mounted = h.setActiveCalls.at(-1);
     expect(mounted).toContain("telegram_ask"); // discovery: the tool's own no-surface guard replaces `No such tool`
     expect(mounted).toContain("ask"); // ...but a local turn keeps the native ask; only away/always and Telegram turns swap
+  });
+
+  test("a resumed daemon turn hydrates the bridge, mounts telegram_ask, and reaches its paired owner", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    // Match startBridge(): a live standalone daemon means startBot hydrates the
+    // session lifecycle without issuing getMe or starting a second poller.
+    writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: "test", startedAt: Date.now() }));
+    const h = harness(["ask", "read"]);
+    const ctx = {
+      hasUI: false,
+      ui: { notify() {} },
+      sessionManager: {
+        getSessionId: () => "resumed-session",
+        getSessionFile: () => "/tmp/resumed-session.jsonl",
+      },
+    };
+    const result = (await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "resumed scheduled tick", systemPrompt: [] },
+      ctx,
+    )) as { systemPrompt: string[] } | undefined;
+
+    expect(h.active()).toContain("telegram_ask");
+    expect(h.active()).not.toContain("ask");
+    expect(result?.systemPrompt.at(-1)).toContain("headless");
+    expect(loadDmOwner()).toMatchObject({
+      pid: process.pid,
+      sessionId: "resumed-session",
+      sessionFile: "/tmp/resumed-session.jsonl",
+    });
+
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const stop = new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ method: String(input).split("/").pop()!, body: JSON.parse(String(init?.body ?? "{}")) });
+      if (calls.length === 2) stop.abort();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const sendResult = await h.tools.get("telegram_send")!.execute(
+        "send",
+        { chat_id: "42", text: "bridge hydrated" },
+        undefined,
+        undefined,
+        { hasUI: false },
+      );
+      expect(sendResult.isError).toBeUndefined();
+      const askResult = await h.tools.get("telegram_ask")!.execute(
+        "ask",
+        { questions: [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] },
+        stop.signal,
+        undefined,
+        { hasUI: false },
+      );
+      expect(askResult.isError).toBe(true);
+      expect(askResult.content[0].text).not.toContain("no surface available");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(calls[0]).toMatchObject({ method: "sendMessage", body: { chat_id: "42", text: "bridge hydrated" } });
+    expect(calls[1]).toMatchObject({ method: "sendMessage", body: { chat_id: "42" } });
+  });
+
+  test("a resumed local turn keeps telegram_ask unmounted when the bridge is disabled despite a saved token", async () => {
+    writeAccess({ enabled: false, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    const h = harness(["ask", "read"]);
+
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "resumed scheduled tick", systemPrompt: [] },
+      { hasUI: false },
+    );
+
+    expect(h.active()).toEqual(["ask", "read"]);
+    expect(h.setActiveCalls).toEqual([]);
+  });
+
+  test("a resumed task subagent stays detached from the enabled Telegram bridge", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], notifyChat: "42", profile: "daemon" });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    const h = harness(["read", "yield"]);
+
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt: "subagent turn", systemPrompt: [] },
+      { hasUI: false },
+    );
+
+    expect(h.active()).toEqual(["read", "yield"]);
+    expect(h.setActiveCalls).toEqual([]);
   });
 
   test("before_agent_start adds no away nudge when telegram_ask is merely mounted", async () => {
