@@ -33,6 +33,8 @@
     "src/prompts.ts",
     "src/topics.ts",
     "README.md",
+    "SECURITY.md",
+    "docs",
     "LICENSE"
   ],
   "scripts": {

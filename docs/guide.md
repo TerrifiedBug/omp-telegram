@@ -572,7 +572,7 @@ starts a fresh session in a brand-new topic.
 ## Development
 
 ```bash
-bun install --frozen-lockfile
+bun install
 bun run typecheck
 bun test
 # or both:
