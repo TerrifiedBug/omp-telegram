@@ -166,19 +166,44 @@ describe("extension wiring", () => {
     expect(notices.at(-1)).toContain("DM owner cleared");
   });
 
-  test("before_agent_start swaps ask -> telegram_ask for a Telegram-originated turn", async () => {
+  test("a resumed Telegram turn resolves its token, swaps ask, and reaches the originating owner", async () => {
+    writeAccess({ enabled: false, allowFrom: ["42"] });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
     const h = harness(["ask", "read", "bash"]);
     const beforeStart = h.handlers.get("before_agent_start")?.[0];
     expect(beforeStart).toBeDefined();
     const result = (await beforeStart?.(
       { type: "before_agent_start", prompt: '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>', systemPrompt: [] },
-      {},
+      { hasUI: false },
     )) as { systemPrompt: string[] } | undefined;
     const swapped = h.setActiveCalls.at(-1);
     expect(swapped).toContain("telegram_ask");
     expect(swapped).not.toContain("ask");
     expect(swapped).toContain("read");
     expect(result?.systemPrompt.at(-1)).toContain("Telegram");
+
+    const calls: string[] = [];
+    const stop = new AbortController();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      stop.abort();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const askResult = await h.tools.get("telegram_ask")!.execute(
+        "ask",
+        { questions: [{ id: "q", question: "Pick one", options: [{ label: "A" }, { label: "B" }] }] },
+        stop.signal,
+        undefined,
+        { hasUI: false },
+      );
+      expect(askResult.isError).toBe(true);
+      expect(askResult.content[0].text).not.toContain("no surface available");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(calls[0]).toContain("/bot111:wiring-test/sendMessage");
   });
 
   test("a Telegram steering message gives telegram_send its default chat", async () => {

@@ -2156,6 +2156,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       await restorePromptTools();
       return;
     }
+    // The shared daemon can inject a Telegram turn into a resumed session that
+    // is not configured to start its own bridge. That source is already live;
+    // recover the token needed to answer its authorized sender.
+    if (
+      token.length === 0 &&
+      telegramTarget &&
+      canAnswerPrompt(telegramTarget.responderId, telegramTarget.chatId, telegramTarget.chatType, a)
+    ) {
+      token = resolveToken();
+    }
     const enabled = bridgeEnabled(a);
     if (!telegramTarget && !enabled) {
       await restorePromptTools();
