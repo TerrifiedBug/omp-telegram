@@ -619,38 +619,106 @@ describe("telegram_ask execute (dual-surface)", () => {
     );
   });
 
-  test("dual-surface terminal answer reports both posts and terminal origin", async () => {
+  test("terminal answer waits for a deferred Telegram post before reporting provenance", async () => {
     const h = harness(["ask", "read"]);
     await activateDualSurfaces(h);
-    const telegramPosted = Promise.withResolvers<void>();
+    const telegramStarted = Promise.withResolvers<void>();
+    const telegramResponse = Promise.withResolvers<Response>();
     const telegramClosed = Promise.withResolvers<void>();
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async (input: string | URL | Request) => {
       const method = String(input).split("/").pop();
-      if (method === "sendMessage") telegramPosted.resolve();
+      if (method === "sendMessage") {
+        telegramStarted.resolve();
+        return telegramResponse.promise;
+      }
       if (method === "editMessageText") telegramClosed.resolve();
       return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
     try {
-      const res = await h.tools.get("telegram_ask")!.execute(
+      let settled = false;
+      const result = h.tools.get("telegram_ask")!.execute(
         "t",
         { questions },
         undefined,
         undefined,
         {
           hasUI: true,
+          ui: { askDialog: (qs: DialogQuestion[]) => submit(qs) },
+        },
+      );
+      void result.then(() => {
+        settled = true;
+      });
+      await telegramStarted.promise;
+      await Bun.sleep(0);
+      expect(settled).toBe(false);
+      telegramResponse.resolve(
+        new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const res = await result;
+      expect(res.content[0].text).toBe(
+        'Ask provenance: {"posted":["terminal","telegram"],"answeredBy":"terminal","errors":{}}\nUser selected: A',
+      );
+      await telegramClosed.promise;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("parent cancellation does not wait for a deferred Telegram post", async () => {
+    const h = harness(["ask", "read"]);
+    await activateDualSurfaces(h);
+    const telegramStarted = Promise.withResolvers<void>();
+    const telegramResponse = Promise.withResolvers<Response>();
+    const telegramClosed = Promise.withResolvers<void>();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const method = String(input).split("/").pop();
+      if (method === "sendMessage") {
+        telegramStarted.resolve();
+        return telegramResponse.promise;
+      }
+      if (method === "editMessageText") telegramClosed.resolve();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const stop = new AbortController();
+      const result = h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions },
+        stop.signal,
+        undefined,
+        {
+          hasUI: true,
           ui: {
-            askDialog: async (qs: DialogQuestion[]) => {
-              await telegramPosted.promise;
-              return await submit(qs);
-            },
+            askDialog: (
+              _qs: DialogQuestion[],
+              opts: { signal: AbortSignal },
+            ) =>
+              new Promise<undefined>((resolve) => {
+                if (opts.signal.aborted) resolve(undefined);
+                else opts.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+              }),
           },
         },
       );
+      await telegramStarted.promise;
+      stop.abort();
+      const res = await result;
       expect(res.content[0].text).toBe(
-        'Ask provenance: {"posted":["terminal","telegram"],"answeredBy":"terminal","errors":{}}\nUser selected: A',
+        'Ask provenance: {"posted":["terminal"],"errors":{}}\nThe question was cancelled because the task stopped.',
+      );
+      telegramResponse.resolve(
+        new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+          headers: { "content-type": "application/json" },
+        }),
       );
       await telegramClosed.promise;
     } finally {
