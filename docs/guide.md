@@ -275,8 +275,9 @@ count as a mention.
   question on both the terminal and Telegram at once and returning whichever the
   user answers first. Otherwise it stays mounted alongside `ask` whenever the
   bridge is running with a paired owner, so a locally injected turn (a scheduled
-  tick, an extension-composed prompt) can still reach Telegram: with no terminal
-  to ask at, the question goes to this session's topic, else the owner's DM.
+  tick, an extension-composed prompt) can still reach Telegram. Without a
+  pre-resolved chat, it falls back to this session's topic or the owner's DM and
+  also shows the terminal picker when one is available.
   Requests are responder-, chat-, topic-, message-, and
   nonce-bound, stay answerable while the owning session runs, and use the shared
   state directory for cross-process answers.

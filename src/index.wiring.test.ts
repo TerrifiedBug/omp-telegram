@@ -619,6 +619,47 @@ describe("telegram_ask execute (dual-surface)", () => {
     );
   });
 
+  test("resumed daemon UI ask falls back to the paired owner", async () => {
+    writeAccess({
+      enabled: true,
+      allowFrom: ["42"],
+      notifyChat: "42",
+      notifyMode: "always",
+      profile: "daemon",
+    });
+    const h = harness(["ask", "read"]);
+    await startBridge(h);
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        method: String(input).split("/").pop()!,
+        body: JSON.parse(String(init?.body ?? "{}")),
+      });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const res = await h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions },
+        undefined,
+        undefined,
+        {
+          hasUI: true,
+          ui: { askDialog: (qs: DialogQuestion[]) => submit(qs) },
+        },
+      );
+      expect(res.content[0].text).toBe(
+        'Ask provenance: {"posted":["terminal","telegram"],"answeredBy":"terminal","errors":{}}\nUser selected: A',
+      );
+      expect(calls[0]).toMatchObject({ method: "sendMessage", body: { chat_id: "42" } });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   test("terminal answer waits for a deferred Telegram post before reporting provenance", async () => {
     const h = harness(["ask", "read"]);
     await activateDualSurfaces(h);

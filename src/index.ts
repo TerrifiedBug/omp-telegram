@@ -1986,11 +1986,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const questions: PromptQuestion[] = p.questions.map((q) => ({ ...q, options: q.options ?? [] }));
       const canTerminal = ctx?.hasUI === true && typeof ctx.ui?.askDialog === "function";
       let resolved = activePromptTarget ? { ...activePromptTarget } : undefined;
-      if (!resolved && !canTerminal && token.length > 0) {
-        // Headless turn the bridge never resolved a destination for (a locally
-        // injected or scheduled prompt with notify off). Telegram is the only
-        // surface left, so fall back to the destination telegram_send already
-        // uses: this session's topic, else the paired owner's DM.
+      if (!resolved && token.length > 0) {
+        // A resumed or locally injected turn may not have pre-resolved a
+        // destination. Fall back to the same destination telegram_send uses
+        // so an explicit telegram_ask can reach Telegram alongside a terminal:
+        // this session's topic, else the paired owner's DM.
         const a = loadAccess(warn);
         const ownerId = pairedOwnerId(a);
         const own = ownTopic && a.topicsChat ? { chatId: a.topicsChat, threadId: ownTopic.threadId } : undefined;
