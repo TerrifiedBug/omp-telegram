@@ -2119,7 +2119,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       } catch (err) {
         decision = { result: errorResult(err instanceof Error ? err.message : String(err)) };
       }
-      if (telegramStarted) await telegramPosting?.promise;
+      if (telegramStarted && !signal?.aborted) await telegramPosting?.promise;
       return withAskProvenance(
         decision.result,
         posted,
