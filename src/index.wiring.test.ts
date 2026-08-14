@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type Access, defaultAccess, loadAccess } from "./access";
@@ -593,6 +593,20 @@ describe("telegram_ask execute (dual-surface)", () => {
     })),
   });
 
+  const activateDualSurfaces = async (h: Harness): Promise<void> => {
+    writeAccess({ enabled: false, allowFrom: ["42"] });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      {
+        type: "before_agent_start",
+        prompt:
+          '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>',
+        systemPrompt: [],
+      },
+      { hasUI: true },
+    );
+  };
+
   test("maps a terminal submit to the answer", async () => {
     const h = harness(["ask"]);
     const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
@@ -600,7 +614,119 @@ describe("telegram_ask execute (dual-surface)", () => {
       ui: { askDialog: (qs: DialogQuestion[]) => submit(qs) },
     });
     expect(res.isError).toBeUndefined();
-    expect(res.content[0].text).toContain("User selected: A");
+    expect(res.content[0].text).toBe(
+      'Ask provenance: {"posted":["terminal"],"answeredBy":"terminal","errors":{}}\nUser selected: A',
+    );
+  });
+
+  test("dual-surface terminal answer reports both posts and terminal origin", async () => {
+    const h = harness(["ask", "read"]);
+    await activateDualSurfaces(h);
+    const telegramPosted = Promise.withResolvers<void>();
+    const telegramClosed = Promise.withResolvers<void>();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const method = String(input).split("/").pop();
+      if (method === "sendMessage") telegramPosted.resolve();
+      if (method === "editMessageText") telegramClosed.resolve();
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const res = await h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions },
+        undefined,
+        undefined,
+        {
+          hasUI: true,
+          ui: {
+            askDialog: async (qs: DialogQuestion[]) => {
+              await telegramPosted.promise;
+              return await submit(qs);
+            },
+          },
+        },
+      );
+      expect(res.content[0].text).toBe(
+        'Ask provenance: {"posted":["terminal","telegram"],"answeredBy":"terminal","errors":{}}\nUser selected: A',
+      );
+      await telegramClosed.promise;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("dual-surface Telegram answer reports both posts and Telegram origin", async () => {
+    const h = harness(["ask", "read"]);
+    await activateDualSurfaces(h);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 7 } }), {
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    try {
+      const result = h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions },
+        undefined,
+        undefined,
+        {
+          hasUI: true,
+          ui: {
+            askDialog: (
+              _qs: DialogQuestion[],
+              opts: { signal: AbortSignal },
+            ) =>
+              new Promise<undefined>((resolve) => {
+                if (opts.signal.aborted) resolve(undefined);
+                else opts.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+              }),
+          },
+        },
+      );
+      const answer = (async (): Promise<void> => {
+        const prompts = join(dir, "prompts");
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const requestName = existsSync(prompts)
+            ? readdirSync(prompts).find(
+                (name) => name.endsWith(".json") && !name.endsWith(".answer.json"),
+              )
+            : undefined;
+          if (requestName !== undefined) {
+            const request = JSON.parse(
+              readFileSync(join(prompts, requestName), "utf8"),
+            ) as { nonce: string };
+            writeFileSync(
+              join(prompts, `${request.nonce}.answer.json`),
+              JSON.stringify({
+                expiresAt: Date.now() + 60_000,
+                outcome: {
+                  status: "answered",
+                  answers: [
+                    {
+                      id: "q",
+                      question: "Pick one",
+                      selectedOptions: ["B"],
+                    },
+                  ],
+                },
+              }),
+            );
+            return;
+          }
+          await Bun.sleep(5);
+        }
+        throw new Error("Telegram prompt request was not persisted");
+      })();
+      const [res] = await Promise.all([result, answer]);
+      expect(res.content[0].text).toBe(
+        'Ask provenance: {"posted":["terminal","telegram"],"answeredBy":"telegram","errors":{}}\nUser selected: B',
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   test("preserves a terminal note", async () => {
@@ -630,19 +756,33 @@ describe("telegram_ask execute (dual-surface)", () => {
     expect(res.content[0].text.toLowerCase()).toContain("chat about this");
   });
 
-  test("terminal wins when the Telegram surface fails fast", async () => {
-    writeAccess({ allowFrom: [] }); // responder isn't authorized → Telegram surface rejects before any network call
+  test("Telegram post failure remains explicit beside a terminal answer", async () => {
     const h = harness(["ask", "read"]);
-    await h.handlers.get("before_agent_start")?.[0]?.(
-      { type: "before_agent_start", prompt: '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>', systemPrompt: [] },
-      {},
-    );
-    const res = await h.tools.get("telegram_ask")!.execute("t", { questions }, undefined, undefined, {
-      hasUI: true,
-      ui: { askDialog: (qs: DialogQuestion[]) => submit(qs, ["B"]) },
-    });
-    expect(res.isError).toBeUndefined();
-    expect(res.content[0].text).toContain("User selected: B");
+    await activateDualSurfaces(h);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      throw new Error("sendMessage unavailable");
+    }) as typeof fetch;
+    try {
+      const res = await h.tools.get("telegram_ask")!.execute(
+        "t",
+        { questions },
+        undefined,
+        undefined,
+        {
+          hasUI: true,
+          ui: { askDialog: (qs: DialogQuestion[]) => submit(qs, ["B"]) },
+        },
+      );
+      expect(res.isError).toBeUndefined();
+      expect(res.content[0].text).toBe(
+        'Ask provenance: {"posted":["terminal"],"answeredBy":"terminal","errors":{"telegram":"sendMessage unavailable"}}\n' +
+          "SURFACE ERROR [telegram]: sendMessage unavailable\n" +
+          "User selected: B",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   test("normalizes an omitted-options question into a free-text terminal dialog", async () => {

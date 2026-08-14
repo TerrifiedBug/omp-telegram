@@ -248,7 +248,7 @@ export class TelegramPromptController {
     target: PromptTarget,
     questions: PromptQuestion[],
     signal?: AbortSignal,
-    opts?: { supersededText?: string },
+    opts?: { supersededText?: string; onPosted?: () => void },
   ): Promise<PromptOutcome> {
     if (!this.#authorize(target.responderId, target.chatId, target.chatType)) {
       throw new Error("The originating Telegram user is no longer authorized");
@@ -277,6 +277,7 @@ export class TelegramPromptController {
       text: first.text,
       reply_markup: first.reply_markup,
     });
+    opts?.onPosted?.();
     request.messageId = sent.message_id;
     await atomicJson(requestPath(nonce), request);
 

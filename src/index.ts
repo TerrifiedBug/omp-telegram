@@ -319,6 +319,49 @@ export interface AskSurface<R> {
   run(signal: AbortSignal): Promise<R | undefined>;
 }
 
+type AskSurfaceName = "terminal" | "telegram";
+type AskToolResult = { content: ContentBlock[]; isError?: true };
+type AskDecision = { result: AskToolResult; answeredBy?: AskSurfaceName };
+type AskSurfaceState = Record<AskSurfaceName, boolean>;
+type AskSurfaceErrors = Partial<Record<AskSurfaceName, string>>;
+
+/** Keep answer text compatible while making delivery and answer provenance
+ * machine-readable at the start of every telegram_ask result. */
+function withAskProvenance(
+  result: AskToolResult,
+  posted: AskSurfaceState,
+  answeredBy: AskSurfaceName | undefined,
+  surfaceErrors: AskSurfaceErrors,
+): AskToolResult {
+  const postedSurfaces = (["terminal", "telegram"] as const).filter((surface) => posted[surface]);
+  const errors = {
+    ...(surfaceErrors.terminal === undefined ? {} : { terminal: surfaceErrors.terminal }),
+    ...(surfaceErrors.telegram === undefined ? {} : { telegram: surfaceErrors.telegram }),
+  };
+  const lines = [
+    `Ask provenance: ${JSON.stringify({
+      posted: postedSurfaces,
+      ...(answeredBy === undefined ? {} : { answeredBy }),
+      errors,
+    })}`,
+    ...(surfaceErrors.terminal === undefined
+      ? []
+      : [`SURFACE ERROR [terminal]: ${surfaceErrors.terminal}`]),
+    ...(surfaceErrors.telegram === undefined
+      ? []
+      : [`SURFACE ERROR [telegram]: ${surfaceErrors.telegram}`]),
+  ];
+  const first = result.content[0];
+  if (first?.type === "text") lines.push(first.text);
+  return {
+    ...result,
+    content: [
+      { type: "text", text: lines.join("\n") },
+      ...(first?.type === "text" ? result.content.slice(1) : result.content),
+    ],
+  };
+}
+
 /**
  * Present the same question on several surfaces at once (the terminal picker and
  * Telegram) and take whichever decides first, aborting the rest. A surface that
@@ -1912,7 +1955,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     name: "telegram_ask",
     label: "Telegram Ask",
     description:
-      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; when both are offered you are at the terminal, so prefer ask unless the question should also reach Telegram. Use it exactly as you would use ask.",
+      "Ask the user one or more questions: single-select, multi-select, or free-text. Provide 2-8 options for a choice, or omit options for a free-text answer the user types as a reply. While active it shows the question on both the terminal and Telegram (each when available) and returns whichever the user answers first. Every result names the surfaces successfully posted, the answer origin, and any per-surface posting error. It replaces the built-in ask on Telegram-originated turns and while away/always mode is on; when both are offered you are at the terminal, so prefer ask unless the question should also reach Telegram. Use it exactly as you would use ask.",
     approval: "read",
     // Agent-initiated custom turns (including conductor ticks) bypass
     // before_agent_start. A daemon profile therefore keeps its only interactive
@@ -1957,59 +2000,132 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!target && !canTerminal) {
         return errorResult("telegram_ask has no surface available — no Telegram target and no interactive terminal.");
       }
-      const surfaces: AskSurface<{ content: ContentBlock[]; isError?: true }>[] = [];
+      const posted: AskSurfaceState = { terminal: false, telegram: false };
+      const surfaceErrors: AskSurfaceErrors = {};
+      const telegramPosting = target === undefined ? undefined : Promise.withResolvers<void>();
+      let telegramStarted = false;
+      const surfaces: AskSurface<AskDecision>[] = [];
       if (target) {
         surfaces.push({
           run: async (sig) => {
-            const outcome = await promptController.ask(target, questions, sig, { supersededText: "☑️ Closed at the terminal." });
-            if (outcome.status === "answered") return { content: [{ type: "text", text: formatPromptResult(outcome) }] };
-            if (outcome.status === "cancelled") return errorResult(formatPromptResult(outcome));
-            return undefined; // expired, or superseded because the terminal was answered first
+            telegramStarted = true;
+            try {
+              const outcome = await promptController.ask(target, questions, sig, {
+                supersededText: "☑️ Closed at the terminal.",
+                onPosted: () => {
+                  posted.telegram = true;
+                  telegramPosting?.resolve();
+                },
+              });
+              if (outcome.status === "answered") {
+                return {
+                  result: { content: [{ type: "text", text: formatPromptResult(outcome) }] },
+                  answeredBy: "telegram",
+                };
+              }
+              if (outcome.status === "cancelled") {
+                return { result: errorResult(formatPromptResult(outcome)) };
+              }
+              return undefined; // expired, or superseded because the terminal was answered first
+            } catch (err) {
+              const detail = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+              surfaceErrors.telegram = detail || "unknown Telegram surface error";
+              throw err;
+            } finally {
+              telegramPosting?.resolve();
+            }
           },
         });
       }
       if (canTerminal) {
         surfaces.push({
           run: async (sig) => {
-            const result = await ctx.ui.askDialog!(
-              questions.map((q) => ({
-                id: q.id,
-                question: q.question,
-                options: q.options.map((o) => ({ label: o.label, ...(o.description ? { description: o.description } : {}) })),
-                ...(q.multi != null ? { multi: q.multi } : {}),
-                ...(q.recommended != null ? { recommended: q.recommended } : {}),
-              })),
-              { signal: sig },
-            );
-            // Aborted (a sibling surface won, or the turn stopped) → idle; only a real Esc cancels.
-            if (result === undefined) return sig.aborted ? undefined : errorResult("Question cancelled at the terminal.");
-            if (result.kind === "chat") {
-              return { content: [{ type: "text", text: "User chose to chat about this instead of answering." }] };
+            try {
+              const pending = ctx.ui.askDialog!(
+                questions.map((q) => ({
+                  id: q.id,
+                  question: q.question,
+                  options: q.options.map((o) => ({
+                    label: o.label,
+                    ...(o.description ? { description: o.description } : {}),
+                  })),
+                  ...(q.multi != null ? { multi: q.multi } : {}),
+                  ...(q.recommended != null ? { recommended: q.recommended } : {}),
+                })),
+                { signal: sig },
+              );
+              posted.terminal = true;
+              const result = await pending;
+              // Aborted (a sibling surface won, or the turn stopped) → idle; only a real Esc cancels.
+              if (result === undefined) {
+                return sig.aborted
+                  ? undefined
+                  : { result: errorResult("Question cancelled at the terminal.") };
+              }
+              if (result.kind === "chat") {
+                return {
+                  result: {
+                    content: [
+                      { type: "text", text: "User chose to chat about this instead of answering." },
+                    ],
+                  },
+                };
+              }
+              if (
+                result.results.length !== p.questions.length ||
+                result.results.some((item, index) => item.id !== p.questions[index]?.id)
+              ) {
+                throw new Error("ask dialog returned results that do not match the requested questions");
+              }
+              const answers = result.results.map((item) => ({
+                id: item.id,
+                question: item.question,
+                selectedOptions: item.selectedOptions,
+                ...(item.customInput == null ? {} : { customInput: item.customInput }),
+                ...(item.note == null ? {} : { note: item.note }),
+              }));
+              return {
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: formatPromptResult({ status: "answered", answers }),
+                    },
+                  ],
+                },
+                answeredBy: "terminal",
+              };
+            } catch (err) {
+              if (sig.aborted) return undefined;
+              const detail = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, " ").trim();
+              surfaceErrors.terminal = detail || "unknown terminal surface error";
+              throw err;
             }
-            if (
-              result.results.length !== p.questions.length ||
-              result.results.some((item, index) => item.id !== p.questions[index]?.id)
-            ) {
-              throw new Error("ask dialog returned results that do not match the requested questions");
-            }
-            const answers = result.results.map((item) => ({
-              id: item.id,
-              question: item.question,
-              selectedOptions: item.selectedOptions,
-              ...(item.customInput == null ? {} : { customInput: item.customInput }),
-              ...(item.note == null ? {} : { note: item.note }),
-            }));
-            return { content: [{ type: "text", text: formatPromptResult({ status: "answered", answers }) }] };
           },
         });
       }
+      let decision: AskDecision;
       try {
-        const exhausted = (aborted: boolean): { content: ContentBlock[]; isError: true } =>
-          errorResult(aborted ? "The question was cancelled because the task stopped." : "The question expired before it was answered.");
-        return await raceAskSurfaces(surfaces, exhausted, signal, (err) => log.debug(`[telegram] ask surface failed: ${String(err)}`));
+        const exhausted = (aborted: boolean): AskDecision => ({
+          result: errorResult(
+            aborted
+              ? "The question was cancelled because the task stopped."
+              : "The question expired before it was answered.",
+          ),
+        });
+        decision = await raceAskSurfaces(surfaces, exhausted, signal, (err) =>
+          log.debug(`[telegram] ask surface failed: ${String(err)}`),
+        );
       } catch (err) {
-        return errorResult(err instanceof Error ? err.message : String(err));
+        decision = { result: errorResult(err instanceof Error ? err.message : String(err)) };
       }
+      if (telegramStarted) await telegramPosting?.promise;
+      return withAskProvenance(
+        decision.result,
+        posted,
+        decision.answeredBy,
+        surfaceErrors,
+      );
     },
   });
 

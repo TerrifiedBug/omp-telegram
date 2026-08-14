@@ -280,6 +280,11 @@ count as a mention.
   Requests are responder-, chat-, topic-, message-, and
   nonce-bound, stay answerable while the owning session runs, and use the shared
   state directory for cross-process answers.
+  Every result starts with an `Ask provenance` JSON record. `posted` lists only
+  surfaces that successfully received the question, `answeredBy` names the
+  accepted answer's origin, and `errors` preserves per-surface posting failures. A
+  terminal answer therefore cannot hide a failed Telegram post: the result
+  includes a `SURFACE ERROR [telegram]` line alongside the answer.
 
 `telegram_send` and `telegram_react` refuse any chat the inbound gate would not
 deliver from. `telegram_ask` responds only to the exact user who originated the turn.
