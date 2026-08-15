@@ -40,7 +40,12 @@ interface PaneWire {
   agent_session?: unknown;
 }
 
-function resultArray(raw: string, key: "workspaces" | "panes"): unknown[] {
+interface AgentWire {
+  name?: unknown;
+  agent_session?: unknown;
+}
+
+function resultArray(raw: string, key: "workspaces" | "panes" | "agents"): unknown[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -135,6 +140,25 @@ export async function findSessionSpace(sessionFile: string, run: RunHerdr = runH
   });
   if (typeof pane?.workspace_id !== "string") return undefined;
   return (await listControlSpaces(run)).find((space) => space.workspaceId === pane.workspace_id);
+}
+
+/**
+ * The herdr agent name bound to one exact omp session file.
+ *
+ * A pane's agent name is the identity an operator deliberately assigned to it
+ * (`herdr agent start <name>` / `agent rename`) and it is one-to-one with the
+ * session, which is exactly what a per-session topic represents. `pane list` does
+ * not carry it; only `agent list` does.
+ */
+export async function agentNameForSession(
+  sessionFile: string,
+  run: RunHerdr = runHerdr,
+): Promise<string | undefined> {
+  const agents = resultArray(await run(["agent", "list"]), "agents") as AgentWire[];
+  const hit = agents.find(
+    (candidate) => (candidate.agent_session as { value?: unknown } | undefined)?.value === sessionFile,
+  );
+  return typeof hit?.name === "string" && hit.name.length > 0 ? hit.name : undefined;
 }
 
 type HerdrSpaceRef = Pick<ControlSpace, "workspaceId" | "label" | "terminalIds">;

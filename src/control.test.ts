@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess } from "./access";
 import { type TgCallbackQuery, type TgMessage, TgError } from "./api";
-import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
+import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, agentNameForSession, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
 import type { ThreadRegistry } from "./topics";
 
 const workspaceList = (items: unknown[]): string => JSON.stringify({ result: { workspaces: items } });
 const paneList = (items: unknown[]): string => JSON.stringify({ result: { panes: items } });
+const agentList = (items: unknown[]): string => JSON.stringify({ result: { agents: items } });
 
 function snapshotRunner(calls: string[] = []): RunHerdr {
   return async (args) => {
@@ -60,6 +61,35 @@ describe("listControlSpaces", () => {
   test("rejects malformed herdr JSON", async () => {
     const run: RunHerdr = async (args) => (args[0] === "workspace" ? "not-json" : paneList([]));
     await expect(listControlSpaces(run)).rejects.toThrow("invalid JSON");
+  });
+});
+
+describe("agentNameForSession", () => {
+  const run: RunHerdr = async (args) => {
+    if (args.join(" ") !== "agent list") throw new Error(`unexpected command: ${args.join(" ")}`);
+    return agentList([
+      { name: "veltrosecurity", agent_session: { kind: "path", value: "/sessions/fleet.jsonl" } },
+      { name: "", agent_session: { kind: "path", value: "/sessions/unnamed.jsonl" } },
+      { agent_session: { kind: "path", value: "/sessions/nameless.jsonl" } },
+    ]);
+  };
+
+  test("returns the name herdr bound to that exact session file", async () => {
+    expect(await agentNameForSession("/sessions/fleet.jsonl", run)).toBe("veltrosecurity");
+  });
+
+  test("is undefined for a session herdr does not name", async () => {
+    // No entry, an empty name, and a missing name all mean "no deliberate identity",
+    // which leaves the caller on its own fallback rather than a blank topic title.
+    expect(await agentNameForSession("/sessions/absent.jsonl", run)).toBeUndefined();
+    expect(await agentNameForSession("/sessions/unnamed.jsonl", run)).toBeUndefined();
+    expect(await agentNameForSession("/sessions/nameless.jsonl", run)).toBeUndefined();
+  });
+
+  test("rejects a malformed herdr reply rather than guessing a title", async () => {
+    await expect(agentNameForSession("/sessions/fleet.jsonl", async () => "not-json")).rejects.toThrow(
+      "invalid JSON",
+    );
   });
 });
 
