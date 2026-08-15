@@ -1,9 +1,10 @@
 // Per-session forum-topic routing. In topics mode each omp session claims one
-// Telegram forum topic (named after its project dir) in an operator-designated
-// chat; inbound topic messages are routed to the owning session — even across
-// processes — via JSON payload files spooled under the shared state dir and a
-// per-topic watcher. No network here: this module is pure filesystem + policy,
-// so it is fully unit-testable. Telegram I/O stays in api.ts / outbound.ts.
+// Telegram forum topic (named by `sessionTopicTitle` below) in an operator-
+// designated chat; inbound topic messages are routed to the owning session —
+// even across processes — via JSON payload files spooled under the shared state
+// dir and a per-topic watcher. No network here: this module is pure filesystem
+// + policy, so it is fully unit-testable. Telegram I/O stays in api.ts /
+// outbound.ts.
 
 import { randomBytes } from "node:crypto";
 import {
@@ -19,7 +20,7 @@ import {
   watch,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { ensureStateDir, statePath } from "./access";
 import type { Logger, TgMessage } from "./api";
 
@@ -50,6 +51,35 @@ export interface ThreadRegistry {
 export const ROUTED_TTL_MS = 600_000;
 /** Spool key for untopiced private messages routed to the pinned DM owner. */
 export const DM_ROUTE_KEY = "dm" as const;
+
+/**
+ * The title a newly created session topic gets, strongest identity first.
+ *
+ * 1. **herdr agent name** — operator-assigned and one-to-one with the session,
+ *    which is exactly what a per-session topic represents.
+ * 2. **herdr space label** — equally one-to-one with the pane, and captured by
+ *    a *different* call than the agent name, so it still answers when that
+ *    lookup comes back empty.
+ * 3. **`basename(cwd)`** — the last resort, and the reason the first two exist:
+ *    every pane under one directory tree claims the same useless title.
+ *
+ * The middle rung is not belt-and-braces. The agent lookup reads herdr over a
+ * socket and swallows its own failure, and `tidy` closes a topic on exit so the
+ * title is re-derived on every restart rather than once. On a fleet whose panes
+ * share a parent directory — `~/.omp/conductor/…` for two projects, say — a
+ * single missed lookup is enough to retitle a live project's topic after the
+ * shared directory, which is how two projects end up both called "conductor".
+ *
+ * Blank is treated as absent throughout: Telegram rejects an empty topic name,
+ * and a space with no custom name must not consume the fallback chain.
+ */
+export function sessionTopicTitle(
+  agentName: string | undefined,
+  spaceLabel: string | undefined,
+  cwd: string,
+): string {
+  return agentName?.trim() || spaceLabel?.trim() || basename(cwd);
+}
 
 /**
  * Load threads.json. ENOENT / read error → fresh empty registry. Corrupt JSON →

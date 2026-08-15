@@ -455,10 +455,14 @@ back to its project directory), inside one operator-chosen chat.
 ```
 
 - Each session **claims one topic** on start (and when that session runs `/telegram topics on` or `/telegram topics <chat_id>`).
-  Under herdr it is named after the pane's **agent name** — the identity you assigned
-  with `herdr agent start <name>` or `agent rename`, which is one-to-one with the
-  session. Otherwise it falls back to `basename(cwd)`, which is all there is outside
-  herdr and is ambiguous when several panes share one parent directory. A session
+  The title is the strongest identity available, in this order: the pane's **herdr agent
+  name** (what you assigned with `herdr agent start <name>` or `agent rename`, one-to-one
+  with the session), then the pane's **herdr space label**, then `basename(cwd)`.
+  The space is consulted because the agent lookup is best-effort — it reads herdr over a
+  socket and returns nothing on failure — and because `topics tidy on` re-derives the
+  title on every restart rather than once. On a host where several panes share one parent
+  directory, that combination is what used to title every topic after the shared
+  directory. Outside herdr, `basename(cwd)` is all there is. A session
   restarted in the same directory **re-adopts**
   its existing topic instead of creating a duplicate; a second live session in the same
   directory gets a `<name>-<pid>` topic. Sessions already running when topics are first
