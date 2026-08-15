@@ -16,6 +16,7 @@ import {
   loadRegistry,
   purgeRouteDir,
   releaseThread,
+  sessionTopicTitle,
   staleThreads,
   watchRoute,
   writeRouted,
@@ -41,6 +42,42 @@ const topicMsg = (over: Partial<TgMessage> = {}): TgMessage => ({
   is_topic_message: true,
   message_thread_id: 7,
   ...over,
+});
+
+describe("sessionTopicTitle", () => {
+  test("prefers the herdr agent name over everything else", () => {
+    expect(sessionTopicTitle("veltrosecurity", "veltrosecurity", "/root/.omp/conductor")).toBe("veltrosecurity");
+  });
+
+  test("falls back to the herdr space when the agent lookup came back empty", () => {
+    // The lookup reads herdr over a socket and swallows its own failure, so
+    // "no agent name" is a routine outcome, not a broken host.
+    expect(sessionTopicTitle(undefined, "veltrosecurity", "/root/.omp/conductor")).toBe("veltrosecurity");
+  });
+
+  test("falls back to the cwd basename outside herdr", () => {
+    expect(sessionTopicTitle(undefined, undefined, "/srv/checkouts/api")).toBe("api");
+  });
+
+  test("treats blank identities as absent rather than titling a topic with nothing", () => {
+    // Telegram rejects an empty topic name, and a space with no custom name
+    // must not consume the fallback chain on the way past.
+    expect(sessionTopicTitle("", "", "/srv/checkouts/api")).toBe("api");
+    expect(sessionTopicTitle("   ", "veltro", "/srv/checkouts/api")).toBe("veltro");
+    expect(sessionTopicTitle(undefined, "  spaced  ", "/srv/checkouts/api")).toBe("spaced");
+  });
+
+  test("two panes under one directory tree get their own titles, not the shared one", () => {
+    // The regression this rule exists for: both panes live under
+    // ~/.omp/conductor, so basename alone titles both of them "conductor" and
+    // a project's pages land in the other project's topic.
+    const shared = "/root/.omp/conductor";
+    expect(sessionTopicTitle(undefined, "veltrosecurity", shared)).toBe("veltrosecurity");
+    expect(sessionTopicTitle(undefined, "conductor", shared)).toBe("conductor");
+    // Without a space either, both collapse to the same useless title — which
+    // is exactly the state that shipped before this fallback existed.
+    expect(sessionTopicTitle(undefined, undefined, shared)).toBe("conductor");
+  });
 });
 
 describe("decideRoute", () => {

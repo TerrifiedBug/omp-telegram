@@ -59,6 +59,7 @@ import {
   loadRegistry,
   purgeRouteDir,
   releaseThread,
+  sessionTopicTitle,
   watchRoute,
 } from "./topics";
 import { BlockedPings, askQuestionSummary } from "./blocked";
@@ -925,11 +926,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     let name = basename(cwd);
     try {
       await captureOwnSpace(ctx);
-      // Prefer the name herdr knows this pane by. It is assigned deliberately and
-      // is one-to-one with the session, whereas `basename(cwd)` is whatever the
-      // parent directory happens to be called — every pane under one tree then
-      // claims a topic with the same useless title.
-      name = ownAgentName ?? name;
+      // Identity beats the directory name; see `sessionTopicTitle` for why the
+      // herdr space is consulted before falling back to `basename(cwd)`.
+      name = sessionTopicTitle(ownAgentName, ownSpace?.label, cwd);
       const r = loadRegistry(warn);
       const sessionId = ctx?.sessionManager.getSessionId();
       const sessionFile = ctx?.sessionManager.getSessionFile();
