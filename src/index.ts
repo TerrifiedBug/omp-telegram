@@ -42,7 +42,7 @@ import {
   webhookConflictHint,
 } from "./api";
 import { type BridgeHost, clearOwnerBotCommands, ensureControlTopic as ensureBridgeControlTopic, handleUpdate, parseBotCommand, syncBotCommands, tidyRemoteTopic } from "./bridge";
-import { SpawnController, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
+import { SpawnController, agentNameForSession, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
 import { Outbound, finalAssistantText } from "./outbound";
@@ -576,6 +576,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let lockRetryTimer: NodeJS.Timeout | undefined;
   let ownTopic: { threadId: number; name: string } | undefined;
   let ownSpace: { workspaceId: string; label: string; terminalIds: string[] } | undefined;
+  /** herdr agent name for this session, when herdr named this pane. */
+  let ownAgentName: string | undefined;
   let stopWatch: (() => void) | undefined;
   let stopDmWatch: (() => void) | undefined;
   let stopLockBeat: (() => void) | undefined;
@@ -830,6 +832,14 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (ownSpace || process.env.HERDR_ENV !== "1") return;
     const sessionFile = ctx?.sessionManager.getSessionFile();
     const workspaceId = process.env.HERDR_WORKSPACE_ID;
+    if (sessionFile && !ownAgentName) {
+      // Independent of the space lookup below: the agent name is what names this
+      // session's topic, and it must survive a space snapshot that fails.
+      ownAgentName = await agentNameForSession(sessionFile).catch((err) => {
+        warn(`could not read this pane's herdr agent name: ${String(err)}`);
+        return undefined;
+      });
+    }
     try {
       const space =
         (sessionFile ? await findSessionSpace(sessionFile) : undefined) ??
@@ -915,6 +925,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     let name = basename(cwd);
     try {
       await captureOwnSpace(ctx);
+      // Prefer the name herdr knows this pane by. It is assigned deliberately and
+      // is one-to-one with the session, whereas `basename(cwd)` is whatever the
+      // parent directory happens to be called — every pane under one tree then
+      // claims a topic with the same useless title.
+      name = ownAgentName ?? name;
       const r = loadRegistry(warn);
       const sessionId = ctx?.sessionManager.getSessionId();
       const sessionFile = ctx?.sessionManager.getSessionFile();

@@ -442,8 +442,8 @@ Session shutdown and agent completion clear pending timers.
 When several omp sessions share one bot, a single chat can't tell them apart: the
 poll-lock holder receives every message and its replies land in the chat's main
 view, so you can't address a specific session. **Topics mode** gives each session
-its own Telegram **forum topic**, named after its project directory, inside one
-operator-chosen chat.
+its own Telegram **forum topic**, named after the pane herdr knows it by (falling
+back to its project directory), inside one operator-chosen chat.
 
 ```
 /telegram topics on           # topics on, auto-hosted in your paired DM; claim this session's topic
@@ -454,8 +454,12 @@ operator-chosen chat.
 /telegram topics tidy off     # keep topics after exit for re-adoption (default)
 ```
 
-- Each session **claims one topic** on start (and when that session runs `/telegram topics on` or `/telegram topics <chat_id>`),
-  named after `basename(cwd)`. A session restarted in the same directory **re-adopts**
+- Each session **claims one topic** on start (and when that session runs `/telegram topics on` or `/telegram topics <chat_id>`).
+  Under herdr it is named after the pane's **agent name** — the identity you assigned
+  with `herdr agent start <name>` or `agent rename`, which is one-to-one with the
+  session. Otherwise it falls back to `basename(cwd)`, which is all there is outside
+  herdr and is ambiguous when several panes share one parent directory. A session
+  restarted in the same directory **re-adopts**
   its existing topic instead of creating a duplicate; a second live session in the same
   directory gets a `<name>-<pid>` topic. Sessions already running when topics are first
   enabled must reload or restart before they claim one.
