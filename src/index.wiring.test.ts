@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type Access, defaultAccess, loadAccess } from "./access";
 import telegramExtension from "./index";
-import { loadDmOwner } from "./topics";
+import { claimDmOwner, loadDmOwner, loadRegistry } from "./topics";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
@@ -70,6 +70,11 @@ function harness(initialTools: string[], activateRegisteredTools = false): Harne
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 const previousToken = process.env.TELEGRAM_BOT_TOKEN;
+const packageJson: unknown = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
+if (!packageJson || typeof packageJson !== "object" || !("version" in packageJson) || typeof packageJson.version !== "string") {
+  throw new Error("package.json has no string version");
+}
+const packageVersion = packageJson.version;
 let dir: string;
 
 beforeEach(() => {
@@ -97,7 +102,7 @@ function writeAccess(over: Partial<Access>): void {
  */
 async function startBridge(h: Harness): Promise<void> {
   writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
-  writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: "test", startedAt: Date.now() }));
+  writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: packageVersion, startedAt: Date.now() }));
   await h.handlers.get("session_start")?.[0]?.(
     { type: "session_start" },
     {
@@ -143,6 +148,43 @@ describe("extension wiring", () => {
       sessionFile: "/tmp/session-2.jsonl",
     });
     await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, switchedCtx);
+  });
+
+  test("task subagent completion cannot replace the parent routing identity", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    const h = harness(["read", "yield"]);
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop();
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 7 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      expect(loadRegistry().threads["99"]?.sessionFile).toBe("/tmp/session-1.jsonl");
+      expect(loadDmOwner()?.sessionFile).toBe("/tmp/session-1.jsonl");
+
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: [] },
+        {
+          hasUI: false,
+          isIdle: () => true,
+          sessionManager: {
+            getSessionId: () => "child-session",
+            getSessionFile: () => "/tmp/child-session.jsonl",
+          },
+        },
+      );
+
+      expect(loadRegistry().threads["99"]?.sessionFile).toBe("/tmp/session-1.jsonl");
+      expect(loadDmOwner()?.sessionFile).toBe("/tmp/session-1.jsonl");
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.(
+        { type: "session_shutdown" },
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      globalThis.fetch = previousFetch;
+    }
   });
 
   test("/telegram own pins, reports, and clears this session", async () => {
@@ -222,6 +264,55 @@ describe("extension wiring", () => {
     expect(calls[1]?.url).toContain("/bot111:wiring-test/sendMessage");
   });
 
+  test("telegram_send uses this session's topic without a prior inbound message", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    const h = harness(["ask"]);
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      calls.push({ method, body });
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 8 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      calls.length = 0;
+      const result = await h.tools.get("telegram_send")!.execute(
+        "t",
+        { text: "done" },
+        undefined,
+        undefined,
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      expect(result.isError).toBeUndefined();
+      expect(calls.find((call) => call.method === "sendMessage")?.body).toMatchObject({
+        chat_id: "42",
+        message_thread_id: 99,
+        text: "done",
+      });
+      const react = await h.tools.get("telegram_react")!.execute(
+        "r",
+        { message_id: "55", emoji: "👍" },
+        undefined,
+        undefined,
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      expect(react.isError).toBeUndefined();
+      expect(calls.find((call) => call.method === "setMessageReaction")?.body).toMatchObject({
+        chat_id: "42",
+        message_id: 55,
+      });
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.(
+        { type: "session_shutdown" },
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test("a Telegram steering message gives telegram_send its default chat", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"] });
     const h = harness(["ask"]);
@@ -262,10 +353,61 @@ describe("extension wiring", () => {
     ]);
   });
 
-  test("telegram_send fails closed without an active Telegram context", async () => {
+  test("telegram_send uses this session's pinned DM owner without a prior inbound message", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"] });
     const h = harness(["ask"]);
     await startBridge(h);
+    const calls: Record<string, unknown>[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 8 } }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const result = await h.tools.get("telegram_send")!.execute(
+        "t",
+        { text: "done" },
+        undefined,
+        undefined,
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      expect(result.isError).toBeUndefined();
+      expect(calls.find((body) => body.text === "done")).toMatchObject({ chat_id: "42", text: "done" });
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.(
+        { type: "session_shutdown" },
+        { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+      );
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test("telegram_send refuses a foreign pinned DM owner", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    claimDmOwner({
+      pid: 999_999,
+      cwd: "/foreign",
+      name: "foreign",
+      claimedAt: 1,
+      sessionId: "foreign",
+      sessionFile: "/tmp/foreign.jsonl",
+    });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const result = await h.tools.get("telegram_send")!.execute(
+      "t",
+      { text: "done" },
+      undefined,
+      undefined,
+      { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("no active telegram chat — pass chat_id");
+  });
+
+  test("telegram_send still refuses when no bridge session has claimed a target", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
     const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {});
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toBe("no active telegram chat — pass chat_id");
