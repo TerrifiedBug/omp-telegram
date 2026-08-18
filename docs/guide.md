@@ -260,24 +260,20 @@ count as a mention.
 
 ## Model tools
 
-- **`telegram_send`** — send text and/or files to the active chat (or a given
-  `chat_id`). Text is chunked and rendered as MarkdownV2 (plain-text fallback on
-  parse errors). `files` are absolute paths: images send as photos, everything
-  else as documents (≤ 50 MB each).
-  A message that steers a busy run remains the active chat for the next tool
-  call. With no Telegram context and no `chat_id`, the tool fails closed.
+- **`telegram_send`** — send text and/or files to the active or durably claimed
+  chat (or a given `chat_id`). Text is chunked and rendered as MarkdownV2
+  (plain-text fallback on parse errors). `files` are absolute paths: images send
+  as photos, everything else as documents (≤ 50 MB each).
 - **`telegram_react`** — react to a message with a Telegram whitelist emoji
   (👍 👎 ❤ 🔥 👀 🎉 …).
 - **`telegram_ask`** — ask the user one or more questions with inline keyboards:
   give 2-8 options for a single- or multi-select choice, or omit options for a
-  free-text question the user answers by replying with a message. It replaces `ask` on
-  Telegram-originated turns and while away/always mode is on, showing the
-  question on both the terminal and Telegram at once and returning whichever the
-  user answers first. Otherwise it stays mounted alongside `ask` whenever the
-  bridge is running with a paired owner, so a locally injected turn (a scheduled
-  tick, an extension-composed prompt) can still reach Telegram. Without a
-  pre-resolved chat, it falls back to this session's topic or the owner's DM and
-  also shows the terminal picker when one is available.
+  free-text question the user answers by replying with a message. It replaces
+  `ask` on Telegram-originated turns and while away/always mode is on, showing
+  the question on both the terminal and Telegram at once and returning whichever
+  the user answers first. Otherwise it stays mounted alongside `ask` whenever
+  the bridge is running with a paired owner, so a locally injected turn (a
+  scheduled tick or extension-composed prompt) can still reach Telegram.
   Requests are responder-, chat-, topic-, message-, and
   nonce-bound, stay answerable while the owning session runs, and use the shared
   state directory for cross-process answers.
@@ -286,6 +282,13 @@ count as a mention.
   accepted answer's origin, and `errors` preserves per-surface posting failures. A
   terminal answer therefore cannot hide a failed Telegram post: the result
   includes a `SURFACE ERROR [telegram]` line alongside the answer.
+
+When a tool target is omitted, the bridge resolves it in this order: the active
+inbound conversation, this process's session topic, an exact durable
+`sessionFile`/`sessionId` topic claim, then an exact-session DM-owner claim.
+Explicit arguments always win. A claim for another session is ignored rather
+than widening delivery to the main chat; with no safe target, the tool fails
+closed.
 
 `telegram_send` and `telegram_react` refuse any chat the inbound gate would not
 deliver from. `telegram_ask` responds only to the exact user who originated the turn.
