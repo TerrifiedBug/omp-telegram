@@ -922,15 +922,41 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     }
   }
 
-  function resolveToolTarget(
+  /**
+   * The target, or why every rung declined (#72).
+   *
+   * `declines` exists because the refusal callers used to get —
+   * "no active telegram chat" — is true and unactionable: it cannot separate
+   * "topics are off" from "a live claim exists but its session identity is not
+   * mine", and those want opposite responses. Measured on conductor#882: that
+   * ambiguity cost two 300-second arming attempts and a five-hour delivery hold
+   * while a matching claim sat in the registry the whole time.
+   *
+   * Counts, never ids. `resolveProjectTopicId`'s rule holds here too: a log line
+   * is a place ids leak from.
+   */
+  interface TargetResolution {
+    target?: ResolvedToolTarget;
+    declines: readonly string[];
+  }
+
+  function resolveTarget(
     ctx: ExtensionContext | undefined,
     currentAccess: Access = loadAccess(warn),
-  ): ResolvedToolTarget | undefined {
+  ): TargetResolution {
+    const declines: string[] = [];
     const active = outbound.lastTarget();
-    if (active) return { ...active, source: "active inbound" };
+    if (active) return { target: { ...active, source: "active inbound" }, declines: [] };
+    declines.push("nothing inbound this turn");
+
     if (ownTopic && currentAccess.topicsChat) {
-      return { chatId: currentAccess.topicsChat, threadId: ownTopic.threadId, source: "session topic" };
+      return {
+        target: { chatId: currentAccess.topicsChat, threadId: ownTopic.threadId, source: "session topic" },
+        declines: [],
+      };
     }
+    declines.push(currentAccess.topicsChat ? "this session owns no topic" : "topics are off");
+
     const current = ctx ?? lastCtx;
     const identity = {
       sessionId: current?.sessionManager?.getSessionId(),
@@ -940,24 +966,48 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     if (currentAccess.topicsChat) {
       const registry = loadRegistry(warn);
       if (registry.chatId === currentAccess.topicsChat) {
-        for (const [threadId, entry] of Object.entries(registry.threads)) {
+        const entries = Object.entries(registry.threads);
+        for (const [threadId, entry] of entries) {
           const belongs = hasIdentity ? sameSession(entry, identity) : entry.pid === process.pid;
           if (belongs) {
-            return { chatId: currentAccess.topicsChat, threadId: Number(threadId), source: "topic registry" };
+            return {
+              target: { chatId: currentAccess.topicsChat, threadId: Number(threadId), source: "topic registry" },
+              declines: [],
+            };
           }
         }
+        // The case #882 could not diagnose, and the reason this whole list
+        // exists: claims are present, so the registry is fine and the bridge has
+        // run — the mismatch is identity, which points at a resumed session or a
+        // plugin too old to compare session files.
+        declines.push(
+          entries.length === 0
+            ? "topic registry carries no claims"
+            : `topic registry has ${entries.length} claim(s), none matching this session's ` +
+              `${hasIdentity ? "identity" : "pid (no session identity available)"}`,
+        );
+      } else {
+        declines.push("topic registry names a different chat");
       }
     }
+
     const dmOwner = loadDmOwner(warn);
     const dmChat = pairedOwnerId(currentAccess);
     const ownsDm = dmOwner && (hasIdentity ? sameSession(dmOwner, identity) : dmOwner.pid === process.pid);
-    return dmOwner && dmChat && ownsDm ? { chatId: dmChat, source: "DM owner" } : undefined;
+    if (dmOwner && dmChat && ownsDm) return { target: { chatId: dmChat, source: "DM owner" }, declines: [] };
+    declines.push(dmOwner === undefined ? "no DM owner pinned" : "DM owner is another session");
+    return { declines };
   }
 
   function logTargetFallback(tool: string, resolved: ResolvedToolTarget | undefined): void {
     if (resolved && resolved.source !== "active inbound") {
       log.debug(`[telegram] ${tool} target resolved from ${resolved.source}`);
     }
+  }
+
+  /** One line per failed call, naming every rung and why it declined (#72). */
+  function targetFailureDetail(tool: string, declines: readonly string[]): string {
+    return `[telegram] ${tool} found no target: ${declines.join("; ")}`;
   }
 
   /**
@@ -2004,12 +2054,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           chatId = p.chat_id;
           threadId = p.thread_id != null && p.thread_id !== "" ? Number(p.thread_id) : undefined;
         } else {
-          const resolved = resolveToolTarget(ctx, currentAccess);
-          logTargetFallback("telegram_send", resolved);
-          chatId = resolved?.chatId;
-          threadId = resolved?.threadId;
+          const resolution = resolveTarget(ctx, currentAccess);
+          logTargetFallback("telegram_send", resolution.target);
+          chatId = resolution.target?.chatId;
+          threadId = resolution.target?.threadId;
+          if (chatId === undefined) {
+            const detail = targetFailureDetail("telegram_send", resolution.declines);
+            log.warn(detail);
+            return errorResult(`no active telegram chat — pass chat_id. ${detail}`);
+          }
         }
-        if (!chatId) return errorResult("no active telegram chat — pass chat_id");
         assertAllowedChat(chatId, currentAccess);
         const replyTo = p.reply_to != null && p.reply_to !== "" ? Number(p.reply_to) : undefined;
         const ids: number[] = [];
@@ -2058,15 +2112,23 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const questions: PromptQuestion[] = p.questions.map((q) => ({ ...q, options: q.options ?? [] }));
       const canTerminal = ctx?.hasUI === true && typeof ctx.ui?.askDialog === "function";
       let resolved = activePromptTarget ? { ...activePromptTarget } : undefined;
+      let declines: readonly string[] = [];
       if (!resolved && token.length > 0) {
         const currentAccess = loadAccess(warn);
-        const fallback = resolveToolTarget(ctx, currentAccess);
-        logTargetFallback("telegram_ask", fallback);
-        resolved = buildPromptTarget(fallback, currentAccess);
+        const resolution = resolveTarget(ctx, currentAccess);
+        logTargetFallback("telegram_ask", resolution.target);
+        declines = resolution.declines;
+        resolved = buildPromptTarget(resolution.target, currentAccess);
       }
       const target = resolved;
       if (!target && !canTerminal) {
-        return errorResult("telegram_ask has no surface available — no Telegram target and no interactive terminal.");
+        // Name the rungs here too: "no surface available" reads as a config
+        // problem, and the common cause is a target that nearly resolved (#72).
+        const detail = declines.length === 0 ? "" : ` ${targetFailureDetail("telegram_ask", declines)}`;
+        if (detail.length > 0) log.warn(detail.trim());
+        return errorResult(
+          `telegram_ask has no surface available — no Telegram target and no interactive terminal.${detail}`,
+        );
       }
       const posted: AskSurfaceState = { terminal: false, telegram: false };
       const surfaceErrors: AskSurfaceErrors = {};
@@ -2211,10 +2273,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       const p = params as ReactParams;
       try {
         const currentAccess = loadAccess(warn);
-        const resolved = p.chat_id ? undefined : resolveToolTarget(ctx, currentAccess);
+        const resolution = p.chat_id ? undefined : resolveTarget(ctx, currentAccess);
+        const resolved = resolution?.target;
         logTargetFallback("telegram_react", resolved);
         const chatId = p.chat_id ?? resolved?.chatId;
-        if (!chatId) return errorResult("no active telegram chat — pass chat_id");
+        if (!chatId) {
+          const detail =
+            resolution === undefined ? "" : ` ${targetFailureDetail("telegram_react", resolution.declines)}`;
+          if (detail.length > 0) log.warn(detail.trim());
+          return errorResult(`no active telegram chat — pass chat_id.${detail}`);
+        }
         assertAllowedChat(chatId, currentAccess);
         await outbound.react(chatId, Number(p.message_id), p.emoji);
         return { content: [{ type: "text", text: "reacted" }] };

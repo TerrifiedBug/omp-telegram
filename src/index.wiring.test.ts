@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type Access, defaultAccess, loadAccess } from "./access";
 import telegramExtension from "./index";
-import { claimDmOwner, loadDmOwner, loadRegistry } from "./topics";
+import { claimDmOwner, loadDmOwner, loadRegistry, saveRegistry } from "./topics";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
@@ -402,7 +402,13 @@ describe("extension wiring", () => {
       { sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" } },
     );
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toBe("no active telegram chat — pass chat_id");
+    // The refusal still leads with the actionable instruction, and now names the
+    // rungs (#72). This case is "a DM owner exists but is somebody else" —
+    // distinct wording from "none pinned", which is the whole point: the two
+    // want opposite responses and used to read identically.
+    expect(result.content[0].text).toContain("no active telegram chat — pass chat_id");
+    expect(result.content[0].text).toContain("DM owner is another session");
+    expect(result.content[0].text).not.toContain("no DM owner pinned");
   });
 
   test("telegram_send still refuses when no bridge session has claimed a target", async () => {
@@ -410,7 +416,67 @@ describe("extension wiring", () => {
     const h = harness(["ask"]);
     const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {});
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toBe("no active telegram chat — pass chat_id");
+    expect(result.content[0].text).toContain("no active telegram chat — pass chat_id");
+    expect(result.content[0].text).toContain("no DM owner pinned");
+  });
+
+  test("a live claim that is not this session's names the identity mismatch, and leaks no ids (#72)", async () => {
+    // The case conductor#882 could not diagnose. Claims are present, so the
+    // registry is fine and the bridge has run — the mismatch is identity, which
+    // points at a resumed session or a plugin too old to compare session files.
+    // Before this, it read exactly like "no claims at all".
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: {
+        "8801": { pid: 999_999, cwd: "/foreign", name: "foreign", claimedAt: 1, sessionId: "foreign-a", sessionFile: "/tmp/foreign-a.jsonl" },
+        "8802": { pid: 999_998, cwd: "/other", name: "other", claimedAt: 2, sessionId: "foreign-b", sessionFile: "/tmp/foreign-b.jsonl" },
+      },
+    });
+    const h = harness(["ask"]);
+    const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {
+      sessionManager: { getSessionId: () => "mine", getSessionFile: () => "/tmp/mine.jsonl" },
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text as string;
+    expect(text).toContain("no active telegram chat — pass chat_id");
+    // Distinguishable from an empty registry, and it says how many exist.
+    expect(text).toContain("topic registry has 2 claim(s), none matching this session's identity");
+    expect(text).not.toContain("carries no claims");
+    // Every rung, one line.
+    expect(text).toContain("nothing inbound this turn");
+    expect(text).toContain("this session owns no topic");
+    expect(text.split("\n")).toHaveLength(1);
+    // Counts, never ids: the precedent is resolveProjectTopicId's rule that a
+    // log line is a place ids leak from.
+    for (const id of ["8801", "8802", "999999", "999998", "/tmp/foreign-a.jsonl", "/tmp/mine.jsonl"]) {
+      expect(text).not.toContain(id);
+    }
+  });
+
+  test("an empty registry says so, rather than blaming identity (#72)", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    saveRegistry({ version: 1, chatId: "42", threads: {} });
+    const h = harness(["ask"]);
+    const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {
+      sessionManager: { getSessionId: () => "mine", getSessionFile: () => "/tmp/mine.jsonl" },
+    });
+    expect(result.content[0].text).toContain("topic registry carries no claims");
+    expect(result.content[0].text).not.toContain("none matching");
+  });
+
+  test("a registry for another chat is named as such, not as an identity problem (#72)", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    saveRegistry({
+      version: 1,
+      chatId: "999",
+      threads: { "8801": { pid: process.pid, cwd: "/here", name: "here", claimedAt: 1 } },
+    });
+    const h = harness(["ask"]);
+    const result = await h.tools.get("telegram_send")!.execute("t", { text: "done" }, undefined, undefined, {});
+    expect(result.content[0].text).toContain("topic registry names a different chat");
+    expect(result.content[0].text).not.toContain("999");
   });
 
   test("before_agent_start leaves ask untouched for a plain terminal turn with notify off", async () => {
