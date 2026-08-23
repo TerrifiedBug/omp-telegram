@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultAccess, saveAccess, statePath } from "./access";
 import { type Logger, type TgMessage, TgError } from "./api";
-import { type BridgeHost, BOT_COMMANDS, PUBLIC_BOT_COMMANDS, handleUpdate, syncBotCommands } from "./bridge";
+import { type BridgeHost, BOT_COMMANDS, PUBLIC_BOT_COMMANDS, cleanupPreviewLine, handleUpdate, parseCleanupArgs, selectCleanupTargets, syncBotCommands } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
-import { DM_ROUTE_KEY, claimDmOwner, loadRegistry, saveRegistry, watchRoute } from "./topics";
+import { DM_ROUTE_KEY, type ThreadEntry, claimDmOwner, classifyStale, loadRegistry, saveRegistry, watchRoute } from "./topics";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 let dir: string;
@@ -588,5 +588,81 @@ describe("status surfaces the DM user-topic-creation setting", () => {
     await handleUpdate(makeHost({ botAllowsUserTopics: () => false }), { update_id: 41, message: message("/status") });
     const reply = calls.find((c) => c.method === "sendMessage" && String(c.payload.text ?? "").includes("Paired owner"));
     expect(String(reply?.payload.text)).not.toContain("Users can create DM topics");
+  });
+});
+
+describe("cleanup selection (#67)", () => {
+  const entry = (name: string, claimedAt: number, sessionFile?: string): ThreadEntry => ({
+    pid: 4242,
+    cwd: `/w/${name}`,
+    name,
+    claimedAt,
+    ...(sessionFile === undefined ? {} : { sessionFile }),
+  });
+
+  test("bad input prints usage rather than cleaning everything", () => {
+    // In a DM host `/cleanup go` deletes irreversibly, so an argument the
+    // parser does not understand must never fall through to "all".
+    expect(parseCleanupArgs("nonsense")).toBeUndefined();
+    expect(parseCleanupArgs("go 10071 banana")).toBeUndefined();
+    expect(parseCleanupArgs("go -5")).toBeUndefined();
+    expect(parseCleanupArgs("go never-ran extra")).toBeUndefined();
+  });
+
+  test("the grammar", () => {
+    expect(parseCleanupArgs("")).toEqual({ kind: "preview" });
+    expect(parseCleanupArgs("  ")).toEqual({ kind: "preview" });
+    expect(parseCleanupArgs("go")).toEqual({ kind: "all" });
+    expect(parseCleanupArgs("go never-ran")).toEqual({ kind: "never-ran" });
+    expect(parseCleanupArgs("go 10071 10073")).toEqual({ kind: "ids", ids: [10071, 10073] });
+  });
+
+  test("naming ids cleans only those — the case that forced a hand-written script", () => {
+    // The incident: 83 topics minutes old alongside one project topic from eight
+    // days earlier. `/cleanup go` would have deleted all of them, irreversibly,
+    // so the only safe remedy was scripting the deletions by id outside the tool.
+    const stale: Array<[number, ThreadEntry]> = [
+      [9549, entry("veltrosecurity", 1_000)],
+      [10071, entry("conductor", 2_000)],
+      [10073, entry("conductor", 3_000)],
+    ];
+    const chosen = selectCleanupTargets(stale, { kind: "ids", ids: [10071, 10073] }, 10_000);
+    expect(chosen.map(([id]) => id)).toEqual([10071, 10073]);
+  });
+
+  test("an id that is no longer stale selects nothing, never something else", () => {
+    const stale: Array<[number, ThreadEntry]> = [[10071, entry("conductor", 2_000)]];
+    expect(selectCleanupTargets(stale, { kind: "ids", ids: [99999] }, 10_000)).toEqual([]);
+  });
+
+  test("never-ran selects exactly the topics whose session wrote no transcript", () => {
+    // The crash-loop signature: a recorded session file that does not exist.
+    const stale: Array<[number, ThreadEntry]> = [
+      [9549, entry("veltrosecurity", 1_000, join(dir, "real.jsonl"))],
+      [10071, entry("conductor", 2_000, "/does/not/exist-1.jsonl")],
+      [10073, entry("conductor", 3_000, "/does/not/exist-2.jsonl")],
+      [10075, entry("legacy-no-sessionfile", 4_000)],
+    ];
+    writeFileSync(join(dir, "real.jsonl"), "{}\n");
+    const chosen = selectCleanupTargets(stale, { kind: "never-ran" }, 10_000);
+    expect(chosen.map(([id]) => id)).toEqual([10071, 10073]);
+  });
+
+  test("a claim with no recorded session file is history, not a crash", () => {
+    // Older-format claims record no session file. Absence of evidence must not
+    // become evidence of a crash, or a legacy topic gets swept up.
+    const classified = classifyStale([[10075, entry("legacy", 1_000)]], 10_000);
+    expect(classified[0]?.reason).toBe("ended");
+  });
+
+  test("the preview says which is which, and how old", () => {
+    writeFileSync(join(dir, "real.jsonl"), "{}\n");
+    const [ranTopic] = classifyStale([[9549, entry("veltrosecurity", 0, join(dir, "real.jsonl"))]], 8 * 24 * 3_600_000);
+    const [neverRan] = classifyStale([[10071, entry("conductor", 0, "/nope.jsonl")]], 120_000);
+    expect(cleanupPreviewLine(neverRan!)).toContain("session never ran");
+    expect(cleanupPreviewLine(neverRan!)).toContain("recent");
+    expect(cleanupPreviewLine(neverRan!)).toContain("2m ago");
+    expect(cleanupPreviewLine(ranTopic!)).not.toContain("session never ran");
+    expect(cleanupPreviewLine(ranTopic!)).toContain("h ago");
   });
 });

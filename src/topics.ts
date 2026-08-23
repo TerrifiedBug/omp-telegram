@@ -6,9 +6,10 @@
 // + policy, so it is fully unit-testable. Telegram I/O stays in api.ts /
 // outbound.ts.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   type FSWatcher,
+  existsSync,
   linkSync,
   mkdirSync,
   readFileSync,
@@ -219,6 +220,48 @@ export function staleThreads(
 }
 
 
+/**
+ * Why a stale topic is stale (#67).
+ *
+ * `!alive(pid)` alone cannot tell a crash loop from a fortnight of history, and
+ * in a DM host `/cleanup` deletes irreversibly — so its only remedy for 83
+ * topics minutes old also destroyed an unrelated project topic from eight days
+ * earlier. An operator needs to see which is which before tapping Delete.
+ *
+ * `never-ran` is the high-confidence signal: the entry records a session file
+ * that does not exist, so that process claimed a topic and died without writing
+ * one line of transcript. A session that did any work leaves a file behind.
+ */
+export type StaleReason = "never-ran" | "ended";
+
+export interface StaleTopic {
+  threadId: number;
+  entry: ThreadEntry;
+  reason: StaleReason;
+  /** How long ago the claim was made, in ms. */
+  ageMs: number;
+}
+
+/**
+ * Annotate stale topics with why they are stale and how old the claim is.
+ *
+ * `exists` is injected so this stays pure and testable, like `alive` above.
+ */
+export function classifyStale(
+  stale: Array<[number, ThreadEntry]>,
+  now: number,
+  exists: (path: string) => boolean = existsSync,
+): StaleTopic[] {
+  return stale.map(([threadId, entry]) => ({
+    threadId,
+    entry,
+    // No recorded session file at all is an older-format claim, not evidence of
+    // a crash: only a recorded-but-absent file proves nothing ever ran.
+    reason: entry.sessionFile !== undefined && !exists(entry.sessionFile) ? "never-ran" : "ended",
+    ageMs: Math.max(0, now - entry.claimedAt),
+  }));
+}
+
 type SessionIdentity = Pick<ThreadEntry, "sessionId" | "sessionFile">;
 
 /** Session files survive `omp --resume`; runtime session IDs may change. */
@@ -384,6 +427,71 @@ export function writeRouted(threadId: number | typeof DM_ROUTE_KEY, msg: TgMessa
   renameSync(tmp, join(dir, base));
 }
 
+/** File name of the per-route inbound receipt (#61). Stable external contract. */
+export const INBOUND_RECEIPT = "last-inbound.json";
+
+/**
+ * What a supervising process can rely on after an inbound message is delivered.
+ *
+ * `textSha256` rather than the text: the payload already exists in the
+ * receiving agent's transcript, and a receipt is for *proving arrival*, not for
+ * holding a second copy of what a user wrote. A supervisor verifying a
+ * challenge code knows the code it sent, so hashing its own copy is enough —
+ * and a hash cannot leak a message to anything that did not already know it.
+ */
+export interface InboundReceipt {
+  messageId: number;
+  date: number;
+  fromId?: number;
+  chatId: number;
+  messageThreadId?: number;
+  textSha256?: string;
+  /** When this receipt was written, which is when the payload was consumed. */
+  receivedAt: number;
+}
+
+/**
+ * Record that a message arrived, before anything consumes it (#61).
+ *
+ * Written before the handoff on purpose: a receipt whose whole value is
+ * surviving a consumer that died is worthless if the consumer writes it. One
+ * file per route, replaced in place, so it is bounded by construction and needs
+ * no reaper beyond {@link purgeRouteDir}.
+ */
+export function writeInboundReceipt(threadId: number | typeof DM_ROUTE_KEY, msg: TgMessage): void {
+  const dir = routeDir(threadId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const receipt: InboundReceipt = {
+    messageId: msg.message_id,
+    date: msg.date,
+    ...(msg.from?.id === undefined ? {} : { fromId: msg.from.id }),
+    chatId: msg.chat.id,
+    ...(msg.message_thread_id === undefined ? {} : { messageThreadId: msg.message_thread_id }),
+    ...(msg.text === undefined ? {} : { textSha256: createHash("sha256").update(msg.text).digest("hex") }),
+    receivedAt: Date.now(),
+  };
+  const tmp = join(dir, `tmp-${process.pid}-${INBOUND_RECEIPT}`);
+  try {
+    writeFileSync(tmp, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, join(dir, INBOUND_RECEIPT));
+  } catch {
+    rmSync(tmp, { force: true });
+    throw new Error("could not write inbound receipt");
+  }
+}
+
+/** Read a route's inbound receipt, or `undefined` when none has been written. */
+export function readInboundReceipt(threadId: number | typeof DM_ROUTE_KEY): InboundReceipt | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(routeDir(threadId), INBOUND_RECEIPT), "utf8"));
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const r = parsed as InboundReceipt;
+    return typeof r.messageId === "number" && typeof r.chatId === "number" ? r : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Watch a route's spool dir and hand each spooled message to `onMsg`. Uses an
  * initial scan + fs.watch + a 5s rescan (fs.watch alone is not reliable enough).
@@ -403,7 +511,9 @@ export function watchRoute(
   const processed = new Set<string>();
 
   const handle = (name: string): void => {
-    if (!name || name.startsWith("tmp-") || !name.endsWith(".json") || processed.has(name)) return;
+    // The receipt lives in this same dir and ends in `.json` (#61): it is
+    // evidence, never a payload, so it must never be consumed or unlinked.
+    if (!name || name.startsWith("tmp-") || name === INBOUND_RECEIPT || !name.endsWith(".json") || processed.has(name)) return;
     if (accept && !accept()) return;
     const full = join(dir, name);
     let mtimeMs: number;
@@ -432,10 +542,25 @@ export function watchRoute(
     } catch {
       /* ignore */
     }
+    let msg: TgMessage;
     try {
-      onMsg(JSON.parse(raw) as TgMessage);
+      msg = JSON.parse(raw) as TgMessage;
     } catch (err) {
       log?.warn(`[telegram] routed payload parse failed (${name}): ${String(err)}`);
+      return;
+    }
+    // Receipt BEFORE the handoff (#61): its whole purpose is to outlive a
+    // consumer that dies, so a receipt written after `onMsg` records only the
+    // deliveries that already succeeded.
+    try {
+      writeInboundReceipt(threadId, msg);
+    } catch (err) {
+      log?.warn(`[telegram] inbound receipt write failed: ${String(err)}`);
+    }
+    try {
+      onMsg(msg);
+    } catch (err) {
+      log?.warn(`[telegram] routed delivery failed (${name}): ${String(err)}`);
     }
   };
 

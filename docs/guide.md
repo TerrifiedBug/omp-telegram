@@ -309,6 +309,46 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
 | `threads.json` | Topic registry — which session (pid/cwd) owns which forum topic |
 | `route/<thread_id>/` / `route/dm/` | Cross-process routed-message spools for topics and untopiced private DMs |
+| `route/<thread_id>/last-inbound.json` / `route/dm/last-inbound.json` | Receipt for the most recent delivered inbound message (see below) |
+
+### Inbound receipts — a contract for external supervisors
+
+A routed payload is deleted the moment it is consumed, so after a successful
+delivery the only surviving copy used to be inside the receiving agent's own
+transcript, in that agent's private format. A supervising process asking the
+reasonable question *"did the operator's reply actually arrive?"* had to parse
+another program's log to find out.
+
+So one bounded receipt is written per route, **before** the payload is handed to
+the session:
+
+```json
+{
+  "messageId": 12345,
+  "date": 1700000000,
+  "fromId": 555,
+  "chatId": 100,
+  "messageThreadId": 7,
+  "textSha256": "9f86d081…",
+  "receivedAt": 1700000000123
+}
+```
+
+- **Written before the handoff**, because the case a receipt exists for is a
+  consumer that died. One written afterwards records only the deliveries that
+  already succeeded.
+- **A hash, not the text.** The message already lives in the consuming agent's
+  transcript, and a supervisor verifying a challenge code knows the code it
+  sent — hashing its own copy is enough. A hash also cannot leak a message to
+  anything that did not already know it.
+- **Bounded by construction**: exactly one file per route, replaced in place. No
+  reaper is needed beyond the existing route purge, which removes it with the
+  rest of the route state.
+- Written `0600` inside the `0700` route directory, tmp+rename, so a reader
+  never sees a partial file.
+
+This file is a stable contract: read it rather than scraping a session
+transcript.
 
 ## Streaming behavior
 

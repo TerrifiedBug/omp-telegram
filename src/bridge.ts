@@ -23,7 +23,9 @@ import {
 import type { TelegramPromptController } from "./prompts";
 import {
   DM_ROUTE_KEY,
+  type StaleTopic,
   type ThreadEntry,
+  classifyStale,
   decideRoute,
   isAlive,
   isResumedOwner,
@@ -66,7 +68,15 @@ const COMMANDS: CommandSpec[] = [
     ],
   },
   { command: "sessions", description: "List active omp sessions", scope: "global", help: ["/sessions — list active omp sessions and topic attachment"] },
-  { command: "cleanup", description: "Tidy topics of exited sessions", scope: "global", help: ["/cleanup — preview exited-session topics, then tap to confirm (or /cleanup go to skip the preview)"] },
+  {
+    command: "cleanup",
+    description: "Tidy topics of exited sessions",
+    scope: "global",
+    help: [
+      "/cleanup — preview exited-session topics, then tap to confirm",
+      "/cleanup go [<id>… | never-ran] — skip the preview, optionally for a subset",
+    ],
+  },
   { command: "stop", description: "Abort this topic's omp task", scope: "session", help: ["/stop — abort this topic’s current task"] },
   { command: "compact", description: "Compact this session's context", scope: "session", help: ["/compact [focus] — compact this session’s context"] },
   { command: "model", description: "Show or change this session's model", scope: "session", help: ["/model [provider/id] — show or change this session’s model"] },
@@ -340,6 +350,71 @@ function cleanupResultText(cleaned: number, failed: number, deletes: boolean): s
 }
 
 /**
+ * What `/cleanup [go [ids|never-ran]]` asked for, or `undefined` for bad input.
+ *
+ * Parsed separately from the handler so the grammar is testable without a live
+ * bridge, and so an unparseable argument prints usage instead of quietly
+ * cleaning everything — which, in a DM host, deletes irreversibly.
+ */
+export type CleanupSelection =
+  | { kind: "preview" }
+  | { kind: "all" }
+  | { kind: "ids"; ids: readonly number[] }
+  | { kind: "never-ran" };
+
+export function parseCleanupArgs(args: string): CleanupSelection | undefined {
+  const words = args.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return { kind: "preview" };
+  if (words[0] !== "go") return undefined;
+  const rest = words.slice(1);
+  if (rest.length === 0) return { kind: "all" };
+  if (rest.length === 1 && rest[0] === "never-ran") return { kind: "never-ran" };
+  const ids = rest.map(Number);
+  return ids.every((n) => Number.isSafeInteger(n) && n > 0) ? { kind: "ids", ids } : undefined;
+}
+
+/** How recent a claim has to be for the preview to call it out as a burst. */
+const CLEANUP_RECENT_MS = 15 * 60_000;
+
+/**
+ * Narrow the stale set to what was asked for (#67).
+ *
+ * The set is always re-derived by the caller first, so naming an id that has
+ * since resumed selects nothing rather than acting on a stale snapshot.
+ */
+export function selectCleanupTargets(
+  stale: Array<[number, ThreadEntry]>,
+  selection: CleanupSelection,
+  now: number,
+): Array<[number, ThreadEntry]> {
+  if (selection.kind === "ids") {
+    const wanted = new Set(selection.ids);
+    return stale.filter(([threadId]) => wanted.has(threadId));
+  }
+  if (selection.kind === "never-ran") {
+    const neverRan = new Set(
+      classifyStale(stale, now)
+        .filter((t) => t.reason === "never-ran")
+        .map((t) => t.threadId),
+    );
+    return stale.filter(([threadId]) => neverRan.has(threadId));
+  }
+  return stale;
+}
+
+/** One preview line: what it is, how old, and whether it ever did anything. */
+export function cleanupPreviewLine(topic: StaleTopic): string {
+  const mins = Math.round(topic.ageMs / 60_000);
+  const age = mins < 1 ? "just now" : mins < 90 ? `${mins}m ago` : `${Math.round(mins / 60)}h ago`;
+  // The distinction that matters before an irreversible delete: a topic whose
+  // session never wrote a transcript did nothing, and a burst of them is a
+  // crash loop. A topic that ran is somebody's history.
+  const note = topic.reason === "never-ran" ? " ⚠ session never ran" : "";
+  const burst = topic.reason === "never-ran" && topic.ageMs < CLEANUP_RECENT_MS ? ", recent" : "";
+  return `#${topic.threadId} ${topic.entry.name} — ${topic.entry.cwd} (${age}${burst})${note}`;
+}
+
+/**
  * Preview the stale topics with a confirm/cancel keyboard so the owner can tidy
  * with one tap instead of typing `/cleanup go`. The picker records the exact
  * previewed topic ids so the tap acts only on those (revalidated as still
@@ -356,7 +431,7 @@ async function sendCleanupPreview(
   if (!ownerId) return;
   const deletes = isDmChat(topicsChat);
   const plural = stale.length === 1 ? "" : "s";
-  const lines = stale.map(([threadId, entry]) => `#${threadId} ${entry.name} — ${entry.cwd}`).join("\n");
+  const lines = classifyStale(stale, Date.now()).map(cleanupPreviewLine).join("\n");
   const prompt = deletes
     ? `Delete these ${stale.length} topic${plural} and their message history?`
     : `Close these ${stale.length} topic${plural}? History is kept and reopened on re-adoption.`;
@@ -516,12 +591,22 @@ export async function handleGlobalCommand(
       }
     }
   } else if (command === "cleanup") {
+    const selection = parseCleanupArgs(args);
     if (!owner) {
       await commandReply(host, access, msg, "Pair this DM locally before using cleanup.");
     } else if (!access.topicsChat) {
       await commandReply(host, access, msg, "Topics mode is off — nothing to clean.");
-    } else if (args !== "" && args !== "go") {
-      await commandReply(host, access, msg, "usage: /cleanup [go]");
+    } else if (selection === undefined) {
+      await commandReply(
+        host,
+        access,
+        msg,
+        "usage: /cleanup [go [<id>…|never-ran]]\n\n" +
+          "/cleanup — preview\n" +
+          "/cleanup go — everything stale\n" +
+          "/cleanup go 10071 10073 — only those topics\n" +
+          "/cleanup go never-ran — only topics whose session never wrote a transcript",
+      );
     } else {
       const registry = loadRegistry(host.warn);
       const topicsChat = registry.chatId || access.topicsChat;
@@ -530,13 +615,18 @@ export async function handleGlobalCommand(
       // host it could numerically collide with a real stale group topic).
       const controlExclude = topicsChat === pairedOwnerId(access) ? access.controlThreadId : undefined;
       const stale = staleThreads(registry, isAlive, controlExclude);
+      // Selection is applied to the freshly derived set, never to a remembered
+      // one: an id the operator names that is no longer stale is simply absent.
+      const chosen = selectCleanupTargets(stale, selection, Date.now());
       if (stale.length === 0) {
         await commandReply(host, access, msg, "Nothing to clean — no stale session topics. Live sessions and omp control remain.");
-      } else if (args === "") {
-        await sendCleanupPreview(host, access, msg, topicsChat, stale);
+      } else if (chosen.length === 0) {
+        await commandReply(host, access, msg, `Nothing matched. ${stale.length} stale topic(s) exist — run /cleanup to see them.`);
+      } else if (selection.kind === "preview") {
+        await sendCleanupPreview(host, access, msg, topicsChat, chosen);
       } else {
-        // args === "go": re-derived above; never act on the preview.
-        const { cleaned, failed, deletes } = await executeCleanup(host, topicsChat, stale);
+        // Re-derived above; never act on the preview.
+        const { cleaned, failed, deletes } = await executeCleanup(host, topicsChat, chosen);
         await commandReply(host, access, msg, cleanupResultText(cleaned, failed, deletes));
       }
     }

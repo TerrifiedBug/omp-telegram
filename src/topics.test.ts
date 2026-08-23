@@ -6,6 +6,7 @@ import { statePath } from "./access";
 import type { TgMessage } from "./api";
 import {
   DM_ROUTE_KEY,
+  INBOUND_RECEIPT,
   ROUTED_TTL_MS,
   type ThreadEntry,
   type ThreadRegistry,
@@ -15,6 +16,7 @@ import {
   isResumedOwner,
   loadRegistry,
   purgeRouteDir,
+  readInboundReceipt,
   releaseThread,
   sessionTopicTitle,
   staleThreads,
@@ -208,7 +210,11 @@ describe("writeRouted / watchRoute", () => {
     expect(got).toHaveLength(1);
     expect(got[0].message_id).toBe(42);
     expect(got[0].text).toBe("hi");
-    expect(readdirSync(statePath("route", "7"))).toHaveLength(0);
+    // The payload is consumed; the receipt stays (#61). Asserted as "no payload
+    // left" rather than "empty dir", because the dir now deliberately retains
+    // exactly one bounded file as evidence the message arrived.
+    expect(readdirSync(statePath("route", "7")).filter((f) => f !== INBOUND_RECEIPT)).toHaveLength(0);
+    expect(readInboundReceipt(7)?.messageId).toBe(42);
   });
 
   test("a watcher that no longer owns a mutable route leaves its payload for the owner", () => {
@@ -336,5 +342,92 @@ describe("registry writes survive concurrency (#68)", () => {
     const leftovers = readdirSync(dir).filter((f) => f.startsWith("threads.json.tmp"));
     expect(leftovers).toEqual([]);
     expect(loadRegistry().threads["8002"]?.pid).toBe(8002);
+  });
+});
+
+describe("durable inbound receipt (#61)", () => {
+  const msg = (id: number, text: string, thread?: number): TgMessage => ({
+    message_id: id,
+    date: 1_700_000_000,
+    from: { id: 555, is_bot: false, first_name: "op" },
+    chat: { id: 100, type: "supergroup" },
+    text,
+    ...(thread === undefined ? {} : { is_topic_message: true, message_thread_id: thread }),
+  });
+
+  test("a delivered message leaves a receipt a supervisor can verify", () => {
+    writeRouted(7, msg(42, "arm-code-abc", 7));
+    watchRoute(7, () => {})();
+    const r = readInboundReceipt(7);
+    expect(r?.messageId).toBe(42);
+    expect(r?.chatId).toBe(100);
+    expect(r?.fromId).toBe(555);
+    expect(r?.messageThreadId).toBe(7);
+    expect(r?.receivedAt).toBeGreaterThan(0);
+    // A hash, not the text: the payload already lives in the consuming agent's
+    // transcript, and a supervisor verifying a challenge knows what it sent.
+    expect(r?.textSha256).toBe(new Bun.CryptoHasher("sha256").update("arm-code-abc").digest("hex"));
+    expect(JSON.stringify(r)).not.toContain("arm-code-abc");
+  });
+
+  test("the receipt survives a consumer that dies mid-handoff — the case it exists for", async () => {
+    // A thrown error is caught and execution continues, so an in-process throw
+    // cannot distinguish before-handoff from after. Process death can: the child
+    // hard-exits inside `onMsg`, so anything sequenced after the handoff never
+    // runs. This is the assertion that fails when the receipt is written last.
+    writeRouted(8, msg(43, "boom", 8));
+    const runner = join(dir, "die.ts");
+    writeFileSync(
+      runner,
+      `import { watchRoute } from ${JSON.stringify(join(import.meta.dirname, "topics.ts"))};\n` +
+        `watchRoute(8, () => process.exit(9));\n`,
+    );
+    const { exitCode } = await Bun.spawn([process.execPath, runner], {
+      env: { ...process.env, OMP_TELEGRAM_STATE_DIR: dir },
+      stdout: "ignore",
+      stderr: "ignore",
+    }).exited.then((code) => ({ exitCode: code }));
+    expect(exitCode).toBe(9); // the consumer really did die inside onMsg
+    expect(readInboundReceipt(8)?.messageId).toBe(43);
+  });
+
+  test("it is bounded: a second delivery replaces the first, never accumulates", () => {
+    writeRouted(9, msg(44, "one", 9));
+    watchRoute(9, () => {})();
+    writeRouted(9, msg(45, "two", 9));
+    watchRoute(9, () => {})();
+    expect(readInboundReceipt(9)?.messageId).toBe(45);
+    expect(readdirSync(statePath("route", "9"))).toEqual([INBOUND_RECEIPT]);
+  });
+
+  test("the watcher never consumes its own receipt as a payload", () => {
+    // It lives in the watched dir and ends in `.json`, so this is a real hazard.
+    writeRouted(10, msg(46, "hi", 10));
+    watchRoute(10, () => {})();
+    const delivered: TgMessage[] = [];
+    watchRoute(10, (m) => delivered.push(m))();
+    expect(delivered).toEqual([]);
+    expect(readInboundReceipt(10)?.messageId).toBe(46);
+  });
+
+  test("the DM route gets one too", () => {
+    writeRouted(DM_ROUTE_KEY, msg(47, "dm"));
+    watchRoute(DM_ROUTE_KEY, () => {})();
+    expect(readInboundReceipt(DM_ROUTE_KEY)?.messageId).toBe(47);
+  });
+
+  test("purgeRouteDir removes it with the rest of the route state", () => {
+    writeRouted(11, msg(48, "hi", 11));
+    watchRoute(11, () => {})();
+    expect(readInboundReceipt(11)).toBeDefined();
+    purgeRouteDir(11);
+    expect(readInboundReceipt(11)).toBeUndefined();
+  });
+
+  test("a corrupt or absent receipt reads as absent, never throws", () => {
+    expect(readInboundReceipt(9999)).toBeUndefined();
+    mkdirSync(statePath("route", "12"), { recursive: true });
+    writeFileSync(join(statePath("route", "12"), INBOUND_RECEIPT), "{ not json");
+    expect(readInboundReceipt(12)).toBeUndefined();
   });
 });
