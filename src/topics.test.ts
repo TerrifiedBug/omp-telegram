@@ -288,3 +288,53 @@ describe("purgeRouteDir", () => {
     expect(() => purgeRouteDir(999)).not.toThrow();
   });
 });
+
+describe("registry writes survive concurrency (#68)", () => {
+  const entry = (pid: number): ThreadEntry => ({ pid, cwd: `/w/${pid}`, name: "conductor", claimedAt: 1_000 + pid });
+
+  test("concurrent claims from separate processes all persist", async () => {
+    // The measured failure: a burst that created 16 topics recorded 15 rows.
+    // Whole-file writes make every claim a read-modify-write, so unserialised
+    // the last writer wins and the rows in between are lost — and a topic whose
+    // row is lost is invisible to /cleanup forever, because the registry is the
+    // only index that exists. Losing the index is worse than losing the topic.
+    const runner = join(dir, "claim.ts");
+    writeFileSync(
+      runner,
+      `import { claimThread } from ${JSON.stringify(join(import.meta.dirname, "topics.ts"))};\n` +
+        `claimThread("42", Number(process.argv[2]), { pid: Number(process.argv[2]), cwd: "/w", name: "conductor", claimedAt: 1 });\n`,
+    );
+    const ids = [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008];
+    await Promise.all(
+      ids.map((id) =>
+        Bun.spawn([process.execPath, runner, String(id)], {
+          env: { ...process.env, OMP_TELEGRAM_STATE_DIR: dir },
+          stdout: "ignore",
+          stderr: "ignore",
+        }).exited,
+      ),
+    );
+    const got = Object.keys(loadRegistry().threads).map(Number).sort((a, b) => a - b);
+    expect(got).toEqual(ids);
+  });
+
+  test("a lock left by a dead process does not wedge the registry shut", () => {
+    // Self-healing by age. A mutation lock is held for microseconds, so one
+    // that is seconds old belonged to a process that died holding it.
+    const lock = `${statePath("threads.json")}.lock`;
+    writeFileSync(lock, "999999");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    claimThread("42", 8001, entry(8001));
+    expect(Object.keys(loadRegistry().threads)).toEqual(["8001"]);
+  });
+
+  test("the temp file is per-process, so two writers cannot publish each other's", () => {
+    // It was a shared `threads.json.tmp`: both writers wrote that one path and
+    // both renamed it, so one could publish the other's half-written file.
+    claimThread("42", 8002, entry(8002));
+    const leftovers = readdirSync(dir).filter((f) => f.startsWith("threads.json.tmp"));
+    expect(leftovers).toEqual([]);
+    expect(loadRegistry().threads["8002"]?.pid).toBe(8002);
+  });
+});

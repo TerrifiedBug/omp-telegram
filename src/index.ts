@@ -966,6 +966,13 @@ export default function telegramExtension(pi: ExtensionAPI): void {
    */
   async function ensureTopic(ctx?: ExtensionContext): Promise<void> {
     if (!access.topicsChat || !token || ownTopic) return;
+    // Blast-radius cap (#68): a process launched to BE the daemon is not a
+    // conversation and must never own a human-visible topic. `ensureDaemon` now
+    // refuses to launch anything that cannot run `daemon.ts`, so this should be
+    // unreachable — it is here because the cost of being wrong was 83 permanent
+    // topics, and a marker the launcher sets is cheaper than trusting that the
+    // launcher is always right.
+    if (process.env.OMP_TELEGRAM_DAEMON_CHILD === "1") return;
     // DM host with forum-topic mode provably off: skip creation (createForumTopic
     // would just fail) and run untopiced with an actionable hint. Only an explicit
     // false blocks — undefined (older server / field absent) still attempts create.

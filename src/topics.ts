@@ -22,7 +22,7 @@ import {
 } from "node:fs";
 import { basename, join } from "node:path";
 import { ensureStateDir, statePath } from "./access";
-import type { Logger, TgMessage } from "./api";
+import { linkClaim, type Logger, type TgMessage } from "./api";
 
 /** A session's claim on one forum topic. Keyed in the registry by thread id. */
 export interface ThreadEntry {
@@ -113,21 +113,78 @@ export function loadRegistry(warn?: (msg: string) => void): ThreadRegistry {
   }
 }
 
-/** Atomically persist threads.json (tmp write mode 0600 + rename). Mirrors saveAccess. */
+/**
+ * Atomically persist threads.json.
+ *
+ * The temp name carries this process's pid (#68). It used to be a shared
+ * `threads.json.tmp`: two writers wrote the same path and both renamed it, so
+ * one could publish the other's half-written file. `saveDaemonState` already
+ * spelled this correctly; this did not.
+ */
 export function saveRegistry(r: ThreadRegistry): void {
   ensureStateDir();
   const file = statePath("threads.json");
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(r, null, 2) + "\n", { mode: 0o600 });
-  renameSync(tmp, file);
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, JSON.stringify(r, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
+/** How long a registry mutation waits for a concurrent one before giving up. */
+const REGISTRY_MUTATE_WAIT_MS = 2_000;
+/** A mutation lock older than this belonged to a process that died holding it. */
+const REGISTRY_MUTATE_STALE_MS = 5_000;
+
+/**
+ * Serialise one read-modify-write of threads.json across processes.
+ *
+ * Whole-file writes make every mutation a read-modify-write, and this package
+ * runs many of them concurrently — one per omp session. Unserialised, the last
+ * writer wins and every claim recorded in between is lost. Measured (#68): a
+ * burst that created 16 topics recorded 15 rows, and the topics whose rows were
+ * lost became permanently invisible to `/cleanup`, which can only see the
+ * registry. Losing the *index* to a topic is worse than losing the topic.
+ *
+ * Bounded and self-healing: a caller that cannot take the lock in
+ * {@link REGISTRY_MUTATE_WAIT_MS} proceeds anyway — a lost update is bad, a
+ * session that hangs on startup is worse — and a lock left by a dead process is
+ * broken by age.
+ */
+function withRegistryLock<T>(mutate: () => T): T {
+  const lock = `${statePath("threads.json")}.lock`;
+  const deadline = Date.now() + REGISTRY_MUTATE_WAIT_MS;
+  let held = false;
+  while (Date.now() < deadline) {
+    if (linkClaim(lock, process.pid)) {
+      held = true;
+      break;
+    }
+    try {
+      if (Date.now() - statSync(lock).mtimeMs > REGISTRY_MUTATE_STALE_MS) rmSync(lock, { force: true });
+    } catch {
+      // vanished between the claim and the stat: next iteration claims it
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  try {
+    return mutate();
+  } finally {
+    if (held) rmSync(lock, { force: true });
+  }
 }
 
 /** Read-modify-write a topic claim: records the chat and the owning session. */
 export function claimThread(chatId: string, threadId: number, entry: ThreadEntry, warn?: (msg: string) => void): void {
-  const r = loadRegistry(warn);
-  r.chatId = chatId;
-  r.threads[String(threadId)] = entry;
-  saveRegistry(r);
+  withRegistryLock(() => {
+    const r = loadRegistry(warn);
+    r.chatId = chatId;
+    r.threads[String(threadId)] = entry;
+    saveRegistry(r);
+  });
 }
 
 /**

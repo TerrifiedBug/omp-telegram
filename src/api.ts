@@ -309,7 +309,14 @@ function lockFresh(lockPath: string, freshMs: number): boolean {
  * not a racy read-then-write — decides the single winner, and the target is
  * populated the instant it appears (no empty mid-write window).
  */
-function linkClaim(target: string, pid: number, content: string = String(pid)): boolean {
+/**
+ * Create `target` atomically, or report that somebody else already has.
+ *
+ * Exported so the thread registry can serialise its read-modify-write on the
+ * same primitive the poll lock uses (#68): two writers racing a shared
+ * `threads.json.tmp` published each other's file and silently lost claims.
+ */
+export function linkClaim(target: string, pid: number, content: string = String(pid)): boolean {
   const temp = `${target}.${pid}.${randomBytes(6).toString("hex")}`;
   writeFileSync(temp, content, { mode: 0o600 });
   try {

@@ -8,7 +8,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import {
   type Access,
   canAnswerPrompt,
@@ -18,7 +18,7 @@ import {
   resolveToken,
   statePath,
 } from "./access";
-import { acquireLock, type Logger, Poller, releaseLock, startLockHeartbeat, tg, webhookConflictHint } from "./api";
+import { acquireLock, type LockOwner, type Logger, Poller, readLockOwner, releaseLock, startLockHeartbeat, tg, webhookConflictHint } from "./api";
 import { type BridgeHost, ensureControlTopic, handleUpdate, syncBotCommands } from "./bridge";
 import { SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
@@ -90,7 +90,7 @@ interface SpawnedDaemon {
 type SpawnDaemon = (
   executable: string,
   args: string[],
-  options: { detached: true; stdio: ["ignore", number, number] },
+  options: { detached: true; stdio: ["ignore", number, number]; env: NodeJS.ProcessEnv },
 ) => SpawnedDaemon;
 
 export interface EnsureDaemonOptions {
@@ -100,13 +100,63 @@ export interface EnsureDaemonOptions {
   sleep?: (ms: number) => void;
   now?: () => number;
   version?: string;
+  /** Resolves the JS runtime to launch the daemon with. Injected for tests. */
+  runtime?: () => string | undefined;
+  /** Reads the poll lock's owner without acquiring it. Injected for tests. */
+  lockOwner?: (lockPath: string) => LockOwner | undefined;
 }
 
-/** Ensure one current-version daemon is alive when topics-only routing permits it. */
+/** A path whose basename is a JS runtime that can execute a script argument. */
+const RUNTIME_NAME = /(?:^|\/)(?:bun|node)(?:-[\d.]+)?$/;
+
+/**
+ * The runtime that can actually execute `daemon.ts`.
+ *
+ * NOT `process.execPath` (#68). When this plugin is hosted inside the omp
+ * binary, `execPath` is *omp* — a compiled Bun executable that ignores a script
+ * argument and boots an interactive agent session instead. `omp daemon.ts` and
+ * `omp /nonexistent.ts` produce byte-identical output, so the daemon never ran;
+ * every "spawn" was a fresh session that claimed a Telegram topic and exited.
+ *
+ * So the runtime is resolved by name, and when there is none we refuse to spawn
+ * rather than launch something that cannot become a daemon.
+ */
+export function resolveRuntime(env: NodeJS.ProcessEnv = process.env, self: string = process.execPath): string | undefined {
+  // `self` counts only when it IS a runtime. Inside omp it is the agent, which
+  // is the whole bug.
+  if (RUNTIME_NAME.test(self)) return self;
+  // Otherwise resolve `bun` by name: this package ships unbuilt TypeScript, so
+  // Bun is the runtime that can execute it. `node` cannot, and is not a
+  // fallback — a spawn that cannot parse the entrypoint is the same silent
+  // no-op in a different costume.
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (dir === "") continue;
+    const candidate = join(dir, "bun");
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // absent or unreadable: keep looking
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Ensure one current-version daemon is alive when topics-only routing permits it.
+ *
+ * Returns `"declined"` when a daemon is neither possible nor needed: another
+ * process already owns the poll lock (an interactive session polls for itself),
+ * or no JS runtime can execute `daemon.ts`. Both are steady states, not
+ * failures, and both must be decided *here* — before spawning (#68). The old
+ * code spawned a child to find out, and since the child was `omp <script>` it
+ * became a session that claimed a Telegram topic before discovering it should
+ * exit. Each caller then re-ran the same experiment, one permanent topic at a
+ * time, forever.
+ */
 export function ensureDaemon(
   warn: (message: string) => void,
   options: EnsureDaemonOptions = {},
-): "alive" | "spawned" | "disabled" | "failed" {
+): "alive" | "spawned" | "disabled" | "declined" | "failed" {
   const reason = daemonDisableReason(loadAccess(warn), resolveToken());
   if (reason) return "disabled";
 
@@ -115,6 +165,8 @@ export function ensureDaemon(
   const sleep = options.sleep ?? ((ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
   const now = options.now ?? Date.now;
   const version = options.version ?? packageVersion();
+  const runtime = options.runtime ?? resolveRuntime;
+  const lockOwner = options.lockOwner ?? readLockOwner;
   const spawnDaemon: SpawnDaemon = options.spawn ?? ((executable, args, spawnOptions) => spawn(executable, args, spawnOptions));
   const current = readDaemonState();
   if (current && daemonAlive(current, alive)) {
@@ -133,13 +185,34 @@ export function ensureDaemon(
     }
   }
 
+  // Read the lock; never spawn to discover it. A live foreign owner means
+  // something is already polling, and `runDaemon` would exit immediately —
+  // which is exactly the no-op that used to cost a topic per call. Checked
+  // AFTER the upgrade path above, so stopping a stale-version daemon still
+  // happens and its released lock is observed on the next call.
+  const owner = lockOwner(statePath("bot.lock"));
+  if (owner !== undefined && owner.pid !== process.pid && alive(owner.pid)) {
+    return "declined";
+  }
+
+  // No runtime, no spawn. Launching the host binary here is what produced the
+  // loop: it cannot run `daemon.ts` and silently becomes a session instead.
+  const executable = runtime();
+  if (executable === undefined) {
+    warn("no bun/node runtime on PATH to run the telegram daemon; inbound relies on a polling session");
+    return "declined";
+  }
+
   ensureStateDir();
   rotateDaemonLog();
   const logFd = openSync(statePath("daemon.log"), "a", 0o600);
   try {
-    const child = spawnDaemon(process.execPath, [join(import.meta.dirname, "daemon.ts")], {
+    const child = spawnDaemon(executable, [join(import.meta.dirname, "daemon.ts")], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
+      // Declares what this child is, so a process that somehow boots as a
+      // session instead of a daemon still cannot claim a topic (#68).
+      env: { ...process.env, OMP_TELEGRAM_DAEMON_CHILD: "1" },
     });
     child.once("error", (err) => warn(`daemon process failed: ${String(err)}`));
     child.unref();
