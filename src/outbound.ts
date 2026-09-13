@@ -83,6 +83,24 @@ export function finalAssistantText(messages: readonly unknown[]): string {
   return "";
 }
 
+export interface RunError {
+  message: string;
+  status?: number;
+}
+
+/** Latest provider/run failure in a message list (assistant message with stopReason "error"). */
+export function lastRunError(messages: readonly unknown[]): RunError | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || typeof m !== "object") continue;
+    const r = m as { role?: unknown; stopReason?: unknown; errorMessage?: unknown; errorStatus?: unknown };
+    if (r.role !== "assistant" || r.stopReason !== "error") continue;
+    if (typeof r.errorMessage !== "string" || r.errorMessage.trim().length === 0) continue;
+    return { message: r.errorMessage, status: typeof r.errorStatus === "number" ? r.errorStatus : undefined };
+  }
+  return undefined;
+}
+
 export class Outbound {
   #token = "";
   readonly #getAccess: () => Access;
@@ -125,6 +143,31 @@ export class Outbound {
   /** Most recent inbound target (chat + optional topic), for tool defaulting. */
   lastTarget(): { chatId: string; threadId?: number } | undefined {
     return this.#lastTarget;
+  }
+
+  /** Chats with a live Telegram turn (normal replies route here). */
+  activeTargets(): Array<{ chatId: string; threadId?: number }> {
+    const targets: Array<{ chatId: string; threadId?: number }> = [];
+    for (const key of this.#active) {
+      const st = this.#chats.get(key);
+      if (st) targets.push({ chatId: st.chatId, threadId: st.threadId });
+    }
+    return targets;
+  }
+
+  /**
+   * Run-status notice (retry/failure/recovery) to every chat with a live
+   * Telegram turn. Plain text: provider errors carry MarkdownV2-hostile
+   * characters. Gated to Telegram turns by construction — #active only fills
+   * from Telegram inbound.
+   */
+  async announce(text: string): Promise<void> {
+    if (!this.#token || this.#active.size === 0) return;
+    for (const t of this.activeTargets()) {
+      await this.send(t.chatId, text, { threadId: t.threadId, format: "text" }).catch((err) =>
+        this.#log?.warn("[telegram] announce failed " + t.chatId + ": " + String(err)),
+      );
+    }
   }
 
   /** Mark a chat (optionally a forum topic) as an active inbound source; starts typing. */

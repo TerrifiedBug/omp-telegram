@@ -452,6 +452,7 @@ Set it up:
     sessions you aren't actively watching. Turn it off explicitly.
   - **off** — nothing mirrors; asks stay on this terminal.
 
+- **Run failures** — a Telegram-initiated run that fails at the provider (quota exhausted, 429, etc.) no longer dies silently: the first scheduled retry, the model fallback switch, and the terminal failure (with a hint at `/model` and `/sessions`) land in the same topic the reply would have used. A recovered retry reports back too. `explicit` streaming mode opts out, like it does for all automatic egress.
 - Only **locally-started** runs mirror — Telegram-initiated runs already stream
   their reply back, so they never double-notify.
 - With **topics mode** on, a session's prompts/pings land in its own topic;
