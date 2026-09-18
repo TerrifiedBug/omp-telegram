@@ -8,7 +8,7 @@ Telegram in real time. One paired DM owner controls the bridge; optional group
 chat access remains separately configured from the terminal, never by the model.
 
 - **Inbound:** DMs / group mentions → injected as `<telegram-message …>` user turns (photos attached inline; other files downloaded to an inbox).
-- **Outbound:** assistant output streams live — native message **drafts** for DMs (Bot API 9.3+), **edited-message** previews for groups — then one finalized MarkdownV2 message per turn. A headless host can turn all of that off with `set profile daemon`, leaving `telegram_send` / `telegram_ask` as the only way out.
+- **Outbound:** assistant output streams live through native message drafts for DMs (Bot API 9.3+) and edited-message previews for groups. Each turn ends with a MarkdownV2 message by default, or optional rich Markdown on Bot API 10.1+. A headless host can turn automatic output off with `set profile daemon`, leaving `telegram_send` / `telegram_ask` as the only way out.
 - **Control:** local `/telegram` configuration, owner-only Telegram commands (`/spawn`, `/sessions`, `/cleanup`, `/stop`, `/status`), and three model tools (`telegram_send`, `telegram_react`, `telegram_ask`).
 - **Zero runtime dependencies** — the raw Bot API over Bun's `fetch`/`FormData`.
 
@@ -185,10 +185,11 @@ configured groups never receive process-spawning authority.
 | Key | Values | Default |
 |---|---|---|
 | `streaming` | `true` (live preview) \| `false` (per turn) \| `final` (last message only) \| `explicit` (nothing automatic) | `true` |
+| `richMessages` | `off` (MarkdownV2) \| `auto` (rich constructs) \| `on` (prefer rich Markdown) | `off` |
 | `profile` | `daemon` (headless host: forces `explicit`, no idle notify post, `telegram_ask` always on) \| `default` | `default` |
 | `deliverAs` | `steer` \| `followUp` — how inbound queues while the agent is busy | `followUp` |
 | `chunkMode` | `length` \| `newline` | `newline` |
-| `textChunkLimit` | `1`–`4096` | `4096` |
+| `textChunkLimit` | `1`–`4096`; also caps rich source when explicitly set | unset (4096 legacy; 32768 whole rich) |
 | `replyToMode` | `off` \| `first` \| `all` — threading for `telegram_send` replies | `first` |
 | `ackReaction` | a whitelist emoji (empty to disable) — reaction on receipt | unset |
 | `mentionPatterns` | JSON array of regexes that also satisfy group mention-gating, e.g. `["\\bassistant\\b"]` | unset |
@@ -261,8 +262,9 @@ count as a mention.
 ## Model tools
 
 - **`telegram_send`** — send text and/or files to the active or durably claimed
-  chat (or a given `chat_id`). Text is chunked and rendered as MarkdownV2
-  (plain-text fallback on parse errors). `files` are absolute paths: images send
+  chat (or a given `chat_id`). Markdown follows `richMessages`, with MarkdownV2
+  as the default and plain-text fallback on parse errors. `format: "text"` stays
+  literal in every mode. `files` are absolute paths: images send
   as photos, everything else as documents (≤ 50 MB each).
 - **`telegram_react`** — react to a message with a Telegram whitelist emoji
   (👍 👎 ❤ 🔥 👀 🎉 …).
@@ -370,12 +372,28 @@ transcript.
   task's closing line and not an answer to anyone. A missing reply is visible to
   the person waiting and can be asked again; a leaked internal turn cannot be
   recalled. Ask for an answer, not a transcript.
-- Any reply too long for one Telegram message (4096 chars, or `textChunkLimit`)
-  is split at a paragraph, line, or word boundary (`chunkMode`) and each part is
-  prefixed `(i/n)`, so it arrives complete and in order rather than cut off.
-  Code fences are closed and reopened across the split. This covers assistant
-  answers and command output alike — a long `/sessions` listing or `/cleanup`
-  preview splits too, with the keyboard on the final part.
+- Legacy messages split at 4096 characters (or `textChunkLimit`), with room
+  reserved for formatting and labels. Splits prefer paragraph, line, or word
+  boundaries (`chunkMode`). Each part carries `(i/n)`; code fences close and
+  reopen across splits. Command output keeps this limit, with keyboards on the
+  final part.
+- `set richMessages auto` selects rich Markdown for tables, task lists,
+  `<details>`, paired `$$` math, and `<tg-emoji>` outside code. Headings alone
+  don't select it. `on` prefers rich Markdown for all Markdown output; `off`
+  keeps MarkdownV2. Rich messages require Bot API 10.1+.
+- Rich delivery sends the original Markdown, including Telegram's native task
+  syntax. Client rendering and click-to-toggle behavior still need live
+  verification. This setting adds no checklist-management commands or state store.
+- Live drafts and edit previews stay unchanged. Final messages and final
+  preview edits use the selected format. An answer with no permanent preview or
+  committed prefix can arrive as one rich message up to 32768 UTF-16 source
+  units when `textChunkLimit` is unset. An explicit cap remains authoritative.
+  Longer answers and existing previews keep legacy chunk boundaries.
+- A definitive rich rejection (400 or unsupported-method 404) falls back to
+  MarkdownV2, then plain text on a parse rejection. A rejected whole answer is
+  split again to fit legacy limits. Network failures, timeouts, server errors,
+  authorization failures, and exhausted rate limits don't trigger another-format
+  send. Constructs split across parts may lose formatting.
 - A part Telegram rate-limits (`429`) is retried up to three times, honouring
   `retry_after`, instead of dropping the rest of the answer.
 

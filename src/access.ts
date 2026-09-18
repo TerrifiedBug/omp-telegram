@@ -37,7 +37,7 @@ export type Access = {
   ackReaction?: string;
   /** Which chunks carry Telegram's reply reference. Default "first". */
   replyToMode?: "off" | "first" | "all";
-  /** Max chars per outbound message before splitting. Default 4096, clamp 1..4096. */
+  /** Explicit source cap, clamped to 1..4096. Unset: 4096 legacy, 32768 whole rich. */
   textChunkLimit?: number;
   /** Split strategy. Default "newline". */
   chunkMode?: "length" | "newline";
@@ -60,6 +60,8 @@ export type Access = {
    * recalled.
    */
   streaming?: boolean | "final" | "explicit";
+  /** Final Markdown formatting. Missing = off (MarkdownV2). */
+  richMessages?: "auto" | "on" | "off";
   /**
    * Headless-host contract, set via `/telegram set profile daemon`. Absent =
    * `default` (an interactive laptop session).
@@ -92,9 +94,8 @@ export type Access = {
 };
 
 /**
- * Per-message character budget for this config, clamped to Telegram's cap.
- * Every outbound text path splits against this, so a long reply is never
- * rejected whole or silently cut.
+ * Legacy per-message budget, also used for previews and rich fallback chunks.
+ * Whole rich messages may use a larger budget only when no explicit cap is set.
  */
 export function messageLimit(access: Access): number {
   return Math.max(1, Math.min(access.textChunkLimit ?? TELEGRAM_MAX_CHARS, TELEGRAM_MAX_CHARS));
@@ -272,6 +273,10 @@ export function loadAccess(warn?: (msg: string) => void): Access {
         ? parsed.streaming
         : undefined;
     const profile: Access["profile"] = parsed.profile === "daemon" ? "daemon" : undefined;
+    const richMessages: Access["richMessages"] =
+      parsed.richMessages === "auto" || parsed.richMessages === "on" || parsed.richMessages === "off"
+        ? parsed.richMessages
+        : undefined;
     return {
       enabled: parsed.enabled ?? false,
       dmPolicy: parsed.dmPolicy ?? "pairing",
@@ -285,6 +290,7 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       chunkMode: parsed.chunkMode,
       deliverAs: parsed.deliverAs,
       streaming,
+      richMessages,
       profile,
       transcribeCommand: Array.isArray(parsed.transcribeCommand) && parsed.transcribeCommand.every((arg) => typeof arg === "string")
         ? parsed.transcribeCommand
