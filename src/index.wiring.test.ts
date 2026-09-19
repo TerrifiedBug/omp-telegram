@@ -117,6 +117,61 @@ async function startBridge(h: Harness): Promise<void> {
 }
 
 describe("extension wiring", () => {
+  test("rich formatting survives command reload, rejects invalid input, and respects literal/file sends", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], profile: "daemon" });
+    const first = harness(["read"]);
+    const ctx = { ui: { notify() {} } };
+    await first.commands.get("telegram")!.handler("set richMessages auto", ctx);
+    await first.commands.get("telegram")!.handler("set richMessages AUTO", ctx);
+    expect(loadAccess().richMessages).toBe("auto");
+
+    const h = harness(["read"]);
+    const calls: Array<{ method: string; payload?: Record<string, unknown> }> = [];
+    const filesDir = mkdtempSync(join(tmpdir(), "omp-tg-rich-files-"));
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      calls.push({ method, payload: typeof init?.body === "string" ? JSON.parse(init.body) : undefined });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: calls.length } }));
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      const source = "| Name | State |\n| --- | --- |\n| build | ready |";
+      calls.length = 0;
+      const tool = h.tools.get("telegram_send")!;
+      await tool.execute("rich", { chat_id: "42", text: source }, undefined, undefined, {});
+      expect(calls).toEqual([{ method: "sendRichMessage", payload: { chat_id: "42", rich_message: { markdown: source } } }]);
+      await h.commands.get("telegram")!.handler("set richMessages on", ctx);
+      calls.length = 0;
+      await tool.execute("literal", { chat_id: "42", text: source, format: "text" }, undefined, undefined, {});
+      expect(calls).toEqual([{ method: "sendMessage", payload: { chat_id: "42", text: source } }]);
+
+      writeFileSync(join(dir, "access.json"), JSON.stringify({ ...loadAccess(), richMessages: "corrupt" }));
+      await h.commands.get("telegram")!.handler("status", ctx); // Reload hand-edited policy.
+      calls.length = 0;
+      await tool.execute("corrupt", { chat_id: "42", text: source }, undefined, undefined, {});
+      expect(calls[0].method).toBe("sendMessage");
+      expect(calls[0].payload?.parse_mode).toBe("MarkdownV2");
+
+      const file = join(filesDir, "report.txt");
+      writeFileSync(file, "report");
+      calls.length = 0;
+      const result = await tool.execute("file", { chat_id: "42", text: "", files: [file] }, undefined, undefined, {});
+      expect(result.isError).toBeUndefined();
+      expect(calls.map((c) => c.method)).toEqual(["sendDocument"]);
+      calls.length = 0;
+      const denied = await tool.execute("denied", { chat_id: "43", text: source }, undefined, undefined, {});
+      expect(denied.isError).toBe(true);
+      expect(calls).toEqual([]);
+    } finally {
+      rmSync(filesDir, { recursive: true, force: true });
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, {
+        sessionManager: { getSessionId: () => "session-1", getSessionFile: () => "/tmp/session-1.jsonl" },
+      });
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test("registers telegram_ask and the /away command", () => {
     const h = harness(["ask", "read"]);
     expect(h.tools.has("telegram_ask")).toBe(true);

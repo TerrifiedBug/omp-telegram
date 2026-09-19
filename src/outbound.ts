@@ -12,7 +12,7 @@ import { stat } from "node:fs/promises";
 import { extname } from "node:path";
 import { type Access, assertSendable, effectiveStreaming, messageLimit } from "./access";
 import { isMissingThreadError, type Logger, TgError, tg, tgUpload, withRateLimit } from "./api";
-import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, chunkLabeled, mdToMarkdownV2 } from "./markdown";
+import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, TELEGRAM_RICH_MAX_CHARS, chunkLabeled, hasRichConstructs, mdToMarkdownV2 } from "./markdown";
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -263,29 +263,38 @@ export class Outbound {
 
   // ---- model-tool helpers ------------------------------------------------
 
-  /** Send text to a chat, chunked + MarkdownV2 (plain fallback on parse error). Returns message ids. */
+  /** Send text with the configured Markdown format and safe labeled fallback. Returns actual message ids. */
   async send(chatId: string, text: string, opts?: { replyTo?: number; format?: "text" | "markdown"; threadId?: number }): Promise<number[]> {
+    if (!text) return [];
     const access = this.#getAccess();
-    const budget = messageLimit(access) - MARKDOWN_HEADROOM;
-    const parts = chunkLabeled(text, budget, access.chunkMode ?? "newline");
-    if (parts.length === 0) return [];
     const replyMode = access.replyToMode ?? "first";
     const useMd = (opts?.format ?? "markdown") === "markdown";
     const ids: number[] = [];
     let threadId = opts?.threadId;
     let recovered = false;
-    for (let i = 0; i < parts.length; i++) {
-      const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
+    const deliver = async <T>(op: () => Promise<T>): Promise<T> => {
       try {
-        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+        return await op();
       } catch (err) {
         if (recovered || threadId == null || !isMissingThreadError(err)) throw err;
         const replacement = await this.#recoverMissingThread(chatId, threadId);
         if (replacement == null) throw err;
         recovered = true;
         threadId = replacement;
-        ids.push(await this.#sendOne(chatId, parts[i], useMd, replyTo, threadId));
+        return op();
       }
+    };
+    let allowRich = true;
+    const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
+    if (text.length <= richBudget && this.#wantsRich(text, useMd)) {
+      const id = await deliver(() => this.#tryRichSend(chatId, text, this.#threadTarget(opts?.replyTo, replyMode, 0), threadId));
+      if (id !== undefined) return [id];
+      allowRich = false; // Re-split the rejected source; never retry rich for these parts.
+    }
+    const parts = chunkLabeled(text, messageLimit(access) - MARKDOWN_HEADROOM, access.chunkMode ?? "newline");
+    for (let i = 0; i < parts.length; i++) {
+      const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
+      ids.push(await deliver(() => this.#sendOne(chatId, parts[i], useMd, replyTo, threadId, allowRich)));
     }
     return ids;
   }
@@ -435,14 +444,25 @@ export class Outbound {
     return para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit;
   }
 
-  /** Finalize a live preview: MarkdownV2 attempt then plain fallback, cursor removed. */
+  /** Finalize a live preview with the selected format, removing the cursor. */
   async #finalizePreview(st: ChatState, text: string, useMd: boolean): Promise<void> {
     if (st.previewMsgId == null) return;
     await this.#editDelivered(st.chatId, st.previewMsgId, text, useMd);
   }
 
-  /** Edit an already-delivered message: MarkdownV2 attempt then plain fallback. */
+  /** Edit in place; only definitive rich rejections may fall back to legacy formatting. */
   async #editDelivered(chatId: string, messageId: number, text: string, useMd: boolean): Promise<void> {
+    if (this.#wantsRich(text, useMd)) {
+      try {
+        await this.#rateLimited(() =>
+          tg(this.#token, "editMessageText", { chat_id: chatId, message_id: messageId, rich_message: { markdown: text } }),
+        );
+        return;
+      } catch (err) {
+        if (err instanceof TgError && err.code === 400 && /message is not modified/i.test(err.message)) return;
+        if (isMissingThreadError(err) || !(err instanceof TgError && (err.code === 400 || err.code === 404))) throw err;
+      }
+    }
     if (useMd) {
       try {
         await this.#rateLimited(() =>
@@ -457,34 +477,41 @@ export class Outbound {
   }
 
   /** Finalize one turn into real message(s), then reset per-turn state. */
-  async #finalize(st: ChatState, fullText: string, allowRecovery = true): Promise<void> {
+  async #finalize(st: ChatState, fullText: string, allowRecovery = true, allowRich = true): Promise<void> {
     if (st.inflight) await st.inflight.catch(() => {}); // barrier: let any in-flight push settle
     const access = this.#getAccess();
     const budget = messageLimit(access) - MARKDOWN_HEADROOM;
     const mode = access.chunkMode ?? "newline";
     const prior = st.committed.length;
     try {
+      let richSent = false;
+      const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
+      if (allowRich && st.previewMsgId == null && st.sentUpTo === 0 && prior === 0 &&
+          fullText.length <= richBudget && this.#wantsRich(fullText, true)) {
+        richSent = (await this.#tryRichSend(st.chatId, fullText, undefined, st.threadId)) !== undefined;
+        if (!richSent) allowRich = false;
+      }
       if (st.previewMsgId != null) {
         const rest = fullText.slice(st.sentUpTo);
         const parts = chunkLabeled(rest, budget, mode, prior);
         await this.#finalizePreview(st, parts[0] ?? rest, true);
-        for (let i = 1; i < parts.length; i++) await this.#sendOne(st.chatId, parts[i], true, undefined, st.threadId);
+        for (let i = 1; i < parts.length; i++) await this.#sendOne(st.chatId, parts[i], true, undefined, st.threadId, allowRich);
         await this.#labelCommitted(st, prior + Math.max(parts.length, 1));
-      } else {
+      } else if (!richSent) {
         // `sentUpTo` is non-zero when stream overflow already committed a head
         // message this turn — resending from 0 would duplicate it.
         const parts = chunkLabeled(fullText.slice(st.sentUpTo), budget, mode, prior);
-        for (const part of parts) await this.#sendOne(st.chatId, part, true, undefined, st.threadId);
+        for (const part of parts) await this.#sendOne(st.chatId, part, true, undefined, st.threadId, allowRich);
         await this.#labelCommitted(st, prior + parts.length);
-        if (st.draftId != null) {
-          // Clear the ephemeral draft so it doesn't linger beside the real message.
-          await tg(this.#token, "sendMessageDraft", {
-            chat_id: st.chatId,
-            draft_id: st.draftId,
-            text: "",
-            ...(st.threadId != null ? { message_thread_id: st.threadId } : {}),
-          }).catch(() => {});
-        }
+      }
+      if (st.draftId != null) {
+        // Clear the ephemeral draft so it doesn't linger beside the real message.
+        await tg(this.#token, "sendMessageDraft", {
+          chat_id: st.chatId,
+          draft_id: st.draftId,
+          text: "",
+          ...(st.threadId != null ? { message_thread_id: st.threadId } : {}),
+        }).catch(() => {});
       }
     } catch (err) {
       if (allowRecovery && st.threadId != null && isMissingThreadError(err)) {
@@ -495,7 +522,7 @@ export class Outbound {
             st.draftId = undefined;
             st.sentUpTo = 0; // the old topic is gone — redeliver the whole answer
             st.committed = [];
-            await this.#finalize(st, fullText, false);
+            await this.#finalize(st, fullText, false, allowRich);
             return;
           }
         } catch (recoveryError) {
@@ -539,7 +566,34 @@ export class Outbound {
     return replacement;
   }
 
-  async #sendOne(chatId: string, text: string, useMd: boolean, replyTo: number | undefined, threadId?: number): Promise<number> {
+  #wantsRich(text: string, useMd: boolean): boolean {
+    if (!useMd || !text) return false;
+    const mode = this.#getAccess().richMessages;
+    return mode === "on" || (mode === "auto" && hasRichConstructs(text));
+  }
+
+  async #tryRichSend(chatId: string, text: string, replyTo: number | undefined, threadId?: number): Promise<number | undefined> {
+    try {
+      const sent = await this.#rateLimited(() =>
+        tg<{ message_id: number }>(this.#token, "sendRichMessage", {
+          chat_id: chatId,
+          rich_message: { markdown: text },
+          ...(threadId != null ? { message_thread_id: threadId } : {}),
+          ...(replyTo != null ? { reply_parameters: { message_id: replyTo } } : {}),
+        }),
+      );
+      return sent.message_id;
+    } catch (err) {
+      if (isMissingThreadError(err) || !(err instanceof TgError && (err.code === 400 || err.code === 404))) throw err;
+      return undefined;
+    }
+  }
+
+  async #sendOne(chatId: string, text: string, useMd: boolean, replyTo: number | undefined, threadId?: number, allowRich = true): Promise<number> {
+    if (allowRich && this.#wantsRich(text, useMd)) {
+      const id = await this.#tryRichSend(chatId, text, replyTo, threadId);
+      if (id !== undefined) return id;
+    }
     const reply = replyTo != null ? { reply_parameters: { message_id: replyTo } } : {};
     const thread = threadId != null ? { message_thread_id: threadId } : {};
     if (useMd) {
