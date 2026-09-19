@@ -88,14 +88,15 @@ export interface RunError {
   status?: number;
 }
 
-/** Latest provider/run failure in a message list (assistant message with stopReason "error"). */
+/** Failure of the current terminal assistant result, never an older turn. */
 export function lastRunError(messages: readonly unknown[]): RunError | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m || typeof m !== "object") continue;
     const r = m as { role?: unknown; stopReason?: unknown; errorMessage?: unknown; errorStatus?: unknown };
-    if (r.role !== "assistant" || r.stopReason !== "error") continue;
-    if (typeof r.errorMessage !== "string" || r.errorMessage.trim().length === 0) continue;
+    if (r.role === "user") return undefined;
+    if (r.role !== "assistant") continue;
+    if (r.stopReason !== "error" || typeof r.errorMessage !== "string" || r.errorMessage.trim().length === 0) return undefined;
     return { message: r.errorMessage, status: typeof r.errorStatus === "number" ? r.errorStatus : undefined };
   }
   return undefined;

@@ -1182,14 +1182,13 @@ describe("run failure notices", () => {
   }
 
   async function activateTelegramTurn(h: Harness): Promise<void> {
+    const prompt = '<telegram-message from_id="42" chat_id="42" chat_type="private" thread_id="9">hi</telegram-message>';
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt, systemPrompt: [] },
+      noticeCtx("session-1"),
+    );
     await h.handlers.get("message_start")?.[0]?.(
-      {
-        type: "message_start",
-        message: {
-          role: "user",
-          content: '<telegram-message from_id="42" chat_id="42" chat_type="private">hi</telegram-message>',
-        },
-      },
+      { type: "message_start", message: { role: "user", content: prompt } },
       noticeCtx("session-1"),
     );
   }
@@ -1211,7 +1210,11 @@ describe("run failure notices", () => {
         noticeCtx("session-1"),
       );
       expect(calls.length).toBe(1);
-      expect(String(calls[0].body.text)).toContain("retrying (1/3");
+      expect(String(calls[0].body.text)).toContain("429 boom");
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", willContinue: true, messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
       await retryStart?.(
         { type: "auto_retry_start", attempt: 2, maxAttempts: 3, delayMs: 120000, errorMessage: "429 boom" },
         noticeCtx("session-1"),
@@ -1222,7 +1225,12 @@ describe("run failure notices", () => {
         noticeCtx("session-1"),
       );
       expect(calls.length).toBe(2);
-      expect(String(calls[1].body.text)).toContain("succeeded after 2 retries");
+      const answer = { role: "assistant", content: [{ type: "text", text: "Recovered answer" }], stopReason: "stop" };
+      await h.handlers.get("turn_end")?.[0]?.({ type: "turn_end", message: answer }, noticeCtx("session-1"));
+      await h.handlers.get("agent_end")?.[0]?.({ type: "agent_end", messages: [...failedRun("429 boom"), answer] }, noticeCtx("session-1"));
+      expect(calls).toHaveLength(3);
+      expect(calls[2].body.text).toBe("Recovered answer");
+      expect(calls.every((call) => call.body.chat_id === "42" && call.body.message_thread_id === 9)).toBe(true);
     } finally {
       restore();
       await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
@@ -1236,18 +1244,27 @@ describe("run failure notices", () => {
     const { calls, restore } = captureSend();
     try {
       await activateTelegramTurn(h);
+      await h.handlers.get("auto_retry_start")?.[0]?.(
+        { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "429 temporary" },
+        noticeCtx("session-1"),
+      );
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", willContinue: true, messages: failedRun("429 temporary") },
+        noticeCtx("session-1"),
+      );
       await h.handlers.get("auto_retry_end")?.[0]?.(
         { type: "auto_retry_end", success: false, attempt: 3, finalError: "429 no more" },
         noticeCtx("session-1"),
       );
-      expect(calls.length).toBe(1);
-      expect(String(calls[0].body.text)).toContain("run failed after 3 attempts");
-      expect(String(calls[0].body.text)).toContain("/model");
+      expect(calls).toHaveLength(2);
+      expect(String(calls[1].body.text)).toContain("429 no more");
       await h.handlers.get("agent_end")?.[0]?.(
         { type: "agent_end", messages: failedRun("429 no more") },
         noticeCtx("session-1"),
       );
-      expect(calls.length).toBe(1);
+      expect(calls).toHaveLength(2);
+      expect(calls.every((call) => call.body.chat_id === "42" && call.body.message_thread_id === 9)).toBe(true);
+      expect(calls.every((call) => call.body.parse_mode === undefined)).toBe(true);
     } finally {
       restore();
       await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
@@ -1273,9 +1290,9 @@ describe("run failure notices", () => {
     }
   });
 
-  test("a scheduled continuation is not a terminal settle", async () => {
+  test("continuations preserve the Telegram prompt surface until terminal settlement", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"] });
-    const h = harness(["ask"]);
+    const h = harness(["ask", "read"]);
     await startBridge(h);
     const { calls, restore } = captureSend();
     try {
@@ -1285,6 +1302,34 @@ describe("run failure notices", () => {
         noticeCtx("session-1"),
       );
       expect(calls).toEqual([]);
+      expect(h.active()).toContain("telegram_ask");
+      expect(h.active()).not.toContain("ask");
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toHaveLength(1);
+      expect(h.active()).toContain("ask");
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("a healthy run does not announce a historical provider failure", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      const answer = { role: "assistant", content: [{ type: "text", text: "Healthy answer" }], stopReason: "stop" };
+      await h.handlers.get("turn_end")?.[0]?.({ type: "turn_end", message: answer }, noticeCtx("session-1"));
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: [...failedRun("old failure"), { role: "user", content: "new request" }, answer] },
+        noticeCtx("session-1"),
+      );
+      expect(calls.map((call) => call.body.text)).toEqual(["Healthy answer"]);
     } finally {
       restore();
       await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));

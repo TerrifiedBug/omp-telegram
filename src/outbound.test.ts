@@ -57,6 +57,14 @@ describe("lastRunError", () => {
     expect(lastRunError([assistant("ok"), failed("429 boom")])).toEqual({ message: "429 boom", status: 429 });
   });
 
+  test("stops at the latest assistant result or user boundary", () => {
+    expect(lastRunError([failed("old"), assistant("healthy")])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "user", content: "new request" }])).toBeUndefined();
+    expect(lastRunError([failed("old"), failed(" ")])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "assistant", stopReason: "aborted" }])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "user", content: "new request" }, failed("current")])).toEqual({ message: "current", status: 429 });
+  });
+
   test("ignores aborts, textless failures, and non-assistant messages", () => {
     expect(lastRunError([{ role: "assistant", content: [], stopReason: "aborted", errorMessage: "stop" }])).toBeUndefined();
     expect(lastRunError([failed("   ")])).toBeUndefined();

@@ -2671,6 +2671,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
   pi.on("agent_end", async (e, ctx) => {
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    // Retry/compaction continuations still own their chats and prompt tools.
+    // Only terminal settlement may tear those down or send an idle notice.
+    if (e.willContinue) return;
     lastCtx = ctx;
     for (const pending of pendingApprovals.values()) {
       clearTimeout(pending.timer);
@@ -2679,10 +2682,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     blockedPings.clear();
     const wasActive = outbound.isActive();
     const finalText = finalAssistantText(e.messages);
-    // A scheduled continuation (auto-retry etc.) is not a terminal settle —
-    // its own events narrate. willContinue is absent on older hosts.
-    const terminalError =
-      (e as { willContinue?: unknown }).willContinue === true ? undefined : lastRunError(e.messages);
+    const terminalError = lastRunError(e.messages);
     if (terminalError && !runFailAnnounced) {
       runFailAnnounced = true;
       const errText =

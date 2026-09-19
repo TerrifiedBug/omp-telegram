@@ -32,7 +32,7 @@ same poll lock and provides the identical routing behavior.
 
 ## Requirements
 
-- omp ≥ 17.0.0, Bun ≥ 1.3
+- omp ≥ 18.1.16, Bun ≥ 1.3
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - [herdr](https://herdr.dev/) for `/spawn` and `/sessions` (chat bridging works without it)
 
