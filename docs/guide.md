@@ -382,8 +382,8 @@ transcript.
   don't select it. `on` prefers rich Markdown for all Markdown output; `off`
   keeps MarkdownV2. Rich messages require Bot API 10.1+.
 - Rich delivery sends the original Markdown, including Telegram's native task
-  syntax. Client rendering and click-to-toggle behavior still need live
-  verification. This setting adds no checklist-management commands or state store.
+  syntax. Telegram controls rendering and checkbox interaction. This setting
+  adds no checklist-management commands or state store.
 - Live drafts and edit previews stay unchanged. Final messages and final
   preview edits use the selected format. An answer with no permanent preview or
   committed prefix can arrive as one rich message up to 32768 UTF-16 source
