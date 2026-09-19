@@ -154,6 +154,7 @@ const TELEGRAM_ARGS: CompletionNode = {
     mentionPatterns: null,
     deliverAs: { steer: null, followUp: null },
     streaming: { true: null, false: null, final: null, explicit: null },
+    richMessages: { auto: null, on: null, off: null },
     profile: { daemon: null, default: null },
     transcribeCommand: null,
   },
@@ -192,6 +193,7 @@ const SET_KEY_HELP: Record<string, string> = {
   mentionPatterns: "JSON array of mention regexes",
   deliverAs: "steer | followUp delivery",
   streaming: "output: true (stream) | false (per-turn) | final (one message) | explicit (tool calls only)",
+  richMessages: "formatting: auto (rich constructs) | on (prefer rich) | off (MarkdownV2)",
   profile: "daemon (headless: explicit output + always-on telegram_ask) | default",
   transcribeCommand: "JSON argv for voice transcription",
 };
@@ -1493,6 +1495,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       // the streaming value is overridden, and "off" would have been read as
       // "silent" when it only ever meant "no live preview".
       `Streaming: ${STREAMING_LABEL[String(effectiveStreaming(a))]} · profile: ${a.profile ?? "default"} · deliverAs: ${a.deliverAs ?? "followUp"} · chunkMode: ${a.chunkMode ?? "newline"} · replyTo: ${a.replyToMode ?? "first"}`,
+      `Rich messages: ${a.richMessages ?? "off"}`,
       `Notify: ${a.notifyMode ?? "off"}${a.notifyChat ? ` · chat ${a.notifyChat}` : ""}`,
       `Voice transcription: ${a.transcribeCommand?.length ? a.transcribeCommand.join(" ") : "off"}`,
       `Control topic: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`,
@@ -1834,6 +1837,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         return ctx.ui.notify("streaming: true | false | final | explicit", "warning");
       }
       a.streaming = value === "final" || value === "explicit" ? value : value === "true";
+    } else if (key === "richMessages") {
+      if (value !== "auto" && value !== "on" && value !== "off") return ctx.ui.notify("richMessages: auto | on | off", "warning");
+      a.richMessages = value;
     } else if (key === "profile") {
       if (value !== "daemon" && value !== "default") return ctx.ui.notify("profile: daemon | default", "warning");
       a.profile = value === "daemon" ? "daemon" : undefined;
@@ -1850,7 +1856,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         }
       }
     } else {
-      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming, profile, transcribeCommand`, "warning");
+      return ctx.ui.notify(`set: unknown key "${key}". Keys: ackReaction, replyToMode, textChunkLimit, chunkMode, mentionPatterns, deliverAs, streaming, richMessages, profile, transcribeCommand`, "warning");
     }
     saveAccess(a);
     access = a;

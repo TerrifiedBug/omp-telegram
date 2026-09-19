@@ -110,6 +110,17 @@ describe("loadAccess field preservation", () => {
     expect(loadAccess().notifyMode).toBeUndefined();
   });
 
+  test("reloads rich formatting modes and discards invalid saved values", () => {
+    for (const richMessages of ["auto", "on", "off"] as const) {
+      saveAccess({ ...defaultAccess(), richMessages });
+      expect(loadAccess().richMessages).toBe(richMessages);
+    }
+    for (const richMessages of ["ON", true, 1, null]) {
+      writeFileSync(join(dir, "access.json"), JSON.stringify({ ...defaultAccess(), richMessages }));
+      expect(loadAccess().richMessages ?? "off").toBe("off");
+    }
+  });
+
   test("round-trips the streaming mode and daemon profile", () => {
     saveAccess({ ...defaultAccess(), streaming: "explicit", profile: "daemon" });
     const a = loadAccess();

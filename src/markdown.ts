@@ -9,8 +9,68 @@
 
 /** Telegram's hard per-message character cap (UTF-16 units). */
 export const TELEGRAM_MAX_CHARS = 4096;
+/** Conservative raw-source budget for Telegram rich messages. */
+export const TELEGRAM_RICH_MAX_CHARS = 32768;
 /** Headroom to reserve when a chunk will be MarkdownV2-escaped (escaping grows text). */
 export const MARKDOWN_HEADROOM = 96;
+
+/** Detect rich-only constructs without rewriting the source sent to Telegram. */
+export function hasRichConstructs(markdown: string): boolean {
+  let fenceChar = "";
+  let fenceLength = 0;
+  const visible: string[] = [];
+  for (const line of markdown.split("\n")) {
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fenceLength) {
+      if (fence && fence[1][0] === fenceChar && fence[1].length >= fenceLength && !fence[2].trim()) fenceLength = 0;
+      visible.push("");
+      continue;
+    }
+    if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+      fenceChar = fence[1][0];
+      fenceLength = fence[1].length;
+      visible.push("");
+      continue;
+    }
+    // Mask escaped punctuation, preserving cell content but not its syntax.
+    visible.push(/^( {4}| {0,3}\t)/.test(line) ? "" : line.replace(/\\[!-/:-@[-`{-~]/g, "\0"));
+  }
+
+  const source = visible.join("\n");
+  const ticks = [...source.matchAll(/`+/g)];
+  const next = new Map<number, number>();
+  const closes: Array<number | undefined> = new Array(ticks.length);
+  for (let i = ticks.length - 1; i >= 0; i--) {
+    closes[i] = next.get(ticks[i][0].length);
+    next.set(ticks[i][0].length, i);
+  }
+  const fragments: string[] = [];
+  let offset = 0;
+  for (let i = 0; i < ticks.length; i++) {
+    const close = closes[i];
+    if (close === undefined) continue; // unmatched backticks are literal
+    const start = ticks[i].index;
+    const end = ticks[close].index + ticks[close][0].length;
+    fragments.push(source.slice(offset, start), source.slice(start, end).replace(/[^\n]/g, "\0"));
+    offset = end;
+    i = close;
+  }
+  fragments.push(source.slice(offset));
+  const text = fragments.join("");
+  if (/<(?:details|tg-emoji)(?:\s[^>]*|)>/i.test(text)) return true;
+  for (const match of text.matchAll(/\$\$((?:(?!\$\$)[\s\S])+)\$\$/g)) {
+    if (match[1].replace(/\0/g, "").trim()) return true;
+  }
+  let header: string[] | undefined;
+  for (const line of text.split("\n")) {
+    if (/^ {0,3}[-+*]\s+\[[ xX]\](?:\s|$)/.test(line)) return true;
+    const trimmed = line.trim();
+    const cells = trimmed.includes("|") ? trimmed.replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim()) : undefined;
+    if (header && cells && cells.length === header.length && cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return true;
+    header = cells;
+  }
+  return false;
+}
 
 /** Escape every MarkdownV2 special character with a backslash. */
 export function escapeMdV2(s: string): string {

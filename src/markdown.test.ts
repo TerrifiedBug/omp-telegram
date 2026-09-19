@@ -1,11 +1,40 @@
 import { test, expect, describe } from "bun:test";
-import { escapeMdV2, mdToMarkdownV2, chunk, chunkLabeled, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, MARKDOWN_HEADROOM } from "./markdown";
+import { escapeMdV2, mdToMarkdownV2, chunk, chunkLabeled, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, MARKDOWN_HEADROOM, hasRichConstructs } from "./markdown";
 
 // The exact MarkdownV2 special set that escapeMdV2 must prefix with a backslash.
 const SPECIALS = ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!", "\\"];
 
 /** Count non-overlapping triple-backtick sequences — the fence-balance measure chunk() uses. */
 const countFences = (s: string): number => (s.match(/```/g) ?? []).length;
+
+describe("hasRichConstructs", () => {
+  test.each([
+    "| Name | State |\n| --- | :---: |\n| build | ready |",
+    "Name | State\n--- | ---:",
+    "| escaped \\| pipe | state |\n| --- | --- |",
+    "- [ ] Pending", "+ [x] Done", "* [X]",
+    "<details open><summary>More</summary></details>",
+    "<tg-emoji emoji-id=\"123\">star</tg-emoji>",
+    "$$E = mc^2$$", "$$\na + b\n$$",
+    "````\n```\n````\n- [x] outside",
+    "prefix `unmatched\n- [ ] outside",
+  ])("detects rich syntax: %s", (source) => expect(hasRichConstructs(source)).toBe(true));
+
+  test.each([
+    "## Heading\n**ordinary bold**", "---", "Name\n---",
+    "| A | B |\n| --- |", "| A |\n| -- |",
+    "- [x]word", "\\- [x] literal", "- \\[x] literal",
+    "\\<details>", "\\<tg-emoji>", "\\$\\$math\\$\\$",
+    "    - [x] indented", "\t<details>", "  \t<details>",
+    "```md\n- [x] code\n```", "~~~\n<details>\n~~~",
+    "````\n```\n- [x] still code\n````",
+    "~~~\n```\n<tg-emoji>\n", "```\n- [x] unclosed",
+    "`<details>`", "`` ` <details> ``",
+    "`multiline\n<details>\nspan`", "$$$$", "$$ \n $$",
+    "| a \\| b |\n| --- | --- |",
+    "`| a | b |`\n| --- | --- |",
+  ])("ignores literal or malformed syntax: %s", (source) => expect(hasRichConstructs(source)).toBe(false));
+});
 
 describe("escapeMdV2", () => {
   test("escapes every MarkdownV2 special character with a backslash", () => {
