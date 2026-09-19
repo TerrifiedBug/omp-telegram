@@ -45,7 +45,7 @@ import { type BridgeHost, clearOwnerBotCommands, ensureControlTopic as ensureBri
 import { SpawnController, agentNameForSession, findSessionSpace, listControlSpaces, sendCommandMessage } from "./control";
 import { daemonAlive, daemonDisableReason, ensureDaemon, readDaemonState } from "./daemon";
 import { INBOX_MAX_FILE_BYTES, pruneInbox, storeInboxFile } from "./inbox";
-import { Outbound, finalAssistantText } from "./outbound";
+import { Outbound, finalAssistantText, lastRunError } from "./outbound";
 import { PROMPT_SUPERSEDED, type PromptOption, type PromptQuestion, type PromptTarget, TelegramPromptController, formatPromptResult } from "./prompts";
 import {
   DM_ROUTE_KEY,
@@ -604,6 +604,10 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let activePromptTarget: PromptTarget | undefined;
   let savedPromptTools: string[] | undefined;
   let compacting = false;
+  /** Terminal run failure already announced to the active chats this run. */
+  let runFailAnnounced = false;
+  /** Retry saga already announced this run (first auto_retry_start). */
+  let retryNoticeSent = false;
   const poller = new Poller();
   const outbound = new Outbound(() => access, log);
   const spawnController = new SpawnController({
@@ -2435,6 +2439,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     ctx.ui.notify("telegram: away off — you're back at the terminal, runs stay on-screen (run /away to re-arm)", "info");
   });
   pi.on("before_agent_start", async (event, ctx) => {
+    runFailAnnounced = false;
+    retryNoticeSent = false;
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
     const a = loadAccess(warn);
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
@@ -2618,8 +2624,62 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     lastCtx = ctx;
     await outbound.onTurnEnd(e.message);
   });
+  /** First line of a provider error, single-spaced, capped for chat. */
+  function shortError(message: string): string {
+    return message.replace(/\s+/g, " ").trim().slice(0, 300);
+  }
+
+  function fmtDelay(ms: number): string {
+    if (!Number.isFinite(ms) || ms < 0) return "a bit";
+    if (ms < 1000) return Math.round(ms) + "ms";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    return Math.floor(m / 60) + "h" + (m % 60 === 0 ? "" : " " + (m % 60) + "m");
+  }
+
+  /**
+   * Run-status notice to the chats with a live Telegram turn. Skipped for task
+   * subagents and explicit mode — which opts out of all automatic egress, like
+   * the idle notify below. announce() self-gates on Telegram turns.
+   */
+  async function announceRunNotice(ctx: ExtensionContext, text: string): Promise<void> {
+    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    lastCtx = ctx;
+    if (effectiveStreaming(loadAccess(warn)) === "explicit") return;
+    await outbound.announce(text);
+  }
+
+  pi.on("auto_retry_start", async (e, ctx) => {
+    if (retryNoticeSent) return;
+    retryNoticeSent = true;
+    await announceRunNotice(
+      ctx,
+      "⚠️ request failed: " + shortError(e.errorMessage) + " — retrying (" + e.attempt + "/" + e.maxAttempts + ", in ~" + fmtDelay(e.delayMs) + ")…",
+    );
+  });
+  pi.on("auto_retry_end", async (e, ctx) => {
+    if (e.success) {
+      if (!retryNoticeSent) return;
+      retryNoticeSent = false;
+      await announceRunNotice(ctx, "✅ request succeeded after " + e.attempt + (e.attempt === 1 ? " retry." : " retries."));
+      return;
+    }
+    runFailAnnounced = true;
+    await announceRunNotice(
+      ctx,
+      "⚠️ run failed after " + e.attempt + (e.attempt === 1 ? " attempt" : " attempts") + ": " + shortError(e.finalError ?? "unknown error") + ". Use /model to switch, /sessions for state.",
+    );
+  });
+  pi.on("retry_fallback_applied", async (e, ctx) => {
+    await announceRunNotice(ctx, "🔀 model fallback: " + e.from + " → " + e.to + " (" + e.role + ").");
+  });
   pi.on("agent_end", async (e, ctx) => {
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    // Retry/compaction continuations still own their chats and prompt tools.
+    // Only terminal settlement may tear those down or send an idle notice.
+    if (e.willContinue) return;
     lastCtx = ctx;
     for (const pending of pendingApprovals.values()) {
       clearTimeout(pending.timer);
@@ -2628,6 +2688,15 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     blockedPings.clear();
     const wasActive = outbound.isActive();
     const finalText = finalAssistantText(e.messages);
+    const terminalError = lastRunError(e.messages);
+    if (terminalError && !runFailAnnounced) {
+      runFailAnnounced = true;
+      const errText =
+        terminalError.status != null
+          ? terminalError.status + " " + shortError(terminalError.message)
+          : shortError(terminalError.message);
+      await announceRunNotice(ctx, "⚠️ run failed: " + errText + ". Use /model to switch, /sessions for state.");
+    }
     await outbound.onAgentEnd(finalText);
     await restorePromptTools();
     await captureOwnSpace(ctx);

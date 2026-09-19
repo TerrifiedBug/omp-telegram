@@ -1216,3 +1216,219 @@ describe("telegram_ask execute (dual-surface)", () => {
     expect(res.content[0].text).toContain("no surface available");
   });
 });
+
+describe("run failure notices", () => {
+  const noticeCtx = (sessionId: string) => ({
+    hasUI: true,
+    ui: { notify() {} },
+    isIdle: () => true,
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => `/tmp/${sessionId}.jsonl` },
+  });
+
+  function captureSend(): { calls: { method: string; body: Record<string, unknown> }[]; restore: () => void } {
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      if (method === "sendMessage") calls.push({ method, body: JSON.parse(String(init?.body ?? "{}")) });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 60 } }), { status: 200 });
+    }) as typeof fetch;
+    return { calls, restore: () => { globalThis.fetch = previousFetch; } };
+  }
+
+  async function activateTelegramTurn(h: Harness): Promise<void> {
+    const prompt = '<telegram-message from_id="42" chat_id="42" chat_type="private" thread_id="9">hi</telegram-message>';
+    await h.handlers.get("before_agent_start")?.[0]?.(
+      { type: "before_agent_start", prompt, systemPrompt: [] },
+      noticeCtx("session-1"),
+    );
+    await h.handlers.get("message_start")?.[0]?.(
+      { type: "message_start", message: { role: "user", content: prompt } },
+      noticeCtx("session-1"),
+    );
+  }
+
+  const failedRun = (message: string) => [
+    { role: "assistant", content: [], stopReason: "error", errorStatus: 429, errorMessage: message },
+  ];
+
+  test("a retry saga narrates its first retry and the recovery", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      const retryStart = h.handlers.get("auto_retry_start")?.[0];
+      await retryStart?.(
+        { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 62000, errorMessage: "429 boom" },
+        noticeCtx("session-1"),
+      );
+      expect(calls.length).toBe(1);
+      expect(String(calls[0].body.text)).toContain("429 boom");
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", willContinue: true, messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      await retryStart?.(
+        { type: "auto_retry_start", attempt: 2, maxAttempts: 3, delayMs: 120000, errorMessage: "429 boom" },
+        noticeCtx("session-1"),
+      );
+      expect(calls.length).toBe(1);
+      await h.handlers.get("auto_retry_end")?.[0]?.(
+        { type: "auto_retry_end", success: true, attempt: 2 },
+        noticeCtx("session-1"),
+      );
+      expect(calls.length).toBe(2);
+      const answer = { role: "assistant", content: [{ type: "text", text: "Recovered answer" }], stopReason: "stop" };
+      await h.handlers.get("turn_end")?.[0]?.({ type: "turn_end", message: answer }, noticeCtx("session-1"));
+      await h.handlers.get("agent_end")?.[0]?.({ type: "agent_end", messages: [...failedRun("429 boom"), answer] }, noticeCtx("session-1"));
+      expect(calls).toHaveLength(3);
+      expect(calls[2].body.text).toBe("Recovered answer");
+      expect(calls.every((call) => call.body.chat_id === "42" && call.body.message_thread_id === 9)).toBe(true);
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("exhausted retries announce the failure once, agent_end stays silent after", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      await h.handlers.get("auto_retry_start")?.[0]?.(
+        { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "429 temporary" },
+        noticeCtx("session-1"),
+      );
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", willContinue: true, messages: failedRun("429 temporary") },
+        noticeCtx("session-1"),
+      );
+      await h.handlers.get("auto_retry_end")?.[0]?.(
+        { type: "auto_retry_end", success: false, attempt: 3, finalError: "429 no more" },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toHaveLength(2);
+      expect(String(calls[1].body.text)).toContain("429 no more");
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: failedRun("429 no more") },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toHaveLength(2);
+      expect(calls.every((call) => call.body.chat_id === "42" && call.body.message_thread_id === 9)).toBe(true);
+      expect(calls.every((call) => call.body.parse_mode === undefined)).toBe(true);
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("agent_end without a retry cycle announces the terminal error with status", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      expect(calls.length).toBe(1);
+      expect(String(calls[0].body.text)).toContain("429 boom");
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("continuations preserve the Telegram prompt surface until terminal settlement", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask", "read"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", willContinue: true, messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toEqual([]);
+      expect(h.active()).toContain("telegram_ask");
+      expect(h.active()).not.toContain("ask");
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toHaveLength(1);
+      expect(h.active()).toContain("ask");
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("a healthy run does not announce a historical provider failure", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      const answer = { role: "assistant", content: [{ type: "text", text: "Healthy answer" }], stopReason: "stop" };
+      await h.handlers.get("turn_end")?.[0]?.({ type: "turn_end", message: answer }, noticeCtx("session-1"));
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: [...failedRun("old failure"), { role: "user", content: "new request" }, answer] },
+        noticeCtx("session-1"),
+      );
+      expect(calls.map((call) => call.body.text)).toEqual(["Healthy answer"]);
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("explicit mode opts out of failure notices", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], streaming: "explicit" });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      await h.handlers.get("auto_retry_end")?.[0]?.(
+        { type: "auto_retry_end", success: false, attempt: 1, finalError: "429 boom" },
+        noticeCtx("session-1"),
+      );
+      await h.handlers.get("agent_end")?.[0]?.(
+        { type: "agent_end", messages: failedRun("429 boom") },
+        noticeCtx("session-1"),
+      );
+      expect(calls).toEqual([]);
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+
+  test("a model fallback is announced to the active chat", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    const h = harness(["ask"]);
+    await startBridge(h);
+    const { calls, restore } = captureSend();
+    try {
+      await activateTelegramTurn(h);
+      await h.handlers.get("retry_fallback_applied")?.[0]?.(
+        { type: "retry_fallback_applied", from: "a/model", to: "b/model", role: "default" },
+        noticeCtx("session-1"),
+      );
+      expect(calls.length).toBe(1);
+      expect(String(calls[0].body.text)).toContain("a/model");
+    } finally {
+      restore();
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, noticeCtx("session-1"));
+    }
+  });
+});

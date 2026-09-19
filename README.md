@@ -8,7 +8,7 @@ commands like `/spawn`, `/sessions`, `/cleanup`, and `/status`.
 
 ## What you need
 
-- [omp](https://github.com/can1357/oh-my-pi) 17.0.0 or newer
+- [omp](https://github.com/can1357/oh-my-pi) 18.1.16 or newer
 - [Bun](https://bun.sh/) 1.3 or newer
 - A Telegram bot from [@BotFather](https://t.me/BotFather)
 - [herdr](https://herdr.dev/) for `/spawn`, `/sessions`, and stale-topic auto-resume

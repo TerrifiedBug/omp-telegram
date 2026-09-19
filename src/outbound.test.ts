@@ -1,6 +1,6 @@
 import { afterEach, test, expect, describe, setSystemTime } from "bun:test";
 import { type Access, defaultAccess } from "./access";
-import { Outbound, assistantText, finalAssistantText } from "./outbound";
+import { Outbound, assistantText, finalAssistantText, lastRunError } from "./outbound";
 import { mdToMarkdownV2 } from "./markdown";
 
 const assistant = (text: string): unknown => ({ role: "assistant", content: [{ type: "text", text }] });
@@ -52,6 +52,57 @@ describe("finalAssistantText", () => {
     expect(finalAssistantText([])).toBe("");
     expect(finalAssistantText([{ role: "user", content: [{ type: "text", text: "hi" }] }])).toBe("");
     expect(finalAssistantText([{ role: "assistant", content: [{ type: "thinking", thinking: "..." }] }])).toBe("");
+  });
+});
+
+describe("lastRunError", () => {
+  const failed = (message?: unknown): unknown => ({ role: "assistant", content: [], stopReason: "error", errorMessage: message, errorStatus: 429 });
+
+  test("returns the latest failure with its status", () => {
+    expect(lastRunError([assistant("ok"), failed("429 boom")])).toEqual({ message: "429 boom", status: 429 });
+  });
+
+  test("stops at the latest assistant result or user boundary", () => {
+    expect(lastRunError([failed("old"), assistant("healthy")])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "user", content: "new request" }])).toBeUndefined();
+    expect(lastRunError([failed("old"), failed(" ")])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "assistant", stopReason: "aborted" }])).toBeUndefined();
+    expect(lastRunError([failed("old"), { role: "user", content: "new request" }, failed("current")])).toEqual({ message: "current", status: 429 });
+  });
+
+  test("ignores aborts, textless failures, and non-assistant messages", () => {
+    expect(lastRunError([{ role: "assistant", content: [], stopReason: "aborted", errorMessage: "stop" }])).toBeUndefined();
+    expect(lastRunError([failed("   ")])).toBeUndefined();
+    expect(lastRunError([failed(undefined)])).toBeUndefined();
+    expect(lastRunError([{ role: "user", content: "hi" }])).toBeUndefined();
+    expect(lastRunError([])).toBeUndefined();
+  });
+});
+
+describe("Outbound.announce", () => {
+  test("notifies every active chat in plain text, silent with no token or no turn", async () => {
+    const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ method, payload });
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 31 } }), { status: 200 });
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], richMessages: "on" }));
+    await outbound.announce("no token");
+    expect(calls).toEqual([]);
+    outbound.setToken("secret");
+    await outbound.announce("no turn");
+    expect(calls).toEqual([]);
+    outbound.markActive("42", 9);
+    outbound.markActive("43");
+    await outbound.announce("run failed: boom_bam");
+    expect(calls.filter((c) => c.method === "sendMessage").map((c) => c.payload)).toEqual([
+      { chat_id: "42", text: "run failed: boom_bam", message_thread_id: 9 },
+      { chat_id: "43", text: "run failed: boom_bam" },
+    ]);
+    outbound.shutdown();
   });
 });
 
