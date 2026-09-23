@@ -207,7 +207,11 @@ describe("writeRouted / watchRoute", () => {
   test("a spooled payload is delivered by the initial scan and consumed", () => {
     writeRouted(7, routed(42));
     const got: TgMessage[] = [];
-    const dispose = watchRoute(7, (m) => got.push(m));
+    // A void return means synchronous settlement; returning a truthy value
+    // (e.g. bare `got.push(m)`) defers consumption to a later microtask.
+    const dispose = watchRoute(7, (m) => {
+      got.push(m);
+    });
     dispose();
     expect(got).toHaveLength(1);
     expect(got[0].message_id).toBe(42);
