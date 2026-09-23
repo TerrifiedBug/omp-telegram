@@ -2,15 +2,24 @@
 
 [Back to the quick start](../README.md)
 
-Run a Telegram bot **inside** an omp coding session. Incoming DMs and configured
-group @-mentions are injected as user messages; assistant replies stream back to
-Telegram in real time. One paired DM owner controls the bridge; optional group
-chat access remains separately configured from the terminal, never by the model.
+Run a Telegram bot inside an omp coding session. Incoming DMs and configured
+group mentions become user messages, and assistant replies stream back to
+Telegram. One paired DM owner controls the bridge. Group access is configured
+separately from the terminal and grants no control authority.
 
-- **Inbound:** DMs / group mentions → injected as `<telegram-message …>` user turns (photos attached inline; other files downloaded to an inbox).
-- **Outbound:** assistant output streams live through native message drafts for DMs (Bot API 9.3+) and edited-message previews for groups. Each turn ends with a MarkdownV2 message by default, or optional rich Markdown on Bot API 10.1+. A headless host can turn automatic output off with `set profile daemon`, leaving `telegram_send` / `telegram_ask` as the only way out.
-- **Control:** local `/telegram` configuration, owner-only Telegram commands (`/spawn`, `/sessions`, `/cleanup`, `/stop`, `/status`), and three model tools (`telegram_send`, `telegram_react`, `telegram_ask`).
-- **Zero runtime dependencies** — the raw Bot API over Bun's `fetch`/`FormData`.
+- Inbound messages arrive as `<telegram-message …>` user turns. Photos are
+  attached inline, and other files are downloaded to an inbox.
+- A failed or uncertain inbound delivery always gets a visible notice. By
+  default a delivered message also gets 👀, then 👍 once a reply lands.
+  `deliveryStatus all` adds a progress reply for every message.
+- Outbound assistant text uses native message drafts in DMs on Bot API 9.3 or
+  newer, with edited previews in groups. Automatic final replies use a durable
+  outbox.
+- Local `/telegram` configuration, owner Telegram commands, and the
+  `telegram_send`, `telegram_react`, and `telegram_ask` tools make up the control
+  surface.
+- The extension has no runtime dependencies. It calls the raw Bot API through
+  Bun's `fetch` and `FormData`.
 
 ## How it fits together
 
@@ -58,7 +67,17 @@ only the raw Bot API and Node/Bun built-ins.
 
 ## Configure
 
-Inside an omp session:
+The guided path runs in an interactive omp terminal:
+
+```
+/telegram setup
+```
+
+It validates the configured token or prompts for a new one, enables the bridge,
+walks through owner pairing, offers session topics when the bot reports support,
+and runs the full diagnostics at the end.
+
+For manual setup, run:
 
 ```
 /telegram token 123456789:AAH...      # validates via getMe, stores ~/.omp/agent/telegram/.env (0600)
@@ -68,8 +87,8 @@ Inside an omp session:
 `/telegram token` reports `@yourbot ok` on success. `/telegram on` sets
 `access.enabled = true` and starts the standalone daemon when owner-DM topics
 are enabled and no groups are configured. The daemon stays alive after every omp
-session exits. Groups and non-topic configurations deliberately use the
-session-poller fallback because their messages need a live target session.
+session exits. Groups and non-topic configurations use the session poller
+fallback because their messages need a live target session.
 
 ## Activation
 
@@ -113,58 +132,80 @@ Once an owner is paired, other DMs are silently dropped and cannot mint pairing
 codes. Transfer ownership locally with `remove <owner-id>`, then pair the replacement.
 Codes expire after 1 hour; at most 3 are pending before an owner is established.
 
+Approval checks the expiry again while holding the access-state lock. An expired
+code is removed and refused even if it was visible when the command was entered.
+
+`/telegram policy disabled` applies to private DMs. It refuses private messages,
+owner commands, pending DM prompt answers, and private callback buttons.
+Configured groups continue to use their own sender and mention policy, including
+answers to prompts created in those groups.
+
 ## `/telegram` command reference
 
 | Subcommand | Effect |
 |---|---|
 | `/telegram` or `status` | Running state, bot username, policy, owner, pending codes, groups, config, lock holder |
 | `token <bot-token>` | Validate (`getMe`) then store the token; run `on` to start |
+| `setup` | Run guided local token, pairing, topics, and diagnostic setup in an interactive terminal |
 | `on` / `off` | Start / stop polling now; persists `enabled` |
 | `doctor` | Diagnose token, webhook, daemon, poll lock, state files, optional binaries, and herdr locally; never prints the token |
 | `daemon [status\|restart\|stop]` | Inspect, restart, or stop the standalone poller |
+| `retry [<chat_id> [thread_id] [uncertain]]` | List retained undelivered replies, or retry one exact chat and topic. Add `uncertain` only after checking the chat because it may duplicate a message. |
 | `own [status\|clear]` | Pin the current session for private DMs without a topic, show the pin, or remove it |
 | `pair <code>` | Approve a pending pairing; the bot confirms in-chat |
 | `deny <code>` | Drop a pending code |
 | `allow <user-id>` / `remove <user-id>` | Set or remove the sole paired Telegram account; a second account is refused |
-| `policy <pairing\|allowlist\|disabled>` | Set DM handling |
+| `policy <pairing\|allowlist\|disabled>` | Set private-DM handling. `disabled` leaves configured groups active. |
 | `group add <id> [--no-mention] [--allow a,b]` | Allow a group; optionally drop the mention requirement / restrict senders |
 | `group rm <id>` | Remove a group |
 | `set <key> <value>` | Tune delivery/UX (see below) |
 | `notify <chat_id>` / `notify clear` / `notify off\|away\|always` | Destination and mode for mirroring **locally-started** runs to Telegram. `away`/`always` mirror `ask` prompts (shown on the terminal AND Telegram) plus idle/blocked pings; `off` is the default. `away` auto-clears when you next type at the terminal; `always` stays until turned off. `/away` is the quick toggle for `away`. See [Notifications](#notifications). |
 | `topics on` / `topics <chat_id>` / `topics off` / `topics tidy on\|off` | Per-session **forum topics**: claim one topic per omp session, routing each session's traffic to its own thread. `on` auto-hosts in your paired DM (no id needed); `<chat_id>` hosts in a specific chat (e.g. a forum supergroup). `tidy on` deletes (DM host) or closes (group host) a session's topic when it exits; a re-adopted closed group topic is reopened. Off by default. |
 
-Every mutation persists to `access.json` and takes effect on the next inbound
-message (the poller re-reads access per message).
+Every access mutation reloads and writes `access.json` under a process-shared
+lock. The poller reads the current access policy for each message.
 
 ## Telegram command reference
 
-These commands are accepted only in the paired owner's private DM. Known bot
-commands typed in a group are consumed and never become omp user turns.
-
-Unpaired chats see a minimal command menu — only `/start`; the full
-menu is scoped to the paired owner's DM.
+Owner actions execute only in the paired owner's private DM. `/start` and
+`/help` still provide pairing help before an owner exists, and `/whoami` reports
+the caller's IDs. Known bot commands typed in a group are consumed and never
+become omp user turns. Unpaired chats see only `/start` in the command menu. The
+full menu is scoped to the paired owner's DM.
 
 With owner-DM topics enabled, the bridge creates one persistent **omp control**
 topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
-`/whoami`; use session topics for agent conversations and session-local `/stop`,
-`/compact`, `/model`, and `/thinking` commands. A global command
-entered elsewhere posts its result in omp control and leaves a short redirect
-notice in the originating topic.
+`/whoami`. Session topics accept `/session`, `/stop`, `/compact`, `/model`,
+`/thinking`, and `/retry`. A global command entered elsewhere posts its result
+in omp control and leaves a short redirect notice in the originating topic.
 
 | Command | Effect |
 |---|---|
 | `/spawn [space]` | List open herdr spaces with inline buttons, or confirm an exact label. A space with live omp sessions requires confirmation before starting another. |
 | `/spawn new <branch> [space]` | Create an unfocused git worktree from the selected source space, then run omp in its root pane. |
 | `/spawn dir <absolute-path>` | Create an unfocused herdr workspace rooted at an existing absolute directory, then run omp there. |
-| `/sessions` | Compare live herdr omp processes with live, unattached, outside-herdr, and stale Telegram topic claims. |
+| `/sessions` | Compare live herdr omp processes with Telegram topic claims. Sessions with a live bridge status have a button that opens a session card. |
+| `/session` | Open the card for the one live omp session attached to this topic. |
 | `/cleanup` | Tidy the topics of exited (stale) sessions: **delete** them in a DM host, **close** (park, history kept) them in a forum supergroup. Live sessions and `omp control` are never touched. The bare command previews with a confirm button; the tap acts only on the previewed topics that are still stale, so it never deletes a topic that went stale after the preview or one that has since resumed. `/cleanup go` skips the preview and tidies all currently-stale topics. |
 | `/stop` | Abort the current task. Run it inside the omp topic to identify the owning session. |
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
 | `/thinking [level]` | Show a thinking-level picker, or set `inherit`, `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
+| `/retry [uncertain]` | Retry failed automatic reply parts for this owner's DM session topic. `uncertain` includes parts Telegram may already have accepted. |
 | `/status` | Show the paired owner, bridge state, topics state, live omp count, and topic-owner count. |
 | `/help` | Show the owner command summary. |
 | `/whoami` | Show Telegram chat and user IDs. |
+
+A session card shows the session state, ID, directory, model, thinking level,
+context use, pending-message state, and last activity. Refresh updates the card.
+Stop, Model, Thinking, and Compact route the matching session command to the
+exact live process and topic.
+
+Only the paired owner can open or use a card. Every button press reloads access
+state and checks the card message, owner, process, session ID, chat, topic, and
+current route before it dispatches. A card for a group-hosted session remains an
+owner control in the owner's private DM. The configured group itself gains
+no command or callback authority.
 
 `/spawn` uses Telegram's native inline keyboard, not a Mini App. The poller
 revalidates each short-lived selection, creates an unfocused herdr tab,
@@ -192,6 +233,7 @@ configured groups never receive process-spawning authority.
 | `textChunkLimit` | `1`–`4096`; also caps rich source when explicitly set | unset (4096 legacy; 32768 whole rich) |
 | `replyToMode` | `off` \| `first` \| `all` — threading for `telegram_send` replies | `first` |
 | `ackReaction` | a whitelist emoji (empty to disable) — reaction on receipt | unset |
+| `deliveryStatus` | `reactions` (👀 when omp accepts, 👍 once a reply lands) \| `failures` (notices only for failed or uncertain delivery) \| `all` (a received, queued, delivered status reply) | `reactions`, or `failures` when `ackReaction` is set |
 | `mentionPatterns` | JSON array of regexes that also satisfy group mention-gating, e.g. `["\\bassistant\\b"]` | unset |
 | `transcribeCommand` | JSON argv array for voice notes, e.g. `["whisper-cli","-f","{file}"]`; empty value disables it | unset |
 
@@ -201,6 +243,26 @@ without a shell, with a 120-second timeout and 1 MiB output cap. Successful text
 is appended to the agent prompt as `[Voice transcript: …]`; failures remain
 visible as `[Voice transcription failed: …]` while the original attachment is
 still delivered.
+
+### Inbound replies and attachments
+
+When a Telegram message replies to another message, the bridge includes the
+earlier text or caption as quoted, untrusted context in the omp request. The
+quote is capped at 4096 characters.
+
+Photo albums with one media group ID are collected during the inbound batching
+window and submitted as one omp request. Each photo remains a separate image
+block. Ordinary text messages from the same conversation may also share a
+batch.
+
+If an attachment is too large, cannot be downloaded, or cannot be transcribed,
+the bridge posts a visible reply to that Telegram message. Usable text or a
+caption still reaches omp. A message with no usable text or attachment ends in
+`failed`, and that failure notice names the attachment problem.
+
+While a free-text `telegram_ask` question is pending, an authorized voice-note
+reply is transcribed with `transcribeCommand` and used as the answer. A failed
+transcription leaves the question open and asks the user to send text.
 
 ## Diagnostics
 
@@ -310,19 +372,48 @@ deliver from. `telegram_ask` responds only to the exact user who originated the 
 | `daemon.json` | Standalone daemon PID, plugin version, and start time |
 | `daemon.log` | Rotating daemon output (5 MiB, one previous generation) |
 | `threads.json` | Topic registry — which session (pid/cwd) owns which forum topic |
-| `route/<thread_id>/` / `route/dm/` | Cross-process routed-message spools for topics and untopiced private DMs |
-| `route/<thread_id>/last-inbound.json` / `route/dm/last-inbound.json` | Receipt for the most recent delivered inbound message (see below) |
+| `route/<thread_id>.accepted.json` / `route/dm.accepted.json` | Bounded identities for accepted routed messages, used to suppress duplicate delivery |
+| `route/<thread_id>/` / `route/dm/` | Durable routed envelopes for topics and untopiced private DMs |
+| `route/<thread_id>/last-inbound.json` / `route/dm/last-inbound.json` | Receipt for the most recent inbound handoff on the route |
+| `outbox/` | Up to 50 recently updated automatic final-reply records, with per-part confirmation and retry state |
+| `session-status/` / `session-cards/` | Live session snapshots and owner-authorized card bindings |
 
-### Inbound receipts — a contract for external supervisors
+### Durable inbound routing and delivery states
 
-A routed payload is deleted the moment it is consumed, so after a successful
-delivery the only surviving copy used to be inside the receiving agent's own
-transcript, in that agent's private format. A supervising process asking the
-reasonable question *"did the operator's reply actually arrive?"* had to parse
-another program's log to find out.
+With `deliveryStatus all`, each normal inbound message gets one small Telegram
+status reply that the bridge edits in place as the delivery state changes. By
+default only `failed` and `uncertain` create that reply:
 
-So one bounded receipt is written per route, **before** the payload is handed to
-the session:
+- `received` means the bridge accepted the Bot API update.
+- `queued` means the bridge started the exact session-route handoff.
+- `accepted` means the session submitted the user turn to omp. It makes no claim
+  about whether an agent has replied.
+- `failed` means the bridge could not complete the handoff. The status includes
+  a short reason when one is available.
+- `uncertain` means the consumer stopped while the handoff was in flight. The
+  turn may already have reached omp, so the bridge does not retry it
+  automatically.
+
+A message inside the configured topics chat follows its exact topic route. The
+bridge does not give it to the poll-lock holder's local session when the claim is
+missing, dead, or changes during delivery. A stale owner-DM topic can use its
+separate authorized auto-resume path.
+
+For a live cross-process route, `writeRouted` stores a routed envelope with the
+Telegram message, a stable delivery identity, state, attempts, and claim owner.
+An active envelope or an accepted-ledger entry suppresses another copy of the
+same original message. Telegram edits have revision-specific identities and can
+be delivered separately.
+The route watcher claims the envelope, marks it `inflight`, writes the inbound
+receipt, and waits for the receiving session's delivery promise. Only a resolved
+consumer promise records the identity as accepted in the dedup ledger and
+removes the envelope. A rejected submission is retried up to three attempts. If
+the consumer process exits after the `inflight` write, the envelope becomes
+`uncertain` and stays for diagnosis. Automatic retry at that point could
+duplicate an omp user turn.
+
+The bounded `last-inbound.json` receipt is written immediately before the
+session handoff:
 
 ```json
 {
@@ -336,21 +427,16 @@ the session:
 }
 ```
 
-- **Written before the handoff**, because the case a receipt exists for is a
-  consumer that died. One written afterwards records only the deliveries that
-  already succeeded.
-- **A hash, not the text.** The message already lives in the consuming agent's
-  transcript, and a supervisor verifying a challenge code knows the code it
-  sent — hashing its own copy is enough. A hash also cannot leak a message to
-  anything that did not already know it.
-- **Bounded by construction**: exactly one file per route, replaced in place. No
-  reaper is needed beyond the existing route purge, which removes it with the
-  rest of the route state.
-- Written `0600` inside the `0700` route directory, tmp+rename, so a reader
-  never sees a partial file.
+- It is written before handoff so a supervisor can see the message a stopped
+  consumer attempted to accept.
+- It stores a hash instead of message text. A supervisor that sent a challenge
+  can hash its own copy without reading an agent transcript.
+- Each route has one receipt that is replaced in place and removed with the
+  other route state.
+- The bridge writes it with mode `0600` inside the `0700` route directory,
+  using a temporary file and rename.
 
-This file is a stable contract: read it rather than scraping a session
-transcript.
+This file is a stable contract for external supervisors.
 
 ## Streaming behavior
 
@@ -396,6 +482,24 @@ transcript.
   send. Constructs split across parts may lose formatting.
 - A part Telegram rate-limits (`429`) is retried up to three times, honouring
   `retry_after`, instead of dropping the rest of the answer.
+
+### Outbound outbox and recovery
+
+Before an automatic final reply is sent or edited, the bridge writes all of its
+parts to the outbox. It saves each part as `pending`, `inflight`, `sent`,
+`failed`, or `uncertain` before and after remote attempts. Confirmed parts are
+skipped on recovery, and the record is removed after every part is sent. The
+outbox keeps the 50 most recently updated records.
+
+A normal retry sends failed parts and leaves uncertain parts alone. An uncertain
+part has no confirmed result and may already be visible in Telegram. Resend it
+only after checking the chat. `/retry uncertain` makes that choice explicit.
+
+In an owner's DM session topic, `/retry` targets that exact chat and topic. A
+group-hosted session cannot accept an owner command from the group, so its
+retained reply is recovered from the omp terminal with
+`/telegram retry <chat_id> [thread_id] [uncertain]`. The terminal notification
+for an undelivered reply prints the matching command.
 
 ## Headless hosts (`profile daemon`)
 
@@ -531,14 +635,16 @@ back to its project directory), inside one operator-chosen chat.
   enabled must reload or restart before they claim one.
 - Task subagents run inside their parent omp process and do not claim their own
   topics; their progress and final result stay in the parent session topic.
-- A message typed **inside a topic** is routed to the session that owns it — even a
-  different omp process — and that session's replies, streaming previews, and typing
-  indicator all land **inside that topic**. Cross-process delivery goes through the
-  shared state dir, so the lock holder forwards to siblings automatically.
-- Messages in the chat's **main view** keep today's behavior (handled by the lock holder).
+- A message inside a configured topic follows the route claimed by that topic.
+  The bridge durably queues cross-process handoff and waits for the owning
+  session to acknowledge submission. Missing, dead, or changed ownership never
+  falls back to the poll-lock holder's local omp session.
+- Messages in the chat's main view are untopiced and use the ordinary
+  lock-holder flow.
 - A normal owner-DM message in a stale topic queues immediately and resumes the
-  exact saved omp session in its original revalidated herdr space. Legacy topics
-  or sessions created outside herdr need one local resume before that identity exists.
+  exact saved omp session in its original revalidated herdr space. Other
+  unowned topics return an explicit notice. Legacy topics or sessions created
+  outside herdr need one local resume before their identity exists.
 - `/stop` is topic-local and reaches the owning session. Global commands such as
   `/spawn`, `/sessions`, `/cleanup`, and `/status` are handled centrally by the poll-lock holder.
 - In an owner DM, the poll-lock holder creates one persistent **omp control**
@@ -582,13 +688,16 @@ starts a fresh session in a brand-new topic.
 
 ## Security
 
-- **Single operator:** exactly one paired DM owns all Telegram control commands.
-  Every message and inline-button callback revalidates both the sender ID and
-  private chat ID. Callback controls expire after five minutes and are consumed
-  before starting a process.
-- **DM-only control:** `/spawn`, `/sessions`, `/cleanup`, `/stop`, `/compact`,
-  `/model`, `/thinking`, and `/status` never execute from groups.
-  Group policies grant chat delivery only, not operator authority.
+- Exactly one paired DM owns Telegram control commands. Every command and
+  callback checks the current owner and private chat before it acts.
+- Spawn, cleanup, and session-list pickers expire after five minutes. A session
+  card stays bound to its exact process, session ID, chat, topic, and message
+  while that session is live. Each action rechecks those bindings at the bridge
+  and again in the receiving session.
+- `/spawn`, `/sessions`, `/cleanup`, `/session`, `/stop`, `/compact`, `/model`,
+  `/thinking`, `/retry`, and `/status` do not execute from ordinary group
+  messages. Group policy grants prompt delivery and prompt-answer authority
+  without granting operator control.
 - **Configured groups are trusted prompt sources:** an allowed group member still
   sends normal omp user turns with the session's workspace and tool access. Use
   sender allowlists; do not connect untrusted or public groups.
@@ -648,9 +757,16 @@ starts a fresh session in a brand-new topic.
 ## Development
 
 ```bash
-bun install
-bun run typecheck
-bun test
-# or both:
+bun install --frozen-lockfile
 bun run check
+bun run check:host -- 18.1.16
+bun run check:host -- latest
+bun run smoke:package
 ```
+
+The locked install and `bun run check` cover the repository dependency graph.
+`check:host` packs the extension, typechecks it against the requested omp host,
+and loads the packed registrar. Run it against the supported minimum and
+`latest`. `smoke:package` checks the tarball contents and loads that artifact
+without network access. CI runs all three checks, and the release workflow also
+uses a frozen install and the package smoke before publishing.

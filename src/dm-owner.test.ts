@@ -76,4 +76,38 @@ describe("DM owner", () => {
     expect(warnings).toEqual(["dm-owner.json was corrupt — moved aside, starting unowned"]);
     expect(readdirSync(statePath()).filter((name) => name.startsWith("dm-owner.json.corrupt-"))).toHaveLength(1);
   });
+  test("lock contention rejects a clear without deleting the owner", () => {
+    const entry = owner();
+    claimDmOwner(entry);
+    writeFileSync(`${statePath("dm-owner.json")}.lock`, String(process.pid));
+    const warnings: string[] = [];
+
+    expect(() => clearDmOwner((message) => warnings.push(message))).toThrow("could not acquire state lock");
+    expect(loadDmOwner()).toEqual(entry);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test("concurrent first claims choose one complete owner record without temp-file debris", async () => {
+    const runner = join(dir, "claim-owner.ts");
+    writeFileSync(
+      runner,
+      `import { claimDmOwner } from ${JSON.stringify(join(import.meta.dirname, "topics.ts"))};\n` +
+        `const pid = Number(process.argv[2]);\n` +
+        `claimDmOwner({ pid, cwd: "/fleet", name: String(pid), claimedAt: pid, sessionId: String(pid) });\n`,
+    );
+    const candidates = [2001, 2002, 2003, 2004, 2005, 2006];
+    const codes = await Promise.all(
+      candidates.map((pid) =>
+        Bun.spawn([process.execPath, runner, String(pid)], {
+          env: { ...process.env, OMP_TELEGRAM_STATE_DIR: dir },
+          stdout: "ignore",
+          stderr: "ignore",
+        }).exited,
+      ),
+    );
+
+    expect(codes).toEqual(candidates.map(() => 0));
+    expect(candidates).toContain(loadDmOwner()?.pid);
+    expect(readdirSync(dir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  });
 });

@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultAccess, saveAccess, statePath } from "./access";
+import { defaultAccess, loadAccess, saveAccess, statePath } from "./access";
 import { type Logger, type TgMessage, TgError } from "./api";
 import { type BridgeHost, BOT_COMMANDS, PUBLIC_BOT_COMMANDS, cleanupPreviewLine, handleUpdate, parseCleanupArgs, selectCleanupTargets, syncBotCommands } from "./bridge";
 import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
+import { sessionCardCallbackId } from "./session-status";
 import { DM_ROUTE_KEY, type ThreadEntry, claimDmOwner, classifyStale, loadRegistry, saveRegistry, watchRoute } from "./topics";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
@@ -88,6 +89,24 @@ describe("shared bridge routing", () => {
     expect(readdirSync(statePath("route", "7"))).toHaveLength(1);
     expect(calls).toEqual([]);
   });
+  test("fails closed when a foreign route cannot be spooled", async () => {
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: { "7": { pid: process.pid, cwd: "/tmp/project", name: "project", claimedAt: 1 } },
+    });
+    writeFileSync(statePath("route"), "not a directory");
+    const delivered: TgMessage[] = [];
+
+    await handleUpdate(makeHost({ deliverLocal: async (msg) => void delivered.push(msg) }), {
+      update_id: 101,
+      message: message("must not fall back", 7),
+    });
+
+    expect(delivered).toEqual([]);
+    expect(calls.some((call) => String(call.payload.text).includes("It was not delivered"))).toBe(true);
+  });
+
 
   test("queues and starts resume for an unowned owner topic", async () => {
     saveRegistry({
@@ -194,7 +213,7 @@ describe("shared bridge routing", () => {
     expect(delivered.map((msg) => msg.text)).toEqual(["hello"]);
   });
 
-  test("recognizes a resumed DM owner by session file instead of stale pid", async () => {
+  test("recognizes a resumed DM owner by session file and still uses its durable route", async () => {
     claimDmOwner({
       pid: 2_000_000_000,
       cwd: "/a",
@@ -215,9 +234,10 @@ describe("shared bridge routing", () => {
       { update_id: 33, message: message("resumed") },
     );
 
-    expect(delivered.map((msg) => msg.text)).toEqual(["resumed"]);
-    expect(calls).toEqual([]);
+    expect(delivered).toEqual([]);
+    expect(readdirSync(statePath("route", DM_ROUTE_KEY))).toHaveLength(1);
   });
+
 
   test("spools session commands to a live foreign DM owner", async () => {
     claimDmOwner({
@@ -267,6 +287,35 @@ describe("shared bridge routing", () => {
     expect(calls.some((call) => String(call.payload.text).includes("user_id: 42"))).toBe(true);
   });
 
+  test("a deleted omp control is recreated once and used for later command replies", async () => {
+    const deleted = true; // #99 was removed by the owner in Telegram
+    let created = 0;
+    const host = makeHost({
+      callTelegram: (async (method: string, payload: Record<string, unknown>) => {
+        calls.push({ method, payload });
+        if (method === "createForumTopic") return { message_thread_id: 500 + ++created };
+        if (method === "sendMessage" && payload.message_thread_id === 99 && deleted) {
+          throw new TgError("Bad Request: message thread not found", 400);
+        }
+        return { message_id: calls.length, date: 1, chat: { id: 42, type: "private" } };
+      }) as TelegramCall,
+    });
+
+    // First command: the reply to deleted #99 fails, falls back to the origin, and forgets #99.
+    await handleUpdate(host, { update_id: 60, message: message("/whoami", 7) });
+    expect(loadAccess().controlThreadId).toBeUndefined();
+    expect(calls.some((c) => c.method === "sendMessage" && c.payload.message_thread_id === 7 && String(c.payload.text).includes("user_id: 42"))).toBe(true);
+
+    // Second command: one new control topic is created, persisted, and receives the reply.
+    calls.length = 0;
+    await handleUpdate(host, { update_id: 61, message: message("/whoami", 7) });
+    await handleUpdate(host, { update_id: 62, message: message("/whoami", 7) });
+    expect(created).toBe(1);
+    expect(loadAccess().controlThreadId).toBe(501);
+    const replies = calls.filter((c) => c.method === "sendMessage" && String(c.payload.text).includes("user_id: 42"));
+    expect(replies.map((c) => c.payload.message_thread_id)).toEqual([501, 501]);
+  });
+
   test("guides session commands entered outside a session topic", async () => {
     await handleUpdate(makeHost(), { update_id: 5, message: message("/stop") });
 
@@ -292,6 +341,173 @@ describe("shared bridge routing", () => {
     expect(delivered).toHaveLength(1);
     expect(delivered[0].edited_flag).toBe(true);
   });
+  test("durably queues a local topic message and routed handling does not loop", async () => {
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: { "7": { pid: process.pid, cwd: "/tmp/project", name: "project", claimedAt: 1 } },
+    });
+    const delivered: TgMessage[] = [];
+    const states: string[] = [];
+    const incoming = message("local durable", 7);
+    const host = makeHost({
+      isDaemon: false,
+      selfPid: process.pid,
+      deliverLocal: async (msg) => void delivered.push(msg),
+      reportDelivery: async (msg, state) => {
+        states.push(state);
+        if (state === "received") msg.bridge_status_id = 99;
+      },
+    });
+
+    await handleUpdate(host, { update_id: 60, message: incoming });
+    expect(delivered).toEqual([]);
+    expect(states).toEqual(["received", "queued"]);
+    expect(readdirSync(statePath("route", "7"))).toHaveLength(1);
+
+    await handleUpdate(host, { update_id: 60, message: incoming }, { routed: true });
+    expect(delivered.map((msg) => msg.text)).toEqual(["local durable"]);
+    expect(readdirSync(statePath("route", "7"))).toHaveLength(1);
+  });
+
+  test("disabled DMs block private prompts but preserve group polling", async () => {
+    saveAccess({
+      ...defaultAccess(),
+      enabled: true,
+      dmPolicy: "disabled",
+      allowFrom: ["42"],
+      groups: { "-100": { requireMention: false, allowFrom: ["42"] } },
+    });
+    const promptCalls: string[] = [];
+    const delivered: TgMessage[] = [];
+    const deliveryStates: string[] = [];
+    const reportDelivery: NonNullable<BridgeHost["reportDelivery"]> = async (_msg, state) => {
+      deliveryStates.push(state);
+    };
+    const promptController = {
+      handleCallback: async () => {
+        promptCalls.push("callback");
+        return false;
+      },
+      handleMessage: async () => {
+        promptCalls.push("message");
+        return false;
+      },
+    } as unknown as TelegramPromptController;
+    const host = makeHost({
+      isDaemon: false,
+      promptController,
+      reportDelivery,
+      deliverLocal: async (msg) => {
+        delivered.push(msg);
+        await reportDelivery(msg, "accepted");
+      },
+    });
+
+    await handleUpdate(host, { update_id: 61, message: message("private") });
+    await handleUpdate(host, {
+      update_id: 62,
+      callback_query: { id: "private", from: { id: 42 }, message: { message_id: 1, chat: { id: 42, type: "private" } } },
+    });
+    expect(promptCalls).toEqual([]);
+    // The button must stop spinning even though the action is refused.
+    const answered = calls.find((call) => call.method === "answerCallbackQuery");
+    expect(answered?.payload).toMatchObject({ callback_query_id: "private", show_alert: true });
+
+    const groupMessage: TgMessage = {
+      message_id: 2,
+      date: 1,
+      from: { id: 42 },
+      chat: { id: -100, type: "supergroup" },
+      text: "group still works",
+    };
+    await handleUpdate(host, { update_id: 63, message: groupMessage });
+    await handleUpdate(host, {
+      update_id: 64,
+      callback_query: { id: "group", from: { id: 42 }, message: { message_id: 2, chat: { id: -100, type: "supergroup" } } },
+    });
+
+    expect(promptCalls).toEqual(["message", "callback"]);
+    expect(delivered.map((msg) => msg.text)).toEqual(["group still works"]);
+    expect(deliveryStates).toEqual(["received", "accepted"]);
+  });
+
+  test("a direct delivery rejection reports failed after received", async () => {
+    saveAccess({
+      ...defaultAccess(),
+      enabled: true,
+      allowFrom: ["42"],
+      groups: { "-100": { requireMention: false, allowFrom: ["42"] } },
+    });
+    const states: string[] = [];
+    const host = makeHost({
+      isDaemon: false,
+      reportDelivery: async (_msg, state) => void states.push(state),
+      deliverLocal: async () => {
+        throw new Error("submit failed");
+      },
+    });
+    const groupMessage: TgMessage = {
+      message_id: 3,
+      date: 1,
+      from: { id: 42 },
+      chat: { id: -100, type: "supergroup" },
+      text: "group fails closed",
+    };
+
+    await expect(handleUpdate(host, { update_id: 65, message: groupMessage })).rejects.toThrow("submit failed");
+    expect(states).toEqual(["received", "failed"]);
+  });
+
+
+  test("only a revalidated routed card action bypasses group command policy", async () => {
+    saveAccess({
+      ...defaultAccess(),
+      enabled: true,
+      allowFrom: ["42"],
+      topicsChat: "-100",
+      groups: { "-100": { requireMention: true, allowFrom: ["42"] } },
+    });
+    saveRegistry({
+      version: 1,
+      chatId: "-100",
+      threads: { "7": { pid: process.pid, cwd: "/tmp/project", name: "project", claimedAt: 1, sessionId: "session-a" } },
+    });
+    const cardActions: Array<boolean | undefined> = [];
+    const host = makeHost({
+      isDaemon: false,
+      selfPid: process.pid,
+      ownThreadId: () => 7,
+      sessionIdentity: () => ({ sessionId: "session-a" }),
+      handleSessionCommand: async (_msg, _parsed, options) => {
+        cardActions.push(options?.cardAction);
+        return true;
+      },
+    });
+    const command: TgMessage = {
+      message_id: 70,
+      date: 1,
+      from: { id: 42 },
+      chat: { id: -100, type: "supergroup" },
+      text: "/stop",
+      is_topic_message: true,
+      message_thread_id: 7,
+      bridge_callback_id: sessionCardCallbackId({
+        pid: process.pid,
+        originPrivate: true,
+        sessionId: "session-a",
+        chatId: "-100",
+        threadId: 7,
+        queryId: "callback-70",
+      }),
+    };
+
+    await handleUpdate(host, { update_id: 70, message: command }, { routed: true });
+    await handleUpdate(host, { update_id: 71, message: { ...command, bridge_callback_id: undefined } });
+
+    expect(cardActions).toEqual([true]);
+  });
+
 });
 
 describe("cleanup command", () => {

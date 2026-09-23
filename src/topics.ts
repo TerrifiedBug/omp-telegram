@@ -10,20 +10,19 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   type FSWatcher,
   existsSync,
-  linkSync,
   mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
-  unlinkSync,
   watch,
   writeFileSync,
 } from "node:fs";
 import { basename, join } from "node:path";
 import { ensureStateDir, statePath } from "./access";
-import { linkClaim, type Logger, type TgMessage } from "./api";
+import { type Logger, type TgMessage } from "./api";
+import { withStateLock } from "./state-lock";
 
 /** A session's claim on one forum topic. Keyed in the registry by thread id. */
 export interface ThreadEntry {
@@ -114,78 +113,32 @@ export function loadRegistry(warn?: (msg: string) => void): ThreadRegistry {
   }
 }
 
-/**
- * Atomically persist threads.json.
- *
- * The temp name carries this process's pid (#68). It used to be a shared
- * `threads.json.tmp`: two writers wrote the same path and both renamed it, so
- * one could publish the other's half-written file. `saveDaemonState` already
- * spelled this correctly; this did not.
- */
+/** Atomically persist threads.json. Kept as a low-level fixture/setup primitive. */
 export function saveRegistry(r: ThreadRegistry): void {
   ensureStateDir();
   const file = statePath("threads.json");
-  const tmp = `${file}.tmp-${process.pid}`;
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   try {
     writeFileSync(tmp, JSON.stringify(r, null, 2) + "\n", { mode: 0o600 });
     renameSync(tmp, file);
-  } catch (err) {
+  } finally {
     rmSync(tmp, { force: true });
-    throw err;
   }
 }
 
-/** How long a registry mutation waits for a concurrent one before giving up. */
-const REGISTRY_MUTATE_WAIT_MS = 2_000;
-/** A mutation lock older than this belonged to a process that died holding it. */
-const REGISTRY_MUTATE_STALE_MS = 5_000;
-
-/**
- * Serialise one read-modify-write of threads.json across processes.
- *
- * Whole-file writes make every mutation a read-modify-write, and this package
- * runs many of them concurrently — one per omp session. Unserialised, the last
- * writer wins and every claim recorded in between is lost. Measured (#68): a
- * burst that created 16 topics recorded 15 rows, and the topics whose rows were
- * lost became permanently invisible to `/cleanup`, which can only see the
- * registry. Losing the *index* to a topic is worse than losing the topic.
- *
- * Bounded and self-healing: a caller that cannot take the lock in
- * {@link REGISTRY_MUTATE_WAIT_MS} proceeds anyway — a lost update is bad, a
- * session that hangs on startup is worse — and a lock left by a dead process is
- * broken by age.
- */
-function withRegistryLock<T>(mutate: () => T): T {
-  const lock = `${statePath("threads.json")}.lock`;
-  const deadline = Date.now() + REGISTRY_MUTATE_WAIT_MS;
-  let held = false;
-  while (Date.now() < deadline) {
-    if (linkClaim(lock, process.pid)) {
-      held = true;
-      break;
-    }
-    try {
-      if (Date.now() - statSync(lock).mtimeMs > REGISTRY_MUTATE_STALE_MS) rmSync(lock, { force: true });
-    } catch {
-      // vanished between the claim and the stat: next iteration claims it
-    }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-  }
-  try {
-    return mutate();
-  } finally {
-    if (held) rmSync(lock, { force: true });
-  }
+function withRegistryLock<T>(mutate: () => T, warn?: (message: string) => void): T {
+  ensureStateDir();
+  return withStateLock(`${statePath("threads.json")}.lock`, mutate, warn);
 }
 
 /** Read-modify-write a topic claim: records the chat and the owning session. */
 export function claimThread(chatId: string, threadId: number, entry: ThreadEntry, warn?: (msg: string) => void): void {
   withRegistryLock(() => {
-    const r = loadRegistry(warn);
-    r.chatId = chatId;
-    r.threads[String(threadId)] = entry;
-    saveRegistry(r);
-  });
+    const registry = loadRegistry(warn);
+    registry.chatId = chatId;
+    registry.threads[String(threadId)] = entry;
+    saveRegistry(registry);
+  }, warn);
 }
 
 /**
@@ -194,12 +147,13 @@ export function claimThread(chatId: string, threadId: number, entry: ThreadEntry
  * without collapsing fresh sessions together.
  */
 export function releaseThread(threadId: number, pid: number, warn?: (msg: string) => void): void {
-  const r = loadRegistry(warn);
-  const key = String(threadId);
-  if (r.threads[key]?.pid === pid) {
-    delete r.threads[key];
-    saveRegistry(r);
-  }
+  withRegistryLock(() => {
+    const registry = loadRegistry(warn);
+    const key = String(threadId);
+    if (registry.threads[key]?.pid !== pid) return;
+    delete registry.threads[key];
+    saveRegistry(registry);
+  }, warn);
 }
 
 /**
@@ -303,9 +257,13 @@ export function loadDmOwner(warn?: (msg: string) => void): ThreadEntry | undefin
   return undefined;
 }
 
-/** Remove the pinned DM owner. */
-export function clearDmOwner(): void {
-  rmSync(statePath("dm-owner.json"), { force: true });
+/** Remove the pinned DM owner without racing another process's claim. */
+export function clearDmOwner(warn?: (msg: string) => void): void {
+  ensureStateDir();
+  const file = statePath("dm-owner.json");
+  withStateLock(`${file}.lock`, () => {
+    rmSync(file, { force: true });
+  }, warn);
 }
 
 /**
@@ -319,31 +277,25 @@ export function claimDmOwner(
 ): { ok: true } | { ok: false; owner: ThreadEntry } {
   ensureStateDir();
   const file = statePath("dm-owner.json");
-  const content = JSON.stringify(entry, null, 2) + "\n";
-  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  writeFileSync(temp, content, { mode: 0o600 });
-  try {
-    linkSync(temp, file);
-    return { ok: true };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-  } finally {
-    rmSync(temp, { force: true });
-  }
+  return withStateLock(
+    `${file}.lock`,
+    () => {
+      const existing = loadDmOwner(warn);
+      if (existing && !options.force && existing.pid !== entry.pid && !sameSession(existing, entry)) {
+        return { ok: false as const, owner: existing };
+      }
 
-  const existing = loadDmOwner(warn);
-  if (existing && !options.force && existing.pid !== entry.pid && !sameSession(existing, entry)) {
-    return { ok: false, owner: existing };
-  }
-
-  const replacement = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  writeFileSync(replacement, content, { mode: 0o600 });
-  try {
-    renameSync(replacement, file);
-  } finally {
-    rmSync(replacement, { force: true });
-  }
-  return { ok: true };
+      const replacement = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      try {
+        writeFileSync(replacement, JSON.stringify(entry, null, 2) + "\n", { mode: 0o600 });
+        renameSync(replacement, file);
+      } finally {
+        rmSync(replacement, { force: true });
+      }
+      return { ok: true as const };
+    },
+    warn,
+  );
 }
 
 
@@ -409,22 +361,161 @@ function routeDir(threadId: number | typeof DM_ROUTE_KEY): string {
   return statePath("route", String(threadId));
 }
 
-/** Remove a route's spool dir and any un-consumed payloads. Missing dir is a no-op. */
+function routeLedgerPath(threadId: number | typeof DM_ROUTE_KEY): string {
+  return statePath("route", `${String(threadId)}.accepted.json`);
+}
+
+function routeLockPath(threadId: number | typeof DM_ROUTE_KEY): string {
+  return `${routeDir(threadId)}.lock`;
+}
+
+/** Remove a route's spool, delivery ledger, and any unconsumed payloads. */
 export function purgeRouteDir(threadId: number | typeof DM_ROUTE_KEY): void {
   rmSync(routeDir(threadId), { recursive: true, force: true });
+  rmSync(routeLedgerPath(threadId), { force: true });
+}
+
+type RoutedState = "queued" | "claimed" | "inflight" | "failed" | "uncertain";
+
+interface RoutedPayload {
+  version: 1;
+  identity: string;
+  msg: TgMessage;
+  state: RoutedState;
+  attempts: number;
+  createdAt: number;
+  updatedAt: number;
+  retryAt?: number;
+  owner?: { pid: number; claimId: string; claimedAt: number };
+  detail?: string;
+}
+
+interface AcceptedLedger {
+  version: 1;
+  entries: Array<{ identity: string; acceptedAt: number }>;
+}
+
+const ACCEPTED_LEDGER_LIMIT = 256;
+const ROUTED_DELIVERY_ATTEMPTS = 3;
+const ROUTED_RETRY_BASE_MS = 250;
+let lastRouteOrder = 0;
+
+function atomicWriteJson(file: string, value: unknown): void {
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function deliveryIdentity(msg: TgMessage): string {
+  if (msg.bridge_callback_id) return `callback:${msg.bridge_callback_id}`;
+  if (typeof msg.edit_date === "number" || msg.edited_flag) {
+    const revision = { ...msg, bridge_status_id: undefined, bridge_callback_id: undefined };
+    const contentHash = createHash("sha256").update(JSON.stringify(revision)).digest("hex").slice(0, 20);
+    return `message:${msg.chat.id}:${msg.message_id}:edit:${msg.edit_date ?? "unknown"}:${contentHash}`;
+  }
+  return `message:${msg.chat.id}:${msg.message_id}:original`;
+}
+
+function readAcceptedLedger(threadId: number | typeof DM_ROUTE_KEY): AcceptedLedger {
+  const file = routeLedgerPath(threadId);
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, entries: [] };
+    throw err;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`routed acceptance ledger is corrupt: ${file}`);
+  }
+  if (!parsed || typeof parsed !== "object") throw new Error(`routed acceptance ledger is invalid: ${file}`);
+  const candidate = parsed as Partial<AcceptedLedger>;
+  if (
+    candidate.version !== 1 ||
+    !Array.isArray(candidate.entries) ||
+    candidate.entries.some(
+      (entry) => !entry || typeof entry.identity !== "string" || typeof entry.acceptedAt !== "number",
+    )
+  ) {
+    throw new Error(`routed acceptance ledger is invalid: ${file}`);
+  }
+  return { version: 1, entries: candidate.entries };
+}
+
+function readRoutedPayload(file: string): RoutedPayload | undefined {
+  const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const candidate = parsed as Partial<RoutedPayload>;
+  const state = candidate.state;
+  if (
+    candidate.version === 1 &&
+    candidate.msg &&
+    typeof candidate.msg === "object" &&
+    typeof candidate.identity === "string" &&
+    (state === "queued" || state === "claimed" || state === "inflight" || state === "failed" || state === "uncertain") &&
+    typeof candidate.attempts === "number" &&
+    typeof candidate.createdAt === "number" &&
+    typeof candidate.updatedAt === "number"
+  ) {
+    return candidate as RoutedPayload;
+  }
+
+  const legacy = parsed as TgMessage;
+  if (typeof legacy.message_id !== "number" || !legacy.chat || typeof legacy.chat.id !== "number") return undefined;
+  const createdAt = statSync(file).mtimeMs;
+  return {
+    version: 1,
+    identity: deliveryIdentity(legacy),
+    msg: legacy,
+    state: "queued",
+    attempts: 0,
+    createdAt,
+    updatedAt: createdAt,
+  };
 }
 
 /**
- * Spool a raw message for the owning session to pick up. Written to a `tmp-`
- * name then renamed so a watcher never observes a half-written file.
+ * Durably spool a message once. Duplicate active or previously accepted
+ * delivery identities are ignored; edited versions and callback ids are
+ * independent identities.
  */
 export function writeRouted(threadId: number | typeof DM_ROUTE_KEY, msg: TgMessage): void {
   const dir = routeDir(threadId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const base = `${Date.now()}-${msg.message_id}.json`;
-  const tmp = join(dir, `tmp-${base}`);
-  writeFileSync(tmp, JSON.stringify(msg), { mode: 0o600 });
-  renameSync(tmp, join(dir, base));
+  const identity = deliveryIdentity(msg);
+  withStateLock(routeLockPath(threadId), () => {
+    if (readAcceptedLedger(threadId).entries.some((entry) => entry.identity === identity)) return;
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".json") || name.startsWith("tmp-") || name === INBOUND_RECEIPT) continue;
+      try {
+        if (readRoutedPayload(join(dir, name))?.identity === identity) return;
+      } catch {
+        // The watcher owns corrupt-payload reporting and cleanup.
+      }
+    }
+
+    const now = Date.now();
+    lastRouteOrder = Math.max(now * 1000, lastRouteOrder + 1);
+    const hash = createHash("sha256").update(identity).digest("hex").slice(0, 20);
+    const file = join(dir, `${String(lastRouteOrder).padStart(16, "0")}-${hash}.json`);
+    atomicWriteJson(file, {
+      version: 1,
+      identity,
+      msg,
+      state: "queued",
+      attempts: 0,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies RoutedPayload);
+  });
 }
 
 /** File name of the per-route inbound receipt (#61). Stable external contract. */
@@ -470,13 +561,14 @@ export function writeInboundReceipt(threadId: number | typeof DM_ROUTE_KEY, msg:
     ...(msg.text === undefined ? {} : { textSha256: createHash("sha256").update(msg.text).digest("hex") }),
     receivedAt: Date.now(),
   };
-  const tmp = join(dir, `tmp-${process.pid}-${INBOUND_RECEIPT}`);
+  const tmp = join(dir, `tmp-${process.pid}-${randomBytes(6).toString("hex")}-${INBOUND_RECEIPT}`);
   try {
     writeFileSync(tmp, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
     renameSync(tmp, join(dir, INBOUND_RECEIPT));
   } catch {
-    rmSync(tmp, { force: true });
     throw new Error("could not write inbound receipt");
+  } finally {
+    rmSync(tmp, { force: true });
   }
 }
 
@@ -491,105 +583,322 @@ export function readInboundReceipt(threadId: number | typeof DM_ROUTE_KEY): Inbo
     return undefined;
   }
 }
+export type RouteDeliveryState = "accepted" | "failed" | "uncertain";
+export type RouteDeliveryCallback = (
+  msg: TgMessage,
+  state: RouteDeliveryState,
+  detail?: string,
+) => Promise<void> | void;
+
+type RouteClaim =
+  | { kind: "deliver"; payload: RoutedPayload }
+  | { kind: "report"; payload: RoutedPayload; state: "failed" | "uncertain"; detail: string };
 
 /**
- * Watch a route's spool dir and hand each spooled message to `onMsg`. Uses an
- * initial scan + fs.watch + a 5s rescan (fs.watch alone is not reliable enough).
- * Skips `tmp-*`; discards payloads older than ROUTED_TTL_MS (e.g. written just
- * before a crash). A per-lifetime processed set stops watch+rescan double-firing.
- * `accept` lets a mutable route owner reject a file before it is consumed.
- * Returns a disposer. All fs calls are synchronous so handling is race-free.
+ * Watch a route's spool and submit every queued message in filename order.
+ * Consumer promises settle independently: later text/album parts enter the
+ * inbound batch immediately instead of waiting behind its 800ms flush.
  */
 export function watchRoute(
   threadId: number | typeof DM_ROUTE_KEY,
-  onMsg: (m: TgMessage) => void,
+  onMsg: (m: TgMessage) => Promise<void> | void,
   log?: Logger,
   accept?: () => boolean,
+  onDelivery?: RouteDeliveryCallback,
 ): () => void {
   const dir = routeDir(threadId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const processed = new Set<string>();
+  const claimId = randomBytes(12).toString("hex");
+  const processing = new Set<string>();
+  const retryTimers = new Set<NodeJS.Timeout>();
+  let stopped = false;
+
+  const warn = (message: string): void => {
+    try {
+      log?.warn(message);
+    } catch {
+      // A host logger must not turn a handled delivery failure into an
+      // unhandled promise rejection.
+    }
+  };
+
+  const report = (msg: TgMessage, state: RouteDeliveryState, detail?: string): void => {
+    if (!onDelivery) return;
+    try {
+      const pending = onDelivery(msg, state, detail);
+      if (pending) {
+        void pending.catch((err) => {
+          warn(`[telegram] routed delivery report failed: ${String(err)}`);
+        });
+      }
+    } catch (err) {
+      warn(`[telegram] routed delivery report failed: ${String(err)}`);
+    }
+  };
+
+  const claimPayload = (name: string): RouteClaim | undefined => {
+    const full = join(dir, name);
+    return withStateLock(routeLockPath(threadId), () => {
+      let payload: RoutedPayload;
+      try {
+        const parsed = readRoutedPayload(full);
+        if (!parsed) throw new Error("invalid routed payload");
+        payload = parsed;
+      } catch (err) {
+        warn(`[telegram] routed payload parse failed (${name}): ${String(err)}`);
+        rmSync(full, { force: true });
+        return undefined;
+      }
+
+      if (readAcceptedLedger(threadId).entries.some((entry) => entry.identity === payload.identity)) {
+        rmSync(full, { force: true });
+        return undefined;
+      }
+
+      if (payload.state === "inflight") {
+        if (payload.owner && isAlive(payload.owner.pid)) return undefined;
+        payload.state = "uncertain";
+        payload.updatedAt = Date.now();
+        payload.detail = "previous consumer exited during handoff; delivery may have been submitted";
+        atomicWriteJson(full, payload);
+        return { kind: "report", payload, state: "uncertain", detail: payload.detail };
+      }
+
+      if (payload.state === "claimed") {
+        if (payload.owner && isAlive(payload.owner.pid)) return undefined;
+        payload.state = "queued";
+        payload.owner = undefined;
+        payload.updatedAt = Date.now();
+        atomicWriteJson(full, payload);
+      }
+      if (payload.state === "failed" || payload.state === "uncertain") return undefined;
+      const now = Date.now();
+      const queuedSince = Math.min(payload.createdAt, statSync(full).mtimeMs);
+      if (now - queuedSince > ROUTED_TTL_MS) {
+        rmSync(full, { force: true });
+        return { kind: "report", payload, state: "failed", detail: "routed payload expired before handoff" };
+      }
+      if (payload.retryAt != null && payload.retryAt > now) return undefined;
+
+      payload.state = "claimed";
+      payload.owner = { pid: process.pid, claimId, claimedAt: now };
+      payload.retryAt = undefined;
+      payload.updatedAt = now;
+      atomicWriteJson(full, payload);
+
+      payload.state = "inflight";
+      payload.attempts += 1;
+      payload.updatedAt = Date.now();
+      atomicWriteJson(full, payload);
+      return { kind: "deliver", payload };
+    });
+  };
+
+  const markUncertain = (name: string, payload: RoutedPayload, detail: string): void => {
+    try {
+      withStateLock(routeLockPath(threadId), () => {
+        const full = join(dir, name);
+        const current = readRoutedPayload(full);
+        if (
+          !current ||
+          current.identity !== payload.identity ||
+          current.state !== "inflight" ||
+          current.owner?.claimId !== claimId
+        ) {
+          return;
+        }
+        current.state = "uncertain";
+        current.detail = detail;
+        current.updatedAt = Date.now();
+        atomicWriteJson(full, current);
+      });
+    } catch (err) {
+      warn(`[telegram] could not retain uncertain routed delivery (${name}): ${String(err)}`);
+    }
+    report(payload.msg, "uncertain", detail);
+  };
+
+  const settleAccepted = (name: string, payload: RoutedPayload): void => {
+    try {
+      const accepted = withStateLock(routeLockPath(threadId), () => {
+        const full = join(dir, name);
+        const current = readRoutedPayload(full);
+        if (
+          !current ||
+          current.identity !== payload.identity ||
+          current.state !== "inflight" ||
+          current.owner?.claimId !== claimId
+        ) {
+          return false;
+        }
+        const ledger = readAcceptedLedger(threadId);
+        if (!ledger.entries.some((entry) => entry.identity === payload.identity)) {
+          ledger.entries.push({ identity: payload.identity, acceptedAt: Date.now() });
+          ledger.entries = ledger.entries.slice(-ACCEPTED_LEDGER_LIMIT);
+          atomicWriteJson(routeLedgerPath(threadId), ledger);
+        }
+        rmSync(full, { force: true });
+        return true;
+      });
+      if (accepted) report(payload.msg, "accepted");
+    } catch (err) {
+      const detail = `consumer accepted but durable acknowledgement failed: ${String(err)}`;
+      warn(`[telegram] ${detail}`);
+      markUncertain(name, payload, detail);
+    }
+  };
+
+  const scheduleScan = (delay: number): void => {
+    if (stopped) return;
+    const timer = setTimeout(() => {
+      retryTimers.delete(timer);
+      if (!stopped) scan();
+    }, delay);
+    timer.unref?.();
+    retryTimers.add(timer);
+  };
+
+  const settleFailed = (name: string, payload: RoutedPayload, err: unknown): void => {
+    const detail = String(err);
+    let retryAt: number | undefined;
+    try {
+      withStateLock(routeLockPath(threadId), () => {
+        const full = join(dir, name);
+        const current = readRoutedPayload(full);
+        if (
+          !current ||
+          current.identity !== payload.identity ||
+          current.state !== "inflight" ||
+          current.owner?.claimId !== claimId
+        ) {
+          return;
+        }
+        current.detail = detail;
+        current.owner = undefined;
+        current.updatedAt = Date.now();
+        if (current.attempts < ROUTED_DELIVERY_ATTEMPTS) {
+          current.state = "queued";
+          retryAt = Date.now() + ROUTED_RETRY_BASE_MS * current.attempts;
+          current.retryAt = retryAt;
+        } else {
+          current.state = "failed";
+          current.retryAt = undefined;
+        }
+        atomicWriteJson(full, current);
+      });
+    } catch (stateErr) {
+      warn(`[telegram] could not retain failed routed delivery (${name}): ${String(stateErr)}`);
+    }
+    warn(`[telegram] routed delivery failed (${name}): ${detail}`);
+    report(payload.msg, "failed", detail);
+    if (retryAt != null) scheduleScan(Math.max(1, retryAt - Date.now()));
+  };
 
   const handle = (name: string): void => {
-    // The receipt lives in this same dir and ends in `.json` (#61): it is
-    // evidence, never a payload, so it must never be consumed or unlinked.
-    if (!name || name.startsWith("tmp-") || name === INBOUND_RECEIPT || !name.endsWith(".json") || processed.has(name)) return;
-    if (accept && !accept()) return;
-    const full = join(dir, name);
-    let mtimeMs: number;
-    try {
-      mtimeMs = statSync(full).mtimeMs;
-    } catch {
-      return; // vanished between listing and stat
-    }
-    processed.add(name);
-    if (Date.now() - mtimeMs > ROUTED_TTL_MS) {
-      try {
-        unlinkSync(full);
-      } catch {
-        /* ignore */
-      }
-      return; // stale
-    }
-    let raw: string;
-    try {
-      raw = readFileSync(full, "utf8");
-    } catch {
+    if (
+      stopped ||
+      !name ||
+      name.startsWith("tmp-") ||
+      name === INBOUND_RECEIPT ||
+      !name.endsWith(".json") ||
+      processing.has(name)
+    ) {
       return;
     }
     try {
-      unlinkSync(full);
-    } catch {
-      /* ignore */
-    }
-    let msg: TgMessage;
-    try {
-      msg = JSON.parse(raw) as TgMessage;
+      if (accept && !accept()) return;
     } catch (err) {
-      log?.warn(`[telegram] routed payload parse failed (${name}): ${String(err)}`);
+      warn(`[telegram] routed ownership check failed: ${String(err)}`);
       return;
     }
-    // Receipt BEFORE the handoff (#61): its whole purpose is to outlive a
-    // consumer that dies, so a receipt written after `onMsg` records only the
-    // deliveries that already succeeded.
+
+    processing.add(name);
+    let claim: RouteClaim | undefined;
     try {
-      writeInboundReceipt(threadId, msg);
+      claim = claimPayload(name);
     } catch (err) {
-      log?.warn(`[telegram] inbound receipt write failed: ${String(err)}`);
+      warn(`[telegram] routed claim failed (${name}): ${String(err)}`);
+      processing.delete(name);
+      return;
     }
+    if (!claim) {
+      processing.delete(name);
+      return;
+    }
+    if (claim.kind === "report") {
+      report(claim.payload.msg, claim.state, claim.detail);
+      processing.delete(name);
+      return;
+    }
+
+    const payload = claim.payload;
     try {
-      onMsg(msg);
+      writeInboundReceipt(threadId, payload.msg);
     } catch (err) {
-      log?.warn(`[telegram] routed delivery failed (${name}): ${String(err)}`);
+      warn(`[telegram] inbound receipt write failed: ${String(err)}`);
     }
+
+    let pending: Promise<void> | void;
+    try {
+      pending = onMsg(payload.msg);
+    } catch (err) {
+      settleFailed(name, payload, err);
+      processing.delete(name);
+      return;
+    }
+
+    if (!pending) {
+      settleAccepted(name, payload);
+      processing.delete(name);
+      return;
+    }
+    void Promise.resolve(pending)
+      .then(
+        () => {
+          settleAccepted(name, payload);
+          processing.delete(name);
+        },
+        (err) => {
+          settleFailed(name, payload, err);
+          processing.delete(name);
+        },
+      )
+      .catch((err) => {
+        processing.delete(name);
+        warn(`[telegram] routed delivery settlement failed (${name}): ${String(err)}`);
+      });
   };
 
-  const scan = (): void => {
+  function scan(): void {
+    if (stopped) return;
     let names: string[];
     try {
-      names = readdirSync(dir);
+      names = readdirSync(dir).sort();
     } catch {
       return;
     }
+    // Deliberately do not await: sorted invocation plus independent settlement
+    // preserves route order without breaking inbound text/album coalescing.
     for (const name of names) handle(name);
-  };
+  }
 
-  scan(); // pick up anything already spooled before the watcher attached
+  scan();
 
   let watcher: FSWatcher | undefined;
   try {
-    watcher = watch(dir, (_event, filename) => {
-      if (filename) handle(String(filename));
-    });
+    watcher = watch(dir, () => scan());
   } catch (err) {
-    log?.warn(`[telegram] watch failed for ${dir}: ${String(err)}`);
+    warn(`[telegram] watch failed for ${dir}: ${String(err)}`);
   }
 
   const interval = setInterval(scan, 5000);
   interval.unref?.();
 
   return () => {
+    stopped = true;
     watcher?.close();
     clearInterval(interval);
+    for (const timer of retryTimers) clearTimeout(timer);
+    retryTimers.clear();
   };
 }

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultAccess } from "./access";
+import { defaultAccess, loadAccess, saveAccess } from "./access";
 import { type TgCallbackQuery, type TgMessage, TgError } from "./api";
 import { type ControlSpace, type RunHerdr, type TelegramCall, SpawnController, agentNameForSession, createWorktreeOmp, findSessionSpace, formatSessions, listControlSpaces, resumeOmp, sendCommandMessage, spawnOmp, validWorktreeBranch, workspaceDirectoryError } from "./control";
 import type { ThreadRegistry } from "./topics";
@@ -351,6 +351,29 @@ describe("sendCommandMessage", () => {
       { chat_id: "42", message_thread_id: 900, text: "sessions" },
       { chat_id: "42", message_thread_id: 3061, text: "sessions" },
     ]);
+  });
+
+  test("forgets a deleted control topic so the bridge recreates it, but not on transient errors", async () => {
+    const previous = process.env.OMP_TELEGRAM_STATE_DIR;
+    const dir = mkdtempSync(join(tmpdir(), "omp-tg-control-"));
+    process.env.OMP_TELEGRAM_STATE_DIR = dir;
+    try {
+      const failWith = (err: Error): TelegramCall => async <T>(_method: string, payload: Record<string, unknown>) => {
+        if (payload.message_thread_id === 900) throw err;
+        return { ...msg, message_id: 1 } as T;
+      };
+      saveAccess(access);
+      await sendCommandMessage({ access, callTelegram: failWith(new TgError("Bad Gateway", 502)), msg, text: "status" });
+      expect(loadAccess().controlThreadId).toBe(900);
+
+      const deleted = new TgError("Bad Request: message thread not found", 400);
+      await expect(sendCommandMessage({ access, callTelegram: failWith(deleted), msg, text: "status" })).resolves.toBeDefined();
+      expect(loadAccess().controlThreadId).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.OMP_TELEGRAM_STATE_DIR;
+      else process.env.OMP_TELEGRAM_STATE_DIR = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("keeps topic-local commands in their originating session", async () => {

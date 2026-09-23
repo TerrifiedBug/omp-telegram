@@ -1,5 +1,38 @@
-import { test, expect, describe } from "bun:test";
-import { type Access, assertAllowedChat, controlTopicCreationChat, controlTopicTarget, defaultAccess, gate, isDmChat, isPairedOwnerDm, pairedOwnerId, resolveDmTopicsHost } from "./access";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  type Access,
+  assertAllowedChat,
+  canAnswerPrompt,
+  controlTopicCreationChat,
+  controlTopicTarget,
+  defaultAccess,
+  gate,
+  isDmChat,
+  isPairedOwnerDm,
+  loadAccess,
+  pairedOwnerId,
+  resolveDmTopicsHost,
+  saveAccess,
+  statePath,
+  updateAccess,
+} from "./access";
+
+const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
+let stateDir: string;
+
+beforeEach(() => {
+  stateDir = mkdtempSync(join(tmpdir(), "omp-tg-access-"));
+  process.env.OMP_TELEGRAM_STATE_DIR = stateDir;
+});
+
+afterEach(() => {
+  if (previousStateDir === undefined) delete process.env.OMP_TELEGRAM_STATE_DIR;
+  else process.env.OMP_TELEGRAM_STATE_DIR = previousStateDir;
+  rmSync(stateDir, { recursive: true, force: true });
+});
 
 const withAllow = (...ids: string[]): Access => ({ ...defaultAccess(), allowFrom: ids });
 
@@ -66,6 +99,92 @@ describe("single paired operator", () => {
     expect(isPairedOwnerDm("42", "42", "private", access)).toBe(true);
     expect(isPairedOwnerDm("99", "42", "private", access)).toBe(false);
     expect(isPairedOwnerDm("42", "-1001", "supergroup", access)).toBe(false);
+  });
+});
+
+describe("disabled DM policy", () => {
+  const access: Access = {
+    ...withAllow("42"),
+    dmPolicy: "disabled",
+    groups: { "-1001": { requireMention: false, allowFrom: ["42"] } },
+  };
+
+  test("rejects private owner interactions without disabling configured groups", () => {
+    expect(gate({ from: { id: 42 }, chat: { id: 42, type: "private" }, text: "hi" }, "bot", access).action).toBe("drop");
+    expect(isPairedOwnerDm("42", "42", "private", access)).toBe(false);
+    expect(canAnswerPrompt("42", "42", "private", access)).toBe(false);
+
+    const group = { from: { id: 42 }, chat: { id: -1001, type: "supergroup" }, text: "hi" };
+    expect(gate(group, "bot", access).action).toBe("deliver");
+    expect(canAnswerPrompt("42", "-1001", "supergroup", access)).toBe(true);
+    expect(() => assertAllowedChat("-1001", access)).not.toThrow();
+    expect(() => assertAllowedChat("42", access)).toThrow("not allowlisted");
+  });
+});
+
+describe("transactional access updates", () => {
+  test("a pairing mutation starts from fresh disk state instead of overwriting concurrent config", () => {
+    saveAccess(defaultAccess());
+    const stale = loadAccess();
+    updateAccess((access) => {
+      access.groups["-1001"] = { requireMention: false, allowFrom: ["42"] };
+    });
+
+    expect(gate({ from: { id: 42 }, chat: { id: 42, type: "private" }, text: "pair" }, "bot", stale).action).toBe("pair");
+    const saved = loadAccess();
+    expect(saved.groups["-1001"]).toEqual({ requireMention: false, allowFrom: ["42"] });
+    expect(Object.values(saved.pending).map((entry) => entry.senderId)).toEqual(["42"]);
+  });
+
+  test("concurrent processes preserve every independent configuration update", async () => {
+    saveAccess(defaultAccess());
+    const runner = join(stateDir, "update-access.ts");
+    writeFileSync(
+      runner,
+      `import { updateAccess } from ${JSON.stringify(join(import.meta.dirname, "access.ts"))};\n` +
+        `const worker = Number(process.argv[2]);\n` +
+        `for (let iteration = 0; iteration < 8; iteration++) {\n` +
+        `  const id = String(-10000 - worker * 100 - iteration);\n` +
+        `  updateAccess((access) => { access.groups[id] = { requireMention: false, allowFrom: [id] }; });\n` +
+        `}\n`,
+    );
+    const workers = Array.from({ length: 8 }, (_, worker) => worker);
+    const ids = workers
+      .flatMap((worker) => Array.from({ length: 8 }, (_, iteration) => String(-10000 - worker * 100 - iteration)))
+      .sort();
+    const codes = await Promise.all(
+      workers.map((worker) =>
+        Bun.spawn([process.execPath, runner, String(worker)], {
+          env: { ...process.env, OMP_TELEGRAM_STATE_DIR: stateDir },
+          stdout: "ignore",
+          stderr: "ignore",
+        }).exited,
+      ),
+    );
+
+    expect(codes).toEqual(workers.map(() => 0));
+    expect(Object.keys(loadAccess().groups).sort()).toEqual(ids);
+    expect(readdirSync(stateDir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("lock contention fails closed without invoking the mutator or changing access.json", () => {
+    saveAccess({ ...defaultAccess(), enabled: true });
+    writeFileSync(`${statePath("access.json")}.lock`, String(process.pid));
+    const warnings: string[] = [];
+    let invoked = false;
+
+    expect(() =>
+      updateAccess(
+        (access) => {
+          invoked = true;
+          access.enabled = false;
+        },
+        (message) => warnings.push(message),
+      ),
+    ).toThrow("could not acquire state lock");
+    expect(invoked).toBe(false);
+    expect(loadAccess().enabled).toBe(true);
+    expect(warnings).toHaveLength(1);
   });
 });
 

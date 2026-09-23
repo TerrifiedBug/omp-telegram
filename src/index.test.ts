@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { defaultAccess } from "./access";
 import { isMissingThreadError, TgError, type TgMessage } from "./api";
 import { canAutoResumeTopic, consumeOutsidePrivateChat } from "./bridge";
-import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, substituteFileArg, telegramArgumentCompletions, telegramMessageHint, transcribeVoice } from "./index";
+import { substituteFileArg, telegramMessageHint, transcribeVoice } from "./inbound";
+import { approvalPingTarget, collectDoctorReport, isTaskSubagent, parseTelegramPromptTarget, telegramArgumentCompletions } from "./index";
 
 describe("Telegram bot command scope", () => {
   test("known commands are consumed outside private chats instead of reaching omp", () => {
@@ -151,7 +152,7 @@ describe("/telegram argument completions", () => {
   test("offers every subcommand at the top level with descriptions", () => {
     const items = telegramArgumentCompletions("") ?? [];
     expect(items.map((i) => i.label)).toEqual([
-      "status", "doctor", "daemon", "token", "on", "off", "pair", "deny",
+      "status", "doctor", "retry", "setup", "daemon", "token", "on", "off", "pair", "deny",
       "allow", "remove", "policy", "group", "set", "notify", "own", "topics",
     ]);
     expect(items.find((i) => i.label === "topics")?.description).toBe("per-project session topics");
@@ -185,7 +186,8 @@ describe("/telegram argument completions", () => {
   test("value replaces the whole argument so nested picks round-trip", () => {
     expect(values("topics ti")).toEqual(["topics tidy "]);
     expect(values("topics tidy of")).toEqual(["topics tidy off "]); // "of" matches only off (on also starts with "o")
-    expect(values("se")).toEqual(["set "]);
+    expect(values("se")).toEqual(["setup ", "set "]);
+    expect(values("set ")).not.toContain("setup "); // `setup` is its own subcommand, never a settings key
   });
 
   test("returns null where the position takes a free-form value", () => {

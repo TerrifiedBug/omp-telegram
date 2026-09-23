@@ -132,6 +132,7 @@ export interface TgSticker extends TgFileBase {
 export interface TgMessage {
   message_id: number;
   date: number;
+  edit_date?: number;
   text?: string;
   caption?: string;
   entities?: TgMessageEntity[];
@@ -151,6 +152,10 @@ export interface TgMessage {
   message_thread_id?: number;
   /** Internal spool sentinel; not a Bot API field. */
   edited_flag?: true;
+  /** Internal delivery-status message id; not a Bot API field. */
+  bridge_status_id?: number;
+  /** Internal session-card callback identity; not a Bot API field. */
+  bridge_callback_id?: string;
 }
 export interface TgCallbackQuery {
   id: string;

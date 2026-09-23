@@ -79,10 +79,18 @@ export function escapeMdV2(s: string): string {
 
 /** Inline formatting for a single line: code/links/bold/italic preserved, the rest escaped. */
 function inlineFormat(s: string): string {
-  const stash: string[] = [];
   // Protect already-rendered MarkdownV2 fragments behind private-use sentinels so
-  // the final escape pass leaves them untouched. 4 call sites, lockstep protocol.
-  const put = (rendered: string): string => `\uE000${stash.push(rendered) - 1}\uE001`;
+  // the final escape pass leaves them untouched. The sentinels are picked from
+  // private-use code points absent from this line, so literal text can never be
+  // mistaken for a placeholder.
+  const [open, close] = unusedSentinels(s);
+  const placeholder = new RegExp(`${open}(\\d+)${close}`, "g");
+  const stash: string[] = [];
+  const expand = (text: string): string => text.replace(placeholder, (_m, n: string) => stash[Number(n)] ?? "");
+  // Nested formatting (e.g. a link inside bold) stores a fragment that already
+  // contains an earlier placeholder; expand it now so the single final restore
+  // pass never leaves an inner placeholder behind (#82).
+  const put = (rendered: string): string => `${open}${stash.push(expand(rendered)) - 1}${close}`;
 
   let t = s;
   // Inline code — inside a code span only ` and \ are special.
@@ -97,8 +105,17 @@ function inlineFormat(s: string): string {
   t = t.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, (_m, inner: string) => put("_" + escapeMdV2(inner) + "_"));
   t = t.replace(/\*([^*\n]+)\*/g, (_m, inner: string) => put("_" + escapeMdV2(inner) + "_"));
   // Escape everything that remains, then restore the protected fragments.
-  t = escapeMdV2(t);
-  return t.replace(/\uE000(\d+)\uE001/g, (_m, n: string) => stash[Number(n)] ?? "");
+  return expand(escapeMdV2(t));
+}
+
+/** Two private-use code points that do not occur in `s`. */
+function unusedSentinels(s: string): [string, string] {
+  const found: string[] = [];
+  for (let code = 0xe000; found.length < 2; code++) {
+    const c = String.fromCharCode(code);
+    if (!s.includes(c)) found.push(c);
+  }
+  return [found[0], found[1]];
 }
 
 /**

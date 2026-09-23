@@ -5,10 +5,11 @@
 // (structural `GateMessage` contract below) — no grammy ctx.
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { TELEGRAM_MAX_CHARS } from "./markdown";
+import { withStateLock } from "./state-lock";
 
 export type PendingEntry = {
   senderId: string;
@@ -35,6 +36,13 @@ export type Access = {
   mentionPatterns?: string[];
   /** Emoji to react with on receipt (Telegram fixed whitelist). Unset = none. */
   ackReaction?: string;
+  /**
+   * Inbound delivery receipts. "failures": only failed or uncertain deliveries
+   * get a notice. "reactions": also 👀 when omp accepts a message and 👍 once a
+   * reply reaches the chat. "all": a status reply with received/queued/delivered
+   * progress. Missing: see {@link effectiveDeliveryStatus}.
+   */
+  deliveryStatus?: "failures" | "reactions" | "all";
   /** Which chunks carry Telegram's reply reference. Default "first". */
   replyToMode?: "off" | "first" | "all";
   /** Explicit source cap, clamped to 1..4096. Unset: 4096 legacy, 32768 whole rich. */
@@ -118,6 +126,15 @@ export function effectiveStreaming(access: Access): boolean | "final" | "explici
   return access.streaming ?? true;
 }
 
+/**
+ * Receipt mode in force. Unset defaults to "reactions", except for a config
+ * that already chose its own `ackReaction`: that keeps its emoji ("failures"
+ * plus the ack reaction) instead of being silently replaced by 👀/👍.
+ */
+export function effectiveDeliveryStatus(access: Access): "failures" | "reactions" | "all" {
+  return access.deliveryStatus ?? (access.ackReaction ? "failures" : "reactions");
+}
+
 // Structural contract for what `gate()`/`isMentioned()` read off a Bot API
 // message. The full wire type in api.ts (TgMessage) satisfies this. Kept local
 // so access.ts stays independent of api.ts.
@@ -178,6 +195,7 @@ export function pairedOwnerId(access: Access): string | undefined {
 
 /** Owner-only control invariant shared by command messages and callbacks. */
 export function isPairedOwnerDm(userId: string, chatId: string, chatType: string, access: Access): boolean {
+  if (access.dmPolicy === "disabled") return false;
   const ownerId = pairedOwnerId(access);
   return ownerId != null && chatType === "private" && userId === ownerId && chatId === ownerId;
 }
@@ -277,6 +295,10 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       parsed.richMessages === "auto" || parsed.richMessages === "on" || parsed.richMessages === "off"
         ? parsed.richMessages
         : undefined;
+    const deliveryStatus: Access["deliveryStatus"] =
+      parsed.deliveryStatus === "all" || parsed.deliveryStatus === "reactions" || parsed.deliveryStatus === "failures"
+        ? parsed.deliveryStatus
+        : undefined;
     return {
       enabled: parsed.enabled ?? false,
       dmPolicy: parsed.dmPolicy ?? "pairing",
@@ -285,6 +307,7 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
+      deliveryStatus,
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
@@ -312,13 +335,37 @@ export function loadAccess(warn?: (msg: string) => void): Access {
   }
 }
 
-/** Atomically persist access.json (tmp write mode 0600 + rename). */
+/** Atomically persist access.json. Kept as a low-level fixture/setup primitive. */
 export function saveAccess(a: Access): void {
   ensureStateDir();
   const file = statePath("access.json");
-  const tmp = `${file}.tmp`;
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + "\n", { mode: 0o600 });
-  renameSync(tmp, file);
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(a, null, 2) + "\n", { mode: 0o600 });
+    renameSync(tmp, file);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+/**
+ * Fresh, cross-process-safe read-modify-write of access.json.
+ *
+ * A caller that cannot acquire the lock fails without invoking `mutator`;
+ * proceeding unlocked would silently discard another process's configuration.
+ */
+export function updateAccess(mutator: (a: Access) => void, warn?: (message: string) => void): Access {
+  ensureStateDir();
+  return withStateLock(
+    statePath("access.json.lock"),
+    () => {
+      const access = loadAccess(warn);
+      mutator(access);
+      saveAccess(access);
+      return access;
+    },
+    warn,
+  );
 }
 
 /** Drop expired pending pairings. Returns true if anything changed. */
@@ -363,13 +410,15 @@ export type GateResult =
   | { action: "pair"; code: string; isResend: boolean };
 
 /**
- * Decide what to do with an inbound message. May mutate + persist `access`
- * (minting/incrementing pairing codes). Caller passes a freshly-loaded Access.
+ * Decide what to do with an inbound message. Pairing mutations are applied to
+ * a freshly loaded access record under the cross-process state lock.
  */
 export function gate(msg: GateMessage, botUsername: string, access: Access): GateResult {
-  if (pruneExpired(access)) saveAccess(access);
-
-  if (access.dmPolicy === "disabled") return { action: "drop" };
+  if (Object.values(access.pending).some((pending) => pending.expiresAt < Date.now())) {
+    access = updateAccess((fresh) => {
+      pruneExpired(fresh);
+    });
+  }
 
   const from = msg.from;
   if (!from) return { action: "drop" };
@@ -377,33 +426,47 @@ export function gate(msg: GateMessage, botUsername: string, access: Access): Gat
   const chatType = msg.chat.type;
 
   if (chatType === "private") {
+    if (access.dmPolicy === "disabled") return { action: "drop" };
     const ownerId = pairedOwnerId(access);
     if (ownerId) return senderId === ownerId ? { action: "deliver" } : { action: "drop" };
     // Historical multi-user state is ambiguous. Fail closed until repaired locally.
     if (access.allowFrom.length > 1 || access.dmPolicy === "allowlist") return { action: "drop" };
 
-    // Pairing — reuse an existing non-expired code for this sender.
-    for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === senderId) {
-        if ((p.replies ?? 1) >= 2) return { action: "drop" }; // initial + one reminder, then silent
-        p.replies = (p.replies ?? 1) + 1;
-        saveAccess(access);
-        return { action: "pair", code, isResend: true };
+    let result: GateResult = { action: "drop" };
+    updateAccess((fresh) => {
+      pruneExpired(fresh);
+      if (fresh.dmPolicy === "disabled") return;
+      const freshOwner = pairedOwnerId(fresh);
+      if (freshOwner || fresh.allowFrom.length > 1 || fresh.dmPolicy === "allowlist") {
+        result = freshOwner === senderId ? { action: "deliver" } : { action: "drop" };
+        return;
       }
-    }
-    if (Object.keys(access.pending).length >= 3) return { action: "drop" }; // cap pending
 
-    const code = randomBytes(3).toString("hex"); // 6 hex chars
-    const now = Date.now();
-    access.pending[code] = {
-      senderId,
-      chatId: String(msg.chat.id),
-      createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
-      replies: 1,
-    };
-    saveAccess(access);
-    return { action: "pair", code, isResend: false };
+      // Pairing — reuse an existing non-expired code for this sender.
+      for (const [code, pending] of Object.entries(fresh.pending)) {
+        if (pending.senderId !== senderId) continue;
+        if ((pending.replies ?? 1) >= 2) return;
+        pending.replies = (pending.replies ?? 1) + 1;
+        result = { action: "pair", code, isResend: true };
+        return;
+      }
+      if (Object.keys(fresh.pending).length >= 3) return;
+
+      let code: string;
+      do {
+        code = randomBytes(3).toString("hex");
+      } while (Object.hasOwn(fresh.pending, code));
+      const now = Date.now();
+      fresh.pending[code] = {
+        senderId,
+        chatId: String(msg.chat.id),
+        createdAt: now,
+        expiresAt: now + 60 * 60 * 1000,
+        replies: 1,
+      };
+      result = { action: "pair", code, isResend: false };
+    });
+    return result;
   }
 
   if (chatType === "group" || chatType === "supergroup") {
@@ -425,7 +488,7 @@ export function gate(msg: GateMessage, botUsername: string, access: Access): Gat
  * from it. DM chat_id == user_id, so allowFrom covers DMs. Throws otherwise.
  */
 export function assertAllowedChat(chatId: string, access: Access): void {
-  if (pairedOwnerId(access) === chatId) return;
+  if (access.dmPolicy !== "disabled" && pairedOwnerId(access) === chatId) return;
   if (chatId in access.groups) return;
   throw new Error(`chat ${chatId} is not allowlisted — manage access via /telegram`);
 }

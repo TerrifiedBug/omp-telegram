@@ -28,6 +28,31 @@ _Avoid_: incoming
 Assistant output flowing from the session back to a Telegram chat.
 _Avoid_: outgoing, response
 
+**Delivery state**:
+The lifecycle for one inbound message: `received`, `queued`, `accepted`,
+`failed`, or `uncertain`. `accepted` records submission to omp. `uncertain`
+means submission may have happened and automatic retry could duplicate the turn.
+`failed` and `uncertain` are always shown to the sender; the progress states are
+shown only with `deliveryStatus all`.
+_Avoid_: receipt state, message progress
+
+**Session card**:
+An owner-authorized Telegram status message bound to one exact live omp session.
+It shows runtime state and carries Refresh, Stop, Model, Thinking, and Compact
+controls.
+_Avoid_: dashboard, group control panel
+
+**Outbox**:
+The durable store for automatic final-reply parts that Telegram has not
+confirmed. Failed parts can be retried directly. Uncertain parts require an
+explicit retry because they may already have arrived.
+_Avoid_: draft cache, inbound queue
+
+**Routed envelope**:
+The durable record that carries one inbound Telegram message, its delivery
+identity and state, attempt count, and claim owner to an exact session route.
+_Avoid_: local fallback, loose message file
+
 **Active chat**:
 A Telegram chat currently mirroring the assistant's output. A chat becomes
 active when it sends an inbound message and stops being active when the run

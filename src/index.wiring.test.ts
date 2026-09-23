@@ -47,7 +47,18 @@ function harness(initialTools: string[], activateRegisteredTools = false): Harne
     registerShortcut: () => {},
     on: (event: string, handler: EventHandler) => {
       const list = handlers.get(event) ?? [];
-      list.push(handler);
+      list.push((value, ctx) => handler(value, {
+        hasUI: true,
+        isIdle: () => true,
+        hasPendingMessages: () => false,
+        getContextUsage: () => undefined,
+        ui: { notify() {} },
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionFile: () => "/tmp/session-1.jsonl",
+        },
+        ...(ctx && typeof ctx === "object" ? ctx : {}),
+      }));
       handlers.set(event, list);
     },
     getFlag: () => undefined,
@@ -70,6 +81,7 @@ function harness(initialTools: string[], activateRegisteredTools = false): Harne
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 const previousToken = process.env.TELEGRAM_BOT_TOKEN;
+const previousHerdr = process.env.HERDR_ENV;
 const packageJson: unknown = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8"));
 if (!packageJson || typeof packageJson !== "object" || !("version" in packageJson) || typeof packageJson.version !== "string") {
   throw new Error("package.json has no string version");
@@ -81,12 +93,15 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "omp-tg-wiring-"));
   process.env.OMP_TELEGRAM_STATE_DIR = dir;
   delete process.env.TELEGRAM_BOT_TOKEN; // a real token in the dev environment must never leak into these tests
+  delete process.env.HERDR_ENV;
 });
 afterEach(() => {
   if (previousStateDir === undefined) delete process.env.OMP_TELEGRAM_STATE_DIR;
   else process.env.OMP_TELEGRAM_STATE_DIR = previousStateDir;
   if (previousToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
   else process.env.TELEGRAM_BOT_TOKEN = previousToken;
+  if (previousHerdr === undefined) delete process.env.HERDR_ENV;
+  else process.env.HERDR_ENV = previousHerdr;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -117,6 +132,77 @@ async function startBridge(h: Harness): Promise<void> {
 }
 
 describe("extension wiring", () => {
+  test.each(["on", "off"])("%s preserves settings changed by another session", async (command) => {
+    writeAccess({ enabled: false, allowFrom: ["42"] });
+    const h = harness(["read"]);
+    const ctx = { ui: { notify() {} } };
+    await h.commands.get("telegram")!.handler("status", ctx);
+    writeAccess({
+      enabled: false,
+      allowFrom: ["43"],
+      groups: { "-100123": { requireMention: true, allowFrom: ["43"] } },
+      richMessages: "auto",
+    });
+    await h.commands.get("telegram")!.handler(command, ctx);
+    expect(loadAccess()).toMatchObject({
+      enabled: command === "on",
+      allowFrom: ["43"],
+      groups: { "-100123": { requireMention: true, allowFrom: ["43"] } },
+      richMessages: "auto",
+    });
+  });
+  test("status and doctor read the real poll lock instead of guessing from liveness", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    const h = harness(["read"]);
+    const notices: string[] = [];
+    const ctx = { ui: { notify: (message: string) => notices.push(message) } };
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const method = String(input).split("/").pop();
+      const result = method === "getMe" ? { username: "tbomp_bot", has_topics_enabled: true } : {};
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    // A real daemon is a separate process, so the lock owner must not be this pid.
+    const daemon = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+    try {
+      await startBridge(h);
+      writeFileSync(
+        join(dir, "daemon.json"),
+        JSON.stringify({ pid: daemon.pid, version: packageVersion, startedAt: Date.now() }),
+      );
+      // A live daemon holding the lock is the healthy arrangement: this session
+      // polls nothing and must not be reported as an outage.
+      writeFileSync(
+        join(dir, "bot.lock"),
+        `${daemon.pid}\n${JSON.stringify({ name: "telegram-daemon", pid: daemon.pid, startedAt: Date.now(), nonce: "n" })}\n`,
+      );
+      notices.length = 0;
+      await h.commands.get("telegram")!.handler("status", ctx);
+      expect(notices[0]).toContain("Bridge: running · the daemon polls");
+      expect(notices[0]).toContain("Session poller: stopped");
+
+      notices.length = 0;
+      await h.commands.get("telegram")!.handler("doctor", ctx);
+      expect(notices[0]).toContain(`Poll lock: pid ${daemon.pid} (telegram-daemon) · alive`);
+      expect(notices[0]).not.toContain("malformed");
+      // getMe during doctor hydrates the flag status reported as unknown before.
+      notices.length = 0;
+      await h.commands.get("telegram")!.handler("status", ctx);
+      expect(notices[0]).toContain("DM topic-mode: on");
+
+      // A daemon alive but backing off holds no lock, so nothing is polling.
+      rmSync(join(dir, "bot.lock"), { force: true });
+      notices.length = 0;
+      await h.commands.get("telegram")!.handler("status", ctx);
+      expect(notices[0]).toContain("Bridge: stopped · nothing holds the poll lock");
+    } finally {
+      daemon.kill();
+      globalThis.fetch = previousFetch;
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, {});
+    }
+  });
+
+
   test("rich formatting survives command reload, rejects invalid input, and respects literal/file sends", async () => {
     writeAccess({ enabled: true, allowFrom: ["42"], profile: "daemon" });
     const first = harness(["read"]);
@@ -240,6 +326,58 @@ describe("extension wiring", () => {
       );
       globalThis.fetch = previousFetch;
     }
+  });
+
+  test("task subagent shutdown leaves the parent's poll lock and DM owner alone (#83)", async () => {
+    // Session-poller path: no topics chat, so no daemon.
+    writeAccess({ enabled: true, allowFrom: ["42"] });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    // Two real factories in one process, as omp loads them for parent and task child.
+    const parent = harness(["ask"]);
+    const child = harness(["read", "yield"]);
+    const parentCtx = {
+      sessionManager: { getSessionId: () => "parent-session", getSessionFile: () => "/tmp/parent-session.jsonl" },
+    };
+    const childCtx = {
+      hasUI: false,
+      sessionManager: { getSessionId: () => "child-session", getSessionFile: () => "/tmp/child-session.jsonl" },
+    };
+    const lockPath = join(dir, "bot.lock");
+    let pollSignal: AbortSignal | undefined;
+    let polling!: () => void;
+    const pollStarted = new Promise<void>((resolve) => (polling = resolve));
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop();
+      if (method === "getUpdates") {
+        const signal = init?.signal ?? undefined;
+        pollSignal = signal;
+        polling();
+        return new Promise<Response>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      }
+      const result = method === "getMe" ? { username: "tbomp_bot" } : true;
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await parent.handlers.get("session_start")?.[0]?.({ type: "session_start" }, parentCtx);
+      await pollStarted;
+      expect(existsSync(lockPath)).toBe(true);
+      expect(loadDmOwner()?.sessionFile).toBe("/tmp/parent-session.jsonl");
+
+      await child.handlers.get("session_start")?.[0]?.({ type: "session_start" }, childCtx);
+      await child.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, childCtx);
+
+      expect(existsSync(lockPath)).toBe(true);
+      expect(loadDmOwner()?.sessionFile).toBe("/tmp/parent-session.jsonl");
+      expect(pollSignal?.aborted).toBe(false);
+    } finally {
+      await parent.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, parentCtx);
+      globalThis.fetch = previousFetch;
+    }
+    expect(pollSignal?.aborted).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   test("/telegram own pins, reports, and clears this session", async () => {

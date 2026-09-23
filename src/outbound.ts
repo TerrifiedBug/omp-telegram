@@ -13,6 +13,18 @@ import { extname } from "node:path";
 import { type Access, assertSendable, effectiveStreaming, messageLimit } from "./access";
 import { isMissingThreadError, type Logger, TgError, tg, tgUpload, withRateLimit } from "./api";
 import { MARKDOWN_HEADROOM, PART_LABEL_RESERVE, TELEGRAM_MAX_CHARS, TELEGRAM_RICH_MAX_CHARS, chunkLabeled, hasRichConstructs, mdToMarkdownV2 } from "./markdown";
+import { REPLIED_REACTION, SEEN_REACTION } from "./delivery";
+import {
+  claimOutboxRecord,
+  createOutboxRecord,
+  loadOutboxRecord,
+  loadOutboxRecords,
+  listOutboxRecords,
+  type OutboxPart,
+  type OutboxRecord,
+  removeOutboxRecord,
+  saveOutboxRecord,
+} from "./outbox";
 
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const PHOTO_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp"]);
@@ -46,10 +58,16 @@ interface ChatState {
   busy: boolean;
   /** The in-flight stream push, awaited by finalize to avoid racing edits. */
   inflight?: Promise<void>;
+  /** The turn-end delivery in progress; the run-end flush waits for it instead of sending again. */
+  finalizing?: Promise<void>;
   /** 429 backoff: suspend stream pushes until this timestamp. */
   suspendUntil?: number;
   /** sendMessageDraft rejected message_thread_id for this target — use the edit path. */
   draftBroken?: boolean;
+  /** Inbound messages marked seen (deliveryStatus "reactions") awaiting a reply this run, with their 👀 send. */
+  awaitingReply: Array<{ messageId: number; seen: Promise<void>; seenAt: number }>;
+  /** When a reply last reached this target this run; only messages seen earlier count as answered. */
+  repliedAt?: number;
   typingTimer?: NodeJS.Timeout;
 }
 
@@ -72,6 +90,13 @@ export function assistantText(message: unknown): string {
   const m = message as { role?: unknown; content?: unknown };
   if (m.role !== "assistant") return "";
   return textFromContent(m.content);
+}
+
+/** Stream-start timestamp omp stamps on an assistant message; stable across its updates. */
+function messageTimestamp(message: unknown): number | undefined {
+  if (!message || typeof message !== "object" || !("timestamp" in message)) return undefined;
+  const stamp = message.timestamp;
+  return typeof stamp === "number" && Number.isFinite(stamp) ? stamp : undefined;
 }
 
 /** Last visible assistant text in a message list (text blocks only; "" when none). */
@@ -102,6 +127,55 @@ export function lastRunError(messages: readonly unknown[]): RunError | undefined
   return undefined;
 }
 
+export type DeliveryFailureState = "failed" | "uncertain";
+
+/** A Bot API rejection proves no send occurred; transport/parse failures cannot. */
+export function deliveryFailureState(error: unknown): DeliveryFailureState {
+  return error instanceof TgError ? "failed" : "uncertain";
+}
+
+/** Delivery error with the confirmed remote ids preserved for callers and logs. */
+export class OutboundDeliveryError extends Error {
+  readonly state: DeliveryFailureState;
+  readonly sentIds: number[];
+  readonly totalParts: number;
+  readonly chatId: string;
+  readonly threadId?: number;
+
+  constructor(
+    kind: "message" | "attachment",
+    error: unknown,
+    sentIds: number[],
+    totalParts: number,
+    chatId: string,
+    threadId?: number,
+  ) {
+    const state = deliveryFailureState(error);
+    const delivered = sentIds.length > 0 ? ` Confirmed message ids: ${sentIds.join(", ")}.` : "";
+    const explanation =
+      state === "uncertain"
+        ? "Telegram may have accepted the in-flight part; it was not retried to avoid a duplicate."
+        : "Telegram definitively rejected the in-flight part.";
+    super(
+      `Telegram ${kind} delivery ${state} after ${sentIds.length} of ${totalParts} part(s).${delivered} ${explanation} ${String(error)}`,
+      { cause: error },
+    );
+    this.name = "OutboundDeliveryError";
+    this.state = state;
+    this.sentIds = [...sentIds];
+    this.totalParts = totalParts;
+    this.chatId = chatId;
+    this.threadId = threadId;
+  }
+}
+
+interface OutboxResumeResult {
+  sent: number;
+  failed: number;
+  uncertain: number;
+  error?: unknown;
+}
+
 export class Outbound {
   #token = "";
   readonly #getAccess: () => Access;
@@ -112,6 +186,13 @@ export class Outbound {
   #draftUnsupported = false;
   #lastTarget: { chatId: string; threadId?: number } | undefined;
   #missingThreadHandler?: (chatId: string, threadId: number) => Promise<number | undefined>;
+  /**
+   * Timestamp of the newest assistant message a turn_end has finalized. omp
+   * delivers message_update through a queue it does not await, so a stale
+   * snapshot can land after turn_end; replaying it would re-dirty the turn and
+   * send its partial text as a second reply.
+   */
+  #finalizedThrough = 0;
 
   constructor(getAccess: () => Access, log?: Logger, sleep?: (ms: number) => Promise<void>) {
     this.#getAccess = getAccess;
@@ -156,6 +237,38 @@ export class Outbound {
     return targets;
   }
 
+  pendingDeliveries(): Array<{
+    chatId: string;
+    threadId?: number;
+    state: "failed" | "uncertain";
+    parts: number;
+    unsent: number;
+    updatedAt: number;
+  }> {
+    const deliveries: Array<{
+      chatId: string;
+      threadId?: number;
+      state: "failed" | "uncertain";
+      parts: number;
+      unsent: number;
+      updatedAt: number;
+    }> = [];
+    for (const record of listOutboxRecords()) {
+      const unsent = record.parts.reduce((count, part) => count + (part.state === "sent" ? 0 : 1), 0);
+      if (unsent === 0) continue;
+      const uncertain = record.parts.some((part) => part.state === "uncertain" || part.state === "inflight");
+      deliveries.push({
+        chatId: record.chatId,
+        ...(record.threadId != null ? { threadId: record.threadId } : {}),
+        state: uncertain ? "uncertain" : "failed",
+        parts: record.parts.length,
+        unsent,
+        updatedAt: record.updatedAt,
+      });
+    }
+    return deliveries;
+  }
+
   /**
    * Run-status notice (retry/failure/recovery) to every chat with a live
    * Telegram turn. Plain text: provider errors carry MarkdownV2-hostile
@@ -180,10 +293,28 @@ export class Outbound {
     if (!already) this.#startTyping(this.#chatState(chatId, threadId));
   }
 
+  /**
+   * React {@link SEEN_REACTION} to an inbound message. It switches to
+   * {@link REPLIED_REACTION} once a reply reaches its chat: at the end of the
+   * first turn that started after this message was accepted, or at run end for
+   * replies sent another way. A run can outlive many turns (follow-ups, steers),
+   * so waiting for run end alone left 👀 up long after the answer arrived.
+   * The replied reaction waits for this send, so a slow 👀 can never overwrite 👍.
+   */
+  markSeen(chatId: string, threadId: number | undefined, messageId: number): Promise<void> {
+    const seen = this.react(chatId, messageId, SEEN_REACTION).catch((err) =>
+      this.#log?.debug(`[telegram] seen reaction ${chatId} failed: ${String(err)}`),
+    );
+    this.#chatState(chatId, threadId).awaitingReply.push({ messageId, seen, seenAt: Date.now() });
+    return seen;
+  }
+
   // ---- event inputs (wired from index.ts) --------------------------------
 
   onMessageUpdate(message: unknown): void {
     if (!this.#token || this.#active.size === 0) return;
+    const stamp = messageTimestamp(message);
+    if (stamp !== undefined && stamp <= this.#finalizedThrough) return;
     const streaming = effectiveStreaming(this.#getAccess());
     if (streaming === false || streaming === "final" || streaming === "explicit") return;
     const text = assistantText(message);
@@ -197,6 +328,9 @@ export class Outbound {
 
   async onTurnEnd(message: unknown): Promise<void> {
     if (!this.#token || this.#active.size === 0) return;
+    // Record before any await: stale updates can arrive while this turn sends.
+    const stamp = messageTimestamp(message);
+    if (stamp !== undefined && stamp > this.#finalizedThrough) this.#finalizedThrough = stamp;
     const streaming = effectiveStreaming(this.#getAccess());
     if (streaming === "final") return; // one message per run, delivered at agent end
     if (streaming === "explicit") return; // nothing is automatic; the model sends or nobody hears
@@ -204,7 +338,11 @@ export class Outbound {
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
       if (!st) continue;
-      if (text.trim().length > 0) await this.#finalize(st, text);
+      if (text.trim().length > 0) {
+        await this.#finalize(st, text);
+        // Only messages accepted before this turn began can be what it answers.
+        if (stamp !== undefined) await this.#reactReplied(st, key, (entry) => entry.seenAt < stamp);
+      }
       else this.#resetTurn(st);
     }
   }
@@ -223,21 +361,50 @@ export class Outbound {
    */
   async onAgentEnd(finalText?: string): Promise<void> {
     const streaming = effectiveStreaming(this.#getAccess());
-    for (const key of [...this.#active]) {
-      const st = this.#chats.get(key);
-      if (!st) continue;
-      // "explicit" streams nothing, so there is never a dirty preview to flush.
-      if (streaming === "final") {
-        if (finalText && finalText.trim().length > 0) await this.#finalize(st, finalText);
-      } else if (streaming !== "explicit" && st.dirty) {
-        await this.#finalize(st, st.acc);
+    let failure: unknown;
+    try {
+      for (const key of [...this.#active]) {
+        const st = this.#chats.get(key);
+        if (!st) continue;
+        try {
+          // turn_end delivery can still be in flight when agent_end arrives;
+          // its failure is reported by the turn_end path.
+          if (st.finalizing) await st.finalizing.catch(() => {});
+          // "explicit" streams nothing, so there is never a dirty preview to flush.
+          if (streaming === "final") {
+            if (finalText && finalText.trim().length > 0) await this.#finalize(st, finalText);
+          } else if (streaming !== "explicit" && st.dirty) {
+            await this.#finalize(st, st.acc);
+          }
+        } catch (error) {
+          failure ??= error;
+        } finally {
+          const repliedAt = st.repliedAt;
+          st.repliedAt = undefined;
+          this.#resetTurn(st);
+          this.#stopTyping(st);
+          if (repliedAt !== undefined) await this.#reactReplied(st, key, (entry) => entry.seenAt <= repliedAt);
+          st.awaitingReply = [];
+        }
       }
-      this.#stopTyping(st);
+    } finally {
+      this.#active.clear();
     }
-    this.#active.clear();
+    if (failure) throw failure;
   }
 
-  /** Session switch/branch/tree: finalize open previews as plain text, keep running. */
+  async #reactReplied(st: ChatState, key: string, answered: (entry: ChatState["awaitingReply"][number]) => boolean): Promise<void> {
+    const due = st.awaitingReply.filter(answered);
+    st.awaitingReply = st.awaitingReply.filter((entry) => !due.includes(entry));
+    for (const { messageId, seen } of due) {
+      await seen;
+      await this.react(st.chatId, messageId, REPLIED_REACTION).catch((err) =>
+        this.#log?.debug(`[telegram] replied reaction ${key} failed: ${String(err)}`),
+      );
+    }
+  }
+
+  /** Session switch/branch/tree: finalize open previews. Native drafts expire on their own. */
   async onSessionBoundary(): Promise<void> {
     for (const key of [...this.#active]) {
       const st = this.#chats.get(key);
@@ -255,8 +422,12 @@ export class Outbound {
     this.#active.clear();
   }
 
-  shutdown(): void {
-    for (const st of this.#chats.values()) this.#stopTyping(st);
+  async shutdown(): Promise<void> {
+    const states = [...this.#chats.values()];
+    for (const st of states) this.#stopTyping(st);
+    for (const st of states) {
+      if (st.inflight) await st.inflight.catch(() => {});
+    }
     this.#chats.clear();
     this.#active.clear();
   }
@@ -270,6 +441,7 @@ export class Outbound {
     const replyMode = access.replyToMode ?? "first";
     const useMd = (opts?.format ?? "markdown") === "markdown";
     const ids: number[] = [];
+    let totalParts = 1;
     let threadId = opts?.threadId;
     let recovered = false;
     const deliver = async <T>(op: () => Promise<T>): Promise<T> => {
@@ -284,61 +456,117 @@ export class Outbound {
         return op();
       }
     };
-    let allowRich = true;
-    const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
-    if (text.length <= richBudget && this.#wantsRich(text, useMd)) {
-      const id = await deliver(() => this.#tryRichSend(chatId, text, this.#threadTarget(opts?.replyTo, replyMode, 0), threadId));
-      if (id !== undefined) return [id];
-      allowRich = false; // Re-split the rejected source; never retry rich for these parts.
+    try {
+      let allowRich = true;
+      const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
+      if (text.length <= richBudget && this.#wantsRich(text, useMd)) {
+        const id = await deliver(() => this.#tryRichSend(chatId, text, this.#threadTarget(opts?.replyTo, replyMode, 0), threadId));
+        if (id !== undefined) {
+          this.#noteReplied(chatId, opts?.threadId);
+          return [id];
+        }
+        allowRich = false; // Re-split the rejected source; never retry rich for these parts.
+      }
+      const parts = chunkLabeled(text, messageLimit(access) - MARKDOWN_HEADROOM, access.chunkMode ?? "newline");
+      totalParts = parts.length;
+      for (let i = 0; i < parts.length; i++) {
+        const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
+        ids.push(await deliver(() => this.#sendOne(chatId, parts[i], useMd, replyTo, threadId, allowRich)));
+      }
+      this.#noteReplied(chatId, opts?.threadId);
+      return ids;
+    } catch (error) {
+      const failure = new OutboundDeliveryError("message", error, ids, totalParts, chatId, threadId);
+      this.#log?.warn(`[telegram] ${failure.state} message delivery ${chatId}: ${failure.message}`);
+      throw failure;
     }
-    const parts = chunkLabeled(text, messageLimit(access) - MARKDOWN_HEADROOM, access.chunkMode ?? "newline");
-    for (let i = 0; i < parts.length; i++) {
-      const replyTo = this.#threadTarget(opts?.replyTo, replyMode, i);
-      ids.push(await deliver(() => this.#sendOne(chatId, parts[i], useMd, replyTo, threadId, allowRich)));
-    }
-    return ids;
   }
 
-  /** Attach files: images as photos, others as documents. Guards state-dir files and 50MB cap. */
+  /** Attach files after preflighting the whole list, so local errors upload nothing. */
   async sendFiles(chatId: string, files: string[], replyTo?: number, threadId?: number): Promise<number[]> {
+    const prepared: Array<{ file: string; isPhoto: boolean }> = [];
+    for (const file of files) {
+      assertSendable(file);
+      const info = await stat(file);
+      if (!info.isFile()) throw new Error(`not a regular file: ${file}`);
+      if (info.size > MAX_ATTACHMENT_BYTES) {
+        throw new Error(`file too large: ${file} (${(info.size / 1048576).toFixed(1)}MB, max 50MB)`);
+      }
+      prepared.push({ file, isPhoto: PHOTO_EXTS.has(extname(file).toLowerCase()) });
+    }
+
     const replyMode = this.#getAccess().replyToMode ?? "first";
     const ids: number[] = [];
     let targetThreadId = threadId;
     let recovered = false;
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      assertSendable(file);
-      const info = await stat(file);
-      if (info.size > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`file too large: ${file} (${(info.size / 1048576).toFixed(1)}MB, max 50MB)`);
+    try {
+      for (let i = 0; i < prepared.length; i++) {
+        const { file, isPhoto } = prepared[i];
+        const upload = async (destinationThreadId: number | undefined): Promise<{ message_id: number }> => {
+          const fields: Record<string, string | number | undefined> = { chat_id: chatId };
+          if (destinationThreadId != null) fields.message_thread_id = destinationThreadId;
+          const reply = this.#threadTarget(replyTo, replyMode, i);
+          if (reply != null) fields.reply_parameters = JSON.stringify({ message_id: reply });
+          return this.#rateLimited(() =>
+            tgUpload<{ message_id: number }>(
+              this.#token,
+              isPhoto ? "sendPhoto" : "sendDocument",
+              fields,
+              { field: isPhoto ? "photo" : "document", path: file },
+            ),
+          );
+        };
+        try {
+          ids.push((await upload(targetThreadId)).message_id);
+        } catch (error) {
+          if (recovered || targetThreadId == null || !isMissingThreadError(error)) throw error;
+          const replacement = await this.#recoverMissingThread(chatId, targetThreadId);
+          if (replacement == null) throw error;
+          recovered = true;
+          targetThreadId = replacement;
+          ids.push((await upload(targetThreadId)).message_id);
+        }
       }
-      const isPhoto = PHOTO_EXTS.has(extname(file).toLowerCase());
-      const upload = async (destinationThreadId: number | undefined): Promise<{ message_id: number }> => {
-        const fields: Record<string, string | number | undefined> = { chat_id: chatId };
-        if (destinationThreadId != null) fields.message_thread_id = destinationThreadId;
-        const reply = this.#threadTarget(replyTo, replyMode, i);
-        if (reply != null) fields.reply_parameters = JSON.stringify({ message_id: reply });
-        return this.#rateLimited(() =>
-          tgUpload<{ message_id: number }>(
-            this.#token,
-            isPhoto ? "sendPhoto" : "sendDocument",
-            fields,
-            { field: isPhoto ? "photo" : "document", path: file },
-          ),
-        );
-      };
+      this.#noteReplied(chatId, threadId);
+      return ids;
+    } catch (error) {
+      const failure = new OutboundDeliveryError("attachment", error, ids, prepared.length, chatId, targetThreadId);
+      this.#log?.warn(`[telegram] ${failure.state} attachment delivery ${chatId}: ${failure.message}`);
+      throw failure;
+    }
+  }
+
+  /**
+   * Explicitly retry durable final-delivery failures for one exact chat/topic.
+   * Ambiguous attempts remain untouched unless the user opts into duplication risk.
+   */
+  async retryFailed(
+    chatId: string,
+    threadId?: number,
+    options: { includeUncertain?: boolean } = {},
+  ): Promise<{ sent: number; failed: number; uncertain: number }> {
+    const totals = { sent: 0, failed: 0, uncertain: 0 };
+    for (const snapshot of loadOutboxRecords(chatId, threadId)) {
+      const release = claimOutboxRecord(snapshot.id);
+      if (!release) continue;
       try {
-        ids.push((await upload(targetThreadId)).message_id);
-      } catch (err) {
-        if (recovered || targetThreadId == null || !isMissingThreadError(err)) throw err;
-        const replacement = await this.#recoverMissingThread(chatId, targetThreadId);
-        if (replacement == null) throw err;
-        recovered = true;
-        targetThreadId = replacement;
-        ids.push((await upload(targetThreadId)).message_id);
+        const record = loadOutboxRecord(snapshot.id);
+        if (!record) continue;
+        const result = await this.#resumeOutbox(record, options.includeUncertain === true);
+        totals.sent += result.sent;
+        totals.failed += result.failed;
+        totals.uncertain += result.uncertain;
+        if (result.error) {
+          this.#log?.warn(`[telegram] retry ${record.id} stopped: ${String(result.error)}`);
+        }
+      } catch (error) {
+        totals.uncertain += 1;
+        this.#log?.warn(`[telegram] retry state failure ${snapshot.id}: ${String(error)}`);
+      } finally {
+        release();
       }
     }
-    return ids;
+    return totals;
   }
 
   async react(chatId: string, messageId: number, emoji: string): Promise<void> {
@@ -384,7 +612,9 @@ export class Outbound {
         ...(st.threadId != null ? { message_thread_id: st.threadId } : {}),
       });
     } catch (err) {
-      if (err instanceof TgError) {
+      // Only a definitive capability/parameter rejection selects the edit path.
+      // Rate limits, server errors, and transport failures are transient.
+      if (err instanceof TgError && (err.code === 400 || err.code === 404)) {
         if (st.threadId != null) {
           // message_thread_id is a valid sendMessageDraft param (Bot API 10.1), but a
           // server/bot without DM forum-topic mode still rejects it — fall back to edit
@@ -476,63 +706,207 @@ export class Outbound {
     await this.#rateLimited(() => tg(this.#token, "editMessageText", { chat_id: chatId, message_id: messageId, text }));
   }
 
-  /** Finalize one turn into real message(s), then reset per-turn state. */
-  async #finalize(st: ChatState, fullText: string, allowRecovery = true, allowRich = true): Promise<void> {
+  /** Finalize one turn through the crash-safe outbox, then reset per-turn state. */
+  #finalize(st: ChatState, fullText: string): Promise<void> {
+    // Claim the turn before the first await. agent_end can arrive while this
+    // send is in flight; seeing the turn still dirty, the run-end flush would
+    // send it a second time (with a stale, shorter preview when throttled).
+    st.dirty = false;
+    const run = this.#deliverTurn(st, fullText).then(() => {
+      st.repliedAt = Date.now();
+    });
+    st.finalizing = run;
+    return run.finally(() => {
+      if (st.finalizing === run) st.finalizing = undefined;
+    });
+  }
+
+  async #deliverTurn(st: ChatState, fullText: string): Promise<void> {
     if (st.inflight) await st.inflight.catch(() => {}); // barrier: let any in-flight push settle
-    const access = this.#getAccess();
-    const budget = messageLimit(access) - MARKDOWN_HEADROOM;
-    const mode = access.chunkMode ?? "newline";
-    const prior = st.committed.length;
+    let record: OutboxRecord | undefined;
     try {
-      let richSent = false;
-      const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
-      if (allowRich && st.previewMsgId == null && st.sentUpTo === 0 && prior === 0 &&
-          fullText.length <= richBudget && this.#wantsRich(fullText, true)) {
-        richSent = (await this.#tryRichSend(st.chatId, fullText, undefined, st.threadId)) !== undefined;
-        if (!richSent) allowRich = false;
+      record = createOutboxRecord(st.chatId, st.threadId, this.#finalParts(st, fullText));
+      const result = await this.#resumeOutbox(record, false, st);
+      if (result.error || result.failed > 0 || result.uncertain > 0) {
+        const cause = result.error ?? new Error("delivery did not reach a confirmed state");
+        const ids = record.parts.flatMap((part) => part.state === "sent" && part.messageId != null ? [part.messageId] : []);
+        const failure = new OutboundDeliveryError("message", cause, ids, record.parts.length, record.chatId, record.threadId);
+        this.#log?.warn(
+          `[telegram] final delivery ${failure.state} ${st.chatId}; retained as ${record.id} for /retry: ${failure.message}`,
+        );
+        throw failure;
       }
-      if (st.previewMsgId != null) {
-        const rest = fullText.slice(st.sentUpTo);
-        const parts = chunkLabeled(rest, budget, mode, prior);
-        await this.#finalizePreview(st, parts[0] ?? rest, true);
-        for (let i = 1; i < parts.length; i++) await this.#sendOne(st.chatId, parts[i], true, undefined, st.threadId, allowRich);
-        await this.#labelCommitted(st, prior + Math.max(parts.length, 1));
-      } else if (!richSent) {
-        // `sentUpTo` is non-zero when stream overflow already committed a head
-        // message this turn — resending from 0 would duplicate it.
-        const parts = chunkLabeled(fullText.slice(st.sentUpTo), budget, mode, prior);
-        for (const part of parts) await this.#sendOne(st.chatId, part, true, undefined, st.threadId, allowRich);
-        await this.#labelCommitted(st, prior + parts.length);
-      }
-      if (st.draftId != null) {
-        // Clear the ephemeral draft so it doesn't linger beside the real message.
-        await tg(this.#token, "sendMessageDraft", {
-          chat_id: st.chatId,
-          draft_id: st.draftId,
-          text: "",
-          ...(st.threadId != null ? { message_thread_id: st.threadId } : {}),
-        }).catch(() => {});
-      }
-    } catch (err) {
-      if (allowRecovery && st.threadId != null && isMissingThreadError(err)) {
-        try {
-          const replacement = await this.#recoverMissingThread(st.chatId, st.threadId, st);
-          if (replacement != null) {
-            st.previewMsgId = undefined;
-            st.draftId = undefined;
-            st.sentUpTo = 0; // the old topic is gone — redeliver the whole answer
-            st.committed = [];
-            await this.#finalize(st, fullText, false, allowRich);
-            return;
-          }
-        } catch (recoveryError) {
-          this.#log?.warn(`[telegram] topic recovery failed ${st.chatId}: ${String(recoveryError)}`);
-        }
-      }
-      this.#log?.warn(`[telegram] finalize failed ${st.chatId}: ${String(err)}`);
+      await this.#labelCommitted(st, record.parts.length);
+    } catch (error) {
+      if (error instanceof OutboundDeliveryError) throw error;
+      const ids = record?.parts.flatMap((part) => part.state === "sent" && part.messageId != null ? [part.messageId] : []) ?? [];
+      const failure = new OutboundDeliveryError(
+        "message",
+        error,
+        ids,
+        record?.parts.length ?? 1,
+        record?.chatId ?? st.chatId,
+        record?.threadId ?? st.threadId,
+      );
+      this.#log?.warn(`[telegram] final delivery state failure ${st.chatId}: ${failure.message}`);
+      throw failure;
     } finally {
+      // No draft cleanup: the final send replaces the DM draft. A later
+      // sendMessageDraft (even with empty text, which Telegram renders as a
+      // "Thinking…" placeholder) would re-show a stale preview under the reply.
       this.#resetTurn(st);
     }
+  }
+
+  #finalParts(st: ChatState, fullText: string): OutboxPart[] {
+    const access = this.#getAccess();
+    const prior: OutboxPart[] = st.committed.map((part) => ({
+      kind: "edit",
+      text: part.text,
+      useMd: true,
+      allowRich: true,
+      state: "sent",
+      existingMessageId: part.messageId,
+      messageId: part.messageId,
+    }));
+    const richBudget = access.textChunkLimit == null ? TELEGRAM_RICH_MAX_CHARS : messageLimit(access);
+    if (
+      prior.length === 0 &&
+      st.previewMsgId == null &&
+      st.sentUpTo === 0 &&
+      fullText.length <= richBudget &&
+      this.#wantsRich(fullText, true)
+    ) {
+      return [{ kind: "rich", text: fullText, useMd: true, allowRich: true, state: "pending" }];
+    }
+
+    const chunks = chunkLabeled(
+      fullText.slice(st.sentUpTo),
+      messageLimit(access) - MARKDOWN_HEADROOM,
+      access.chunkMode ?? "newline",
+      prior.length,
+    );
+    if (st.previewMsgId != null) {
+      const [head = fullText.slice(st.sentUpTo), ...tail] = chunks;
+      prior.push({
+        kind: "edit",
+        text: head,
+        useMd: true,
+        allowRich: true,
+        state: "pending",
+        existingMessageId: st.previewMsgId,
+      });
+      prior.push(...tail.map((text): OutboxPart => ({
+        kind: "send",
+        text,
+        useMd: true,
+        allowRich: true,
+        state: "pending",
+      })));
+      return prior;
+    }
+    prior.push(...chunks.map((text): OutboxPart => ({
+      kind: "send",
+      text,
+      useMd: true,
+      allowRich: true,
+      state: "pending",
+    })));
+    return prior;
+  }
+
+  async #resumeOutbox(record: OutboxRecord, includeUncertain: boolean, st?: ChatState): Promise<OutboxResumeResult> {
+    const result: OutboxResumeResult = { sent: 0, failed: 0, uncertain: 0 };
+    let recovered = false;
+    for (let index = 0; index < record.parts.length; index++) {
+      const part = record.parts[index];
+      if (part.state === "sent") continue;
+      const wasUncertain = part.state === "uncertain" || part.state === "inflight";
+      if (wasUncertain) {
+        result.uncertain += 1;
+        if (!includeUncertain) return result;
+        this.#log?.warn(
+          `[telegram] explicitly retrying uncertain delivery ${record.id} part ${index + 1}; Telegram may already have accepted it`,
+        );
+      }
+
+      part.state = "inflight";
+      part.detail = undefined;
+      saveOutboxRecord(record);
+      try {
+        let messageId: number;
+        if (part.kind === "rich") {
+          const richId = await this.#tryRichSend(record.chatId, part.text, undefined, record.threadId);
+          if (richId == null) {
+            const access = this.#getAccess();
+            const fallback = chunkLabeled(
+              part.text,
+              messageLimit(access) - MARKDOWN_HEADROOM,
+              access.chunkMode ?? "newline",
+            ).map((text): OutboxPart => ({
+              kind: "send",
+              text,
+              useMd: part.useMd,
+              allowRich: false,
+              state: "pending",
+            }));
+            record.parts.splice(index, 1, ...fallback);
+            saveOutboxRecord(record);
+            index -= 1;
+            continue;
+          }
+          messageId = richId;
+        } else if (part.kind === "edit" && part.existingMessageId != null) {
+          await this.#editDelivered(record.chatId, part.existingMessageId, part.text, part.useMd);
+          messageId = part.existingMessageId;
+        } else {
+          messageId = await this.#sendOne(
+            record.chatId,
+            part.text,
+            part.useMd,
+            undefined,
+            record.threadId,
+            part.allowRich,
+          );
+        }
+        part.state = "sent";
+        part.messageId = messageId;
+        part.detail = undefined;
+        saveOutboxRecord(record);
+        result.sent += 1;
+      } catch (error) {
+        if (!recovered && record.threadId != null && isMissingThreadError(error)) {
+          try {
+            const replacement = await this.#recoverMissingThread(record.chatId, record.threadId, st);
+            if (replacement != null) {
+              recovered = true;
+              record.threadId = replacement;
+              if (part.kind === "edit") {
+                part.kind = "send";
+                part.existingMessageId = undefined;
+              }
+              part.state = "pending";
+              part.detail = undefined;
+              saveOutboxRecord(record);
+              index -= 1;
+              continue;
+            }
+          } catch (recoveryError) {
+            this.#log?.warn(`[telegram] topic recovery failed ${record.chatId}: ${String(recoveryError)}`);
+          }
+        }
+        const state = deliveryFailureState(error);
+        part.state = state;
+        part.detail = String(error);
+        saveOutboxRecord(record);
+        if (state === "failed") result.failed += 1;
+        else if (!wasUncertain) result.uncertain += 1;
+        result.error = error;
+        return result;
+      }
+    }
+    removeOutboxRecord(record.id);
+    return result;
   }
 
   /**
@@ -624,9 +998,10 @@ export class Outbound {
   }
 
   #onStreamError(st: ChatState, err: unknown): void {
-    if (err instanceof TgError && err.retryAfter) {
-      st.suspendUntil = Date.now() + err.retryAfter * 1000 + 250;
-      this.#log?.debug(`[telegram] 429 ${st.chatId} — pausing stream ${err.retryAfter}s`);
+    if (err instanceof TgError && (err.retryAfter != null || err.code === 429)) {
+      const retryAfter = err.retryAfter ?? 1;
+      st.suspendUntil = Date.now() + retryAfter * 1000 + 250;
+      this.#log?.debug(`[telegram] 429 ${st.chatId} — pausing stream ${retryAfter}s`);
       return;
     }
     this.#log?.debug(`[telegram] stream edit failed ${st.chatId}: ${String(err)}`);
@@ -658,11 +1033,16 @@ export class Outbound {
     }
   }
 
+  #noteReplied(chatId: string, threadId?: number): void {
+    const st = this.#chats.get(targetKey(chatId, threadId));
+    if (st) st.repliedAt = Date.now();
+  }
+
   #chatState(chatId: string, threadId?: number): ChatState {
     const key = targetKey(chatId, threadId);
     let st = this.#chats.get(key);
     if (!st) {
-      st = { chatId, threadId, acc: "", sentUpTo: 0, committed: [], lastEditAt: 0, dirty: false, busy: false };
+      st = { chatId, threadId, acc: "", sentUpTo: 0, committed: [], lastEditAt: 0, dirty: false, busy: false, awaitingReply: [] };
       this.#chats.set(key, st);
     }
     return st;

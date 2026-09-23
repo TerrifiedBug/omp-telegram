@@ -36,19 +36,31 @@ There is no build step and no runtime dependency install.
 
 ## 3. Start the bridge
 
-Open omp and run:
+Run the guided setup in an interactive omp terminal:
+
+```text
+/telegram setup
+```
+
+Setup validates the configured token or asks for a new one, enables the bridge,
+walks through owner pairing, offers session topics when the bot supports them,
+and finishes with diagnostics.
+
+If setup completes, continue at [Use it](#use-it). The remaining numbered steps
+show the manual path.
+
+To configure it manually, run:
 
 ```text
 /telegram token <your-bot-token>
 /telegram on
 ```
 
-`/telegram on` keeps the bridge enabled for future omp sessions.
-
-With owner-DM topics enabled and no groups configured, `/telegram on` also
-starts a laptop-wide Bun daemon. It keeps polling when every omp session is
-closed, so a message to a saved session topic can resume that session. Other
-configurations use a live omp session as the poller.
+`/telegram on` keeps the bridge enabled for future omp sessions. With owner-DM
+topics enabled and no groups configured, it also starts a laptop-wide Bun
+daemon. The daemon keeps polling when every omp session is closed, so a message
+to a saved session topic can resume that session. Other configurations use a
+live omp session as the poller.
 
 ## 4. Pair your Telegram account
 
@@ -99,25 +111,33 @@ Inside **omp control**:
 /spawn                         Choose a herdr space and start another omp session
 /spawn new <branch> [space]    Create a worktree from a space and start omp
 /spawn dir <absolute-path>     Create a herdr workspace and start omp
-/sessions                      See live, unattached, and stale sessions
+/sessions                      See sessions and open a session card
 /cleanup                       Preview exited-session topics, then tap to delete (DM) or close (group); /cleanup go skips the tap
 /status                        Check the bridge
 /help                          Show Telegram commands
 ```
 
-Inside an omp session topic:
+Inside an owner-DM session topic, the paired owner can:
 
 - Send a normal message to talk to that session.
+- Use `/session` to see its state, model, thinking level, context use, pending
+  message state, and last activity. Its Refresh, Stop, Model, Thinking, and
+  Compact buttons act on that exact live session.
 - Use `/stop` to stop its current task.
 - Use `/compact [focus]` to compact that session's context.
 - Use `/model` and `/thinking` to change that session with inline pickers.
-- When omp needs a choice, the bot shows single-select, multi-select, and **Other**
-  controls directly in Telegram.
-- When omp waits more than two seconds for tool approval, the bot pings the
-  active session topic. Approval still happens at the terminal.
-- Send photos or files as normal Telegram attachments.
-- Voice notes are saved as attachments. To append a local transcript to the
-  agent prompt, configure a no-shell argv template:
+- Use `/retry` to resend failed reply parts.
+  `/retry uncertain` also resends parts that Telegram may already have accepted,
+  so it can duplicate a message.
+- When omp needs a choice, the bot shows single-select, multi-select, and
+  **Other** controls directly in Telegram.
+- Send photos or files as normal Telegram attachments. Photo albums arrive as
+  one omp request. If an attachment cannot be processed, the bot posts a
+  visible failure notice and still submits any usable text or caption.
+- Replies include quoted context from the Telegram message you answered.
+- Voice notes are saved as attachments. With transcription configured, a voice
+  note can also answer a pending free-text question. Configure a no-shell argv
+  template with:
 
   ```text
   /telegram set transcribeCommand ["whisper-cli","-f","{file}"]
@@ -125,8 +145,30 @@ Inside an omp session topic:
 - If its omp process was closed, send a normal message to queue it and resume
   the exact saved session in its original herdr space.
 
-Replies stream back while omp is working (unless the host is configured as a
-headless daemon — see below).
+If a message can't reach omp, the bridge replies to it with `failed` and the
+reason. `uncertain` means the session stopped during handoff and the turn may
+already have reached omp. The bridge never retries an uncertain handoff on its
+own, because that could duplicate the user turn.
+
+When delivery works, the bot reacts 👀 once omp takes your message and switches
+to 👍 when a reply reaches the chat. Telegram doesn't let bots react with a
+check mark, so 👍 stands in. Run `/telegram set deliveryStatus failures` to
+turn the reactions off. A config that already sets `ackReaction` keeps that
+emoji instead.
+
+To see progress on every message, run `/telegram set deliveryStatus all`. Each
+message then gets one status reply that the bridge edits in place: `received`
+when the bridge sees it, `queued` when it enters session routing, and
+`accepted` when omp takes the user turn, before any agent reply.
+
+Automatic final replies use a durable, 50-record outbox. Failed parts remain
+available for `/retry` while their record is retained. Run `/retry` in the
+owner's DM session topic. A group cannot grant control authority, so recover a
+group-hosted topic locally with
+`/telegram retry <chat_id> [thread_id] [uncertain]`.
+
+Replies stream back while omp is working unless the host uses the headless
+profile described below.
 
 ## Away mode (answer local runs from your phone)
 
@@ -199,6 +241,12 @@ Architecture decisions live in [`docs/adr/`](docs/adr/).
 ## Development
 
 ```bash
-bun install
+bun install --frozen-lockfile
 bun run check
+bun run check:host -- 18.1.16
+bun run check:host -- latest
+bun run smoke:package
 ```
+
+CI runs the locked dependency check, host compatibility against the minimum and
+latest omp versions, and a smoke check against the packed npm artifact.

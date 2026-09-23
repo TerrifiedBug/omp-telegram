@@ -225,6 +225,7 @@ export class TelegramPromptController {
   readonly #waitForPoll: (signal?: AbortSignal) => Promise<void>;
   readonly #alive: (pid: number) => boolean;
   readonly #pid: number;
+  readonly #resolveAnswer: ((message: TgMessage) => Promise<string | undefined>) | undefined;
 
   constructor(options: {
     callTelegram: TelegramCall;
@@ -234,6 +235,7 @@ export class TelegramPromptController {
     waitForPoll?: (signal?: AbortSignal) => Promise<void>;
     alive?: (pid: number) => boolean;
     pid?: number;
+    resolveAnswer?: (message: TgMessage) => Promise<string | undefined>;
   }) {
     this.#call = options.callTelegram;
     this.#authorize = options.authorize;
@@ -242,6 +244,7 @@ export class TelegramPromptController {
     this.#waitForPoll = options.waitForPoll ?? waitForPoll;
     this.#alive = options.alive ?? isAlive;
     this.#pid = options.pid ?? process.pid;
+    this.#resolveAnswer = options.resolveAnswer;
   }
 
   async ask(
@@ -419,14 +422,39 @@ export class TelegramPromptController {
         }
         return false;
       }
-      const customInput = (message.text ?? message.caption ?? "").trim();
-      if (!customInput) return true;
+      let customInput = (message.text ?? message.caption ?? "").trim();
+      if (!customInput && this.#resolveAnswer) {
+        try {
+          customInput = (await this.#resolveAnswer(message))?.trim() ?? "";
+        } catch (err) {
+          await this.#unsupportedAnswer(
+            message,
+            `I couldn't use that attachment as an answer: ${err instanceof Error ? err.message : String(err)}. Send text instead.`,
+          );
+          return true;
+        }
+      }
+      if (!customInput) {
+        await this.#unsupportedAnswer(message, "I couldn't use that attachment as an answer. Send text or a voice note instead.");
+        return true;
+      }
       const question = currentQuestion(request);
       const selected = request.selectedIndices.map((index) => question.options[index]!.label);
       await this.#completeQuestion(request, selected, customInput);
       return true;
     }
     return false;
+  }
+
+  async #unsupportedAnswer(message: TgMessage, text: string): Promise<void> {
+    await this.#call("sendMessage", {
+      chat_id: String(message.chat.id),
+      ...(message.is_topic_message && message.message_thread_id != null
+        ? { message_thread_id: message.message_thread_id }
+        : {}),
+      reply_parameters: { message_id: message.message_id },
+      text,
+    }).catch(() => undefined);
   }
 
   async pruneExpired(): Promise<number> {

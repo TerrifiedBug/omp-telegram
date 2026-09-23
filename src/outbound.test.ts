@@ -1,11 +1,29 @@
-import { afterEach, test, expect, describe, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, test, expect, describe, setSystemTime } from "bun:test";
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type Access, defaultAccess } from "./access";
-import { Outbound, assistantText, finalAssistantText, lastRunError } from "./outbound";
+import { Outbound, OutboundDeliveryError, assistantText, finalAssistantText, lastRunError } from "./outbound";
 import { mdToMarkdownV2 } from "./markdown";
 
 const assistant = (text: string): unknown => ({ role: "assistant", content: [{ type: "text", text }] });
 const toolResult = (): unknown => ({ role: "toolResult", content: [{ type: "text", text: "tool output" }] });
 const originalFetch = globalThis.fetch;
+const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
+let testStateDir: string;
+let scratchDir: string;
+beforeEach(() => {
+  testStateDir = mkdtempSync(join(tmpdir(), "omp-telegram-outbound-state-"));
+  scratchDir = mkdtempSync(join(tmpdir(), "omp-telegram-outbound-files-"));
+  process.env.OMP_TELEGRAM_STATE_DIR = testStateDir;
+});
+const outboxFiles = (): string[] => {
+  try {
+    return readdirSync(join(testStateDir, "outbox")).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+};
 /** Flush pending microtasks — the fetch double resolves without real I/O. */
 const flush = async (): Promise<void> => {
   for (let i = 0; i < 200; i++) await Promise.resolve();
@@ -14,6 +32,10 @@ const flush = async (): Promise<void> => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   setSystemTime();
+  rmSync(testStateDir, { recursive: true, force: true });
+  rmSync(scratchDir, { recursive: true, force: true });
+  if (previousStateDir == null) delete process.env.OMP_TELEGRAM_STATE_DIR;
+  else process.env.OMP_TELEGRAM_STATE_DIR = previousStateDir;
 });
 
 describe("assistantText", () => {
@@ -102,7 +124,7 @@ describe("Outbound.announce", () => {
       { chat_id: "42", text: "run failed: boom_bam", message_thread_id: 9 },
       { chat_id: "43", text: "run failed: boom_bam" },
     ]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 });
 
@@ -127,7 +149,7 @@ describe("Outbound Telegram delivery", () => {
       { method: "sendMessage", payload: { chat_id: "42", text: "hello\\_world", parse_mode: "MarkdownV2", message_thread_id: 7 } },
       { method: "sendMessage", payload: { chat_id: "42", text: "hello_world", message_thread_id: 7 } },
     ]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("finalizes an active topic turn into that same topic", async () => {
@@ -148,7 +170,7 @@ describe("Outbound Telegram delivery", () => {
     expect(calls.some((call) => call.method === "sendChatAction" && call.payload.message_thread_id === 9)).toBe(true);
     expect(calls.some((call) => call.method === "sendMessage" && call.payload.message_thread_id === 9 && call.payload.text === "done")).toBe(true);
     expect(outbound.isActive()).toBe(false);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("retries a tool send once in a replacement topic", async () => {
@@ -173,7 +195,7 @@ describe("Outbound Telegram delivery", () => {
     await expect(outbound.send("42", "answer", { threadId: 9 })).resolves.toEqual([30]);
     expect(recovered).toEqual([9]);
     expect(threads).toEqual([9, 10]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("rekeys active turn state before retrying final output", async () => {
@@ -200,7 +222,7 @@ describe("Outbound Telegram delivery", () => {
     expect(threads).toEqual([9, 10]);
     expect(outbound.lastTarget()).toEqual({ chatId: "42", threadId: 10 });
     await outbound.onAgentEnd();
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("streaming 'final' suppresses per-turn messages and sends only the run's final text", async () => {
@@ -226,7 +248,7 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onAgentEnd(finalAssistantText([assistant("step two"), assistant("the answer")]));
     expect(sent).toEqual(["the answer"]);
     expect(outbound.isActive()).toBe(false);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("streaming 'final' with no final text delivers nothing", async () => {
@@ -244,7 +266,7 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onTurnEnd(assistant("interim"));
     await outbound.onAgentEnd("");
     expect(sent).toEqual([]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("streaming 'explicit' sends nothing automatically — not per turn, not at the end", async () => {
@@ -271,7 +293,8 @@ describe("Outbound Telegram delivery", () => {
     expect(sent).toEqual([]);
     expect(methods.filter((m) => m !== "sendChatAction")).toEqual([]);
     expect(outbound.isActive()).toBe(false);
-    outbound.shutdown();
+    expect(outboxFiles()).toEqual([]);
+    await outbound.shutdown();
   });
 
   test("streaming 'explicit' still delivers an explicit send — the tool path is the whole point", async () => {
@@ -290,7 +313,7 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onTurnEnd(assistant("more internal work"));
     await outbound.onAgentEnd("tick complete");
     expect(sent).toEqual(["the answer"]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("profile 'daemon' forces explicit output over a stale streaming value", async () => {
@@ -310,7 +333,7 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onTurnEnd(assistant("step one"));
     await outbound.onAgentEnd("tick complete");
     expect(sent).toEqual([]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("a tick-shaped run (no inbound message) sends nothing whatever the mode", async () => {
@@ -328,7 +351,81 @@ describe("Outbound Telegram delivery", () => {
     await outbound.onTurnEnd(assistant("tick internals"));
     await outbound.onAgentEnd("tick complete");
     expect(sent).toEqual([]);
-    outbound.shutdown();
+    await outbound.shutdown();
+  });
+  test("preflights every attachment and reports confirmed partial uploads", async () => {
+    const first = join(scratchDir, "first.txt");
+    const second = join(scratchDir, "second.txt");
+    writeFileSync(first, "one");
+    let uploadCalls = 0;
+    globalThis.fetch = (async () => {
+      uploadCalls += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 70 + uploadCalls } }));
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"] }));
+    outbound.setToken("secret");
+    await expect(outbound.sendFiles("42", [first, second])).rejects.toThrow();
+    expect(uploadCalls).toBe(0);
+
+    writeFileSync(second, "two");
+    globalThis.fetch = (async () => {
+      uploadCalls += 1;
+      if (uploadCalls === 2) {
+        return new Response(JSON.stringify({ ok: false, error_code: 403, description: "forbidden" }));
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 71 } }));
+    }) as typeof fetch;
+    try {
+      await outbound.sendFiles("42", [first, second]);
+      throw new Error("expected the second upload to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(OutboundDeliveryError);
+      expect((error as OutboundDeliveryError).state).toBe("failed");
+      expect((error as OutboundDeliveryError).sentIds).toEqual([71]);
+      expect(String(error)).toContain("after 1 of 2 part(s)");
+    }
+    await outbound.shutdown();
+  });
+
+  test("transient draft errors recover and boundaries plus shutdown leave drafts to expire", async () => {
+    const drafts: Array<Record<string, unknown>> = [];
+    let draftAttempts = 0;
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      if (method === "sendMessageDraft") {
+        drafts.push(payload);
+        draftAttempts += 1;
+        if (draftAttempts === 1) {
+          return new Response(JSON.stringify({ ok: false, error_code: 500, description: "temporary" }));
+        }
+      }
+      return new Response(JSON.stringify({ ok: true, result: {} }));
+    }) as typeof fetch;
+
+    const outbound = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"] }));
+    outbound.setToken("secret");
+    setSystemTime(new Date(1_000_000));
+    outbound.markActive("42");
+    outbound.onMessageUpdate(assistant("first"));
+    await flush();
+    setSystemTime(new Date(1_001_000));
+    outbound.onMessageUpdate(assistant("second"));
+    await flush();
+    expect(drafts.map((draft) => draft.text)).toEqual(["first", "second"]);
+
+    // An empty sendMessageDraft shows Telegram's "Thinking…" placeholder, so
+    // neither boundary nor shutdown may send one.
+    await outbound.onSessionBoundary();
+    expect(drafts).toHaveLength(2);
+    setSystemTime(new Date(1_002_000));
+    outbound.markActive("42");
+    outbound.onMessageUpdate(assistant("third"));
+    await flush();
+    expect(drafts.at(-1)?.text).toBe("third");
+    await outbound.shutdown();
+    expect(drafts.map((draft) => draft.text)).toEqual(["first", "second", "third"]);
   });
 });
 
@@ -342,6 +439,106 @@ describe("Outbound long answers", () => {
   };
   /** Recorded Telegram text back to source form: drop MarkdownV2 escapes and the (i/n) label. */
   const unlabel = (text: string): string => text.replace(/\\/g, "").replace(/^\(\d+\/\d+\)\n/, "");
+
+  test("keeps failed final chunks across restart without retrying confirmed parts", async () => {
+    const source = prose(9000);
+    const firstRun: string[] = [];
+    const retryRun: string[] = [];
+    let stage: "fail" | "retry" = "fail";
+    let attempt = 0;
+    let messageId = 80;
+    globalThis.fetch = (async (url, init) => {
+      const method = String(url).split("/").pop()!;
+      if (method !== "sendMessage") {
+        return new Response(JSON.stringify({ ok: true, result: {} }));
+      }
+      const payload = JSON.parse(String(init?.body)) as { text: string };
+      (stage === "fail" ? firstRun : retryRun).push(payload.text);
+      attempt += 1;
+      if (stage === "fail" && attempt === 2) {
+        return new Response(JSON.stringify({ ok: false, error_code: 403, description: "forbidden" }));
+      }
+      return new Response(JSON.stringify({ ok: true, result: { message_id: ++messageId } }));
+    }) as typeof fetch;
+
+    const first = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: "final" }));
+    first.setToken("secret");
+    first.markActive("42");
+    await expect(first.onAgentEnd(source)).rejects.toMatchObject({
+      state: "failed",
+      sentIds: [81],
+      chatId: "42",
+    });
+    expect(first.isActive()).toBe(false);
+    expect(firstRun).toHaveLength(2);
+    expect(first.pendingDeliveries()).toEqual([{
+      chatId: "42",
+      state: "failed",
+      parts: 3,
+      unsent: 2,
+      updatedAt: expect.any(Number),
+    }]);
+    expect(outboxFiles()).toHaveLength(1);
+    await first.shutdown();
+
+    stage = "retry";
+    const restarted = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }));
+    restarted.setToken("secret");
+    expect(await restarted.retryFailed("42")).toEqual({ sent: 2, failed: 0, uncertain: 0 });
+    expect(retryRun).toHaveLength(2);
+    expect(retryRun).not.toContain(firstRun[0]);
+    expect(outboxFiles()).toEqual([]);
+    await restarted.shutdown();
+  });
+
+  test("requires explicit opt-in before retrying an ambiguous send", async () => {
+    globalThis.fetch = (async (url) => {
+      const method = String(url).split("/").pop()!;
+      if (method === "sendMessage") throw new TypeError("network timeout");
+      return new Response(JSON.stringify({ ok: true, result: {} }));
+    }) as typeof fetch;
+    const first = new Outbound(() => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }));
+    first.setToken("secret");
+    first.markActive("42");
+    await expect(first.onTurnEnd(assistant("answer"))).rejects.toMatchObject({ state: "uncertain", sentIds: [] });
+    expect(outboxFiles()).toHaveLength(1);
+    expect(first.pendingDeliveries()).toEqual([{
+      chatId: "42",
+      state: "uncertain",
+      parts: 1,
+      unsent: 1,
+      updatedAt: expect.any(Number),
+    }]);
+    await first.shutdown();
+
+    let retries = 0;
+    globalThis.fetch = (async (url) => {
+      if (String(url).endsWith("/sendMessage")) retries += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 91 } }));
+    }) as typeof fetch;
+    const warnings: string[] = [];
+    const restarted = new Outbound(
+      () => ({ ...defaultAccess(), allowFrom: ["42"], streaming: false }),
+      {
+        debug: () => {},
+        info: () => {},
+        warn: (message) => warnings.push(message),
+        error: () => {},
+      },
+    );
+    restarted.setToken("secret");
+    expect(await restarted.retryFailed("42")).toEqual({ sent: 0, failed: 0, uncertain: 1 });
+    expect(retries).toBe(0);
+    expect(await restarted.retryFailed("42", undefined, { includeUncertain: true })).toEqual({
+      sent: 1,
+      failed: 0,
+      uncertain: 1,
+    });
+    expect(retries).toBe(1);
+    expect(warnings.some((message) => message.includes("may already have accepted"))).toBe(true);
+    expect(outboxFiles()).toEqual([]);
+    await restarted.shutdown();
+  });
 
   test("a 9k answer is delivered whole, as labelled consecutive parts", async () => {
     const sent: string[] = [];
@@ -363,7 +560,7 @@ describe("Outbound long answers", () => {
     expect(sent.every((part) => part.length <= 4096)).toBe(true);
     expect(sent.map((part) => /^\\\((\d)\/(\d)\\\)\n/.exec(part)?.slice(1).join("/"))).toEqual(["1/3", "2/3", "3/3"]);
     expect(sent.map(unlabel).join("")).toBe(text);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("a short answer carries no part label", async () => {
@@ -378,7 +575,7 @@ describe("Outbound long answers", () => {
     outbound.setToken("secret");
     await outbound.send("42", "short answer");
     expect(sent).toEqual(["short answer"]);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("a rate-limited part is retried instead of dropping the rest of the answer", async () => {
@@ -416,7 +613,7 @@ describe("Outbound long answers", () => {
     expect(waits).toEqual([3250]);
     expect(sent.length).toBe(3);
     expect(sent.map(unlabel).join("")).toBe(text);
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 
   test("an overflowed stream turn reads as one numbered answer, delivered once", async () => {
@@ -450,7 +647,7 @@ describe("Outbound long answers", () => {
     // The head committed mid-stream is numbered too, once the total is known.
     expect(messages.map((m) => /^\\\((\d)\/(\d)\\\)\n/.exec(m)?.slice(1).join("/"))).toEqual(["1/3", "2/3", "3/3"]);
     expect(messages.map(unlabel).join("")).toBe(text); // every source char exactly once
-    outbound.shutdown();
+    await outbound.shutdown();
   });
 });
 
@@ -608,7 +805,7 @@ describe("Outbound rich Markdown", () => {
     expect(failed.calls.map((c) => c.method)).toEqual(["sendRichMessage", "sendMessage", "sendMessage"]);
   });
 
-  test("DM drafts finalize once as rich and clear the same draft in the same topic", async () => {
+  test("DM drafts finalize once as rich and send no draft after the reply", async () => {
     const source = table + "\n" + "report ".repeat(850);
     const w = wire();
     try {
@@ -617,13 +814,136 @@ describe("Outbound rich Markdown", () => {
       await w.outbound.onTurnEnd(assistant(source));
       await w.outbound.onAgentEnd(source);
       expect([...w.chat.values()]).toEqual([source]);
+      const methods = w.calls.map((c) => c.method);
       const drafts = w.calls.filter((c) => c.method === "sendMessageDraft");
-      expect(drafts).toHaveLength(2);
+      expect(drafts).toHaveLength(1);
       expect(drafts[0].payload.text).toBe(source.slice(-4096));
-      expect(drafts[1].payload).toEqual({ ...drafts[0].payload, text: "" });
+      // Any draft after the final send re-shows a stale preview under the reply.
+      expect(methods.lastIndexOf("sendMessageDraft")).toBeLessThan(methods.indexOf("sendRichMessage"));
       expect(drafts[0].payload.message_thread_id).toBe(9);
       expect(w.calls.filter((c) => c.method === "sendRichMessage")).toHaveLength(1);
-    } finally { w.outbound.shutdown(); }
+    } finally { await w.outbound.shutdown(); }
+  });
+
+  test("a partial update delivered after its turn ended cannot send a second, shorter reply", async () => {
+    // omp queues message_update for extensions without awaiting it, so a stale
+    // snapshot of an already-finalized message can arrive after turn_end.
+    const stamped = (text: string): unknown => ({ role: "assistant", content: [{ type: "text", text }], timestamp: 1_000 });
+    const w = wire({ richMessages: "off" });
+    try {
+      w.outbound.markActive("42", 9);
+      await w.outbound.onTurnEnd(stamped("Answer.\n\nStatus: done."));
+      w.outbound.onMessageUpdate(stamped("Answer."));
+      await flush();
+      await w.outbound.onAgentEnd("Answer.\n\nStatus: done.");
+      expect([...w.chat.values()]).toEqual([mdToMarkdownV2("Answer.\n\nStatus: done.")]);
+    } finally { await w.outbound.shutdown(); }
+  });
+
+  test("agent_end arriving while the turn_end send is in flight sends the reply once", async () => {
+    // Observed live: turn_end and agent_end handlers overlap, and the run-end
+    // flush re-sent the still-dirty turn (with the throttled partial preview).
+    const stamped = (text: string): unknown => ({ role: "assistant", content: [{ type: "text", text }], timestamp: 2_000 });
+    const w = wire({ richMessages: "off" });
+    try {
+      w.outbound.markActive("42", 9);
+      w.outbound.onMessageUpdate(stamped("Answer."));
+      const turnEnd = w.outbound.onTurnEnd(stamped("Answer.\n\nStatus: done."));
+      const agentEnd = w.outbound.onAgentEnd("Answer.\n\nStatus: done.");
+      await Promise.all([turnEnd, agentEnd]);
+      expect(w.calls.filter((c) => c.method === "sendMessage")).toHaveLength(1);
+      expect([...w.chat.values()]).toEqual([mdToMarkdownV2("Answer.\n\nStatus: done.")]);
+    } finally { await w.outbound.shutdown(); }
+  });
+
+  test("a seen message switches to replied only after a reply reaches its chat", async () => {
+    const reactions = (calls: Array<{ method: string; payload: { reaction?: unknown } }>): unknown[] =>
+      calls.filter((c) => c.method === "setMessageReaction").map((c) => c.payload.reaction);
+    const seen = [{ type: "emoji", emoji: "👀" }];
+    const replied = [{ type: "emoji", emoji: "👍" }];
+
+    const w = wire({ richMessages: "off", streaming: "final" });
+    try {
+      w.outbound.markActive("42", 9);
+      await w.outbound.markSeen("42", 9, 7);
+      await w.outbound.onAgentEnd("Answer.");
+      expect(reactions(w.calls)).toEqual([seen, replied]);
+      expect(w.calls.at(-1)?.payload).toMatchObject({ chat_id: "42", message_id: 7 });
+    } finally { await w.outbound.shutdown(); }
+
+    const failed = wire({ richMessages: "off", streaming: "final" }, ({ method }) => method === "sendMessage" ? rejected(403, "forbidden") : undefined);
+    try {
+      failed.outbound.markActive("42", 9);
+      await failed.outbound.markSeen("42", 9, 7);
+      await expect(failed.outbound.onAgentEnd("Answer.")).rejects.toThrow();
+      expect(reactions(failed.calls)).toEqual([seen]);
+    } finally { await failed.outbound.shutdown(); }
+  });
+
+  test("a slow seen reaction cannot land after the replied reaction", async () => {
+    // Telegram replaces a message's reactions, so 👀 finishing last would undo 👍.
+    const w = wire({ richMessages: "off", streaming: "final" });
+    const fastFetch = globalThis.fetch;
+    let releaseSeen!: () => void;
+    const seenGate = new Promise<void>((resolve) => (releaseSeen = resolve));
+    const settled: string[] = [];
+    globalThis.fetch = (async (url, init) => {
+      const payload = JSON.parse(String(init?.body)) as { reaction?: Array<{ emoji: string }> };
+      const emoji = payload.reaction?.[0]?.emoji;
+      if (emoji === "👀") await seenGate;
+      const response = await fastFetch(url, init);
+      if (emoji) settled.push(emoji);
+      return response;
+    }) as typeof fetch;
+    try {
+      w.outbound.markActive("42", 9);
+      void w.outbound.markSeen("42", 9, 7);
+      const end = w.outbound.onAgentEnd("Answer.");
+      await flush();
+      expect(settled).toEqual([]);
+      releaseSeen();
+      await end;
+      expect(settled).toEqual(["👀", "👍"]);
+    } finally { await w.outbound.shutdown(); }
+  });
+
+  test("replied lands at the answering turn, not only when a long run ends", async () => {
+    const emojis = (calls: Array<{ method: string; payload: { reaction?: Array<{ emoji: string }>; message_id?: number } }>) =>
+      calls.filter((c) => c.method === "setMessageReaction").map((c) => `${c.payload.message_id}:${c.payload.reaction?.[0]?.emoji}`);
+    const turn = (text: string, timestamp: number): unknown => ({ role: "assistant", content: [{ type: "text", text }], timestamp });
+    const w = wire({ richMessages: "off" });
+    try {
+      setSystemTime(new Date(1_000));
+      w.outbound.markActive("42", 9);
+      await w.outbound.markSeen("42", 9, 7);
+      // Message 8 arrives while the turn answering 7 (started at 2_000) streams.
+      setSystemTime(new Date(3_000));
+      await w.outbound.markSeen("42", 9, 8);
+      await w.outbound.onTurnEnd(turn("Answer to 7.", 2_000));
+      expect(emojis(w.calls)).toEqual(["7:👀", "8:👀", "7:👍"]);
+
+      await w.outbound.onTurnEnd(turn("Answer to 8.", 4_000));
+      expect(emojis(w.calls)).toEqual(["7:👀", "8:👀", "7:👍", "8:👍"]);
+      await w.outbound.onAgentEnd("Answer to 8.");
+      expect(emojis(w.calls)).toHaveLength(4);
+    } finally { await w.outbound.shutdown(); }
+  });
+
+  test("a message that arrives after the last reply keeps 👀 when the run ends", async () => {
+    const w = wire({ richMessages: "off" });
+    try {
+      setSystemTime(new Date(1_000));
+      w.outbound.markActive("42", 9);
+      await w.outbound.markSeen("42", 9, 7);
+      await w.outbound.onTurnEnd({ role: "assistant", content: [{ type: "text", text: "Answer to 7." }], timestamp: 2_000 });
+      setSystemTime(new Date(5_000));
+      await w.outbound.markSeen("42", 9, 8);
+      await w.outbound.onAgentEnd("Answer to 7.");
+      const reactions = w.calls
+        .filter((c) => c.method === "setMessageReaction")
+        .map((c) => `${c.payload.message_id}:${(c.payload as { reaction?: Array<{ emoji: string }> }).reaction?.[0]?.emoji}`);
+      expect(reactions).toEqual(["7:👀", "7:👍", "8:👀"]);
+    } finally { await w.outbound.shutdown(); }
   });
 
   test("overflowed group previews retain every segment once with final rich labels", async () => {
@@ -646,7 +966,7 @@ describe("Outbound rich Markdown", () => {
       expect(messages.some((m) => m.includes("▍"))).toBe(false);
       expect(w.calls.filter((c) => c.method === "sendMessage")).toHaveLength(1);
       expect(w.calls.filter((c) => c.payload.rich_message).every((c) => !c.payload.text && !c.payload.parse_mode)).toBe(true);
-    } finally { w.outbound.shutdown(); }
+    } finally { await w.outbound.shutdown(); }
   });
 
   test("rich edit rejection falls back in place and not-modified never strips formatting", async () => {
@@ -667,7 +987,7 @@ describe("Outbound rich Markdown", () => {
         const edits = w.calls.filter((c) => c.method === "editMessageText");
         expect(edits).toHaveLength(error === "not modified" ? 1 : 2);
         if (error !== "not modified") expect([...w.chat.values()]).toEqual([mdToMarkdownV2(table)]);
-      } finally { w.outbound.shutdown(); }
+      } finally { await w.outbound.shutdown(); }
     }
   });
 
@@ -688,7 +1008,7 @@ describe("Outbound rich Markdown", () => {
         expect([...w.chat.values()]).toEqual([richRejected ? mdToMarkdownV2(table) : table]);
         expect(w.calls.at(-1)?.payload.message_thread_id).toBe(10);
         expect(w.calls.filter((c) => c.method === "sendRichMessage")).toHaveLength(richRejected ? 1 : 2);
-      } finally { w.outbound.shutdown(); }
+      } finally { await w.outbound.shutdown(); }
     }
   });
 
@@ -704,7 +1024,7 @@ describe("Outbound rich Markdown", () => {
         await w.outbound.send("42", table);
         expect([...w.chat.values()]).toEqual([table]);
         expect(w.calls.at(-1)?.method).toBe("sendRichMessage");
-      } finally { w.outbound.shutdown(); }
+      } finally { await w.outbound.shutdown(); }
     }
     const boundary = wire({ richMessages: "on" });
     try {
@@ -713,6 +1033,6 @@ describe("Outbound rich Markdown", () => {
       await boundary.outbound.onSessionBoundary();
       expect([...boundary.chat.values()]).toEqual([table]);
       expect(boundary.calls.some((c) => c.payload.rich_message || c.payload.parse_mode)).toBe(false);
-    } finally { boundary.outbound.shutdown(); }
+    } finally { await boundary.outbound.shutdown(); }
   });
 });

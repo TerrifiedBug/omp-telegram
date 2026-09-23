@@ -102,6 +102,17 @@ describe("mdToMarkdownV2 correctness", () => {
   test("markdown link keeps its structure", () => {
     expect(mdToMarkdownV2("[the label](https://example.com/p.q)")).toBe("[the label](https://example.com/p.q)");
   });
+
+  test("a link nested in bold keeps its label and URL (#82)", () => {
+    expect(mdToMarkdownV2("- **[Working Copy](https://workingcopy.app/manual.html)**: a native Git client")).toBe(
+      "\\- *[Working Copy](https://workingcopy.app/manual.html)*: a native Git client",
+    );
+  });
+
+  test("literal private-use text is never treated as a placeholder", () => {
+    const literal = "\uE0000\uE001";
+    expect(mdToMarkdownV2(`${literal} **bold**`)).toBe(`${literal} *bold*`);
+  });
 });
 
 describe("mdToMarkdownV2 safety (never throws)", () => {

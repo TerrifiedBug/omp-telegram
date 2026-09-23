@@ -7,8 +7,8 @@ import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Access } from "./access";
-import { controlTopicTarget, isPairedOwnerDm, messageLimit, pairedOwnerId } from "./access";
-import { type TgCallbackQuery, type TgMessage, withRateLimit } from "./api";
+import { controlTopicTarget, isPairedOwnerDm, messageLimit, pairedOwnerId, updateAccess } from "./access";
+import { isMissingThreadError, type TgCallbackQuery, type TgMessage, withRateLimit } from "./api";
 import { chunkLabeled } from "./markdown";
 import type { ThreadEntry, ThreadRegistry } from "./topics";
 
@@ -421,6 +421,14 @@ export async function sendCommandMessage(options: CommandMessageOptions): Promis
   } catch (err) {
     warn(`command reply failed: ${String(err)}`);
     if (!control) return undefined;
+    // The owner deleted omp control. Forget it so the next inbound update
+    // creates a fresh one (handleUpdate recreates a missing control topic);
+    // this reply falls back to where the command was typed.
+    if (isMissingThreadError(err)) {
+      updateAccess((fresh) => {
+        if (fresh.controlThreadId === control.threadId) fresh.controlThreadId = undefined;
+      }, warn);
+    }
     try {
       return await deliver(origin);
     } catch (fallbackErr) {

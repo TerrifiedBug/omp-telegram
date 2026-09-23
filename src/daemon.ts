@@ -12,6 +12,7 @@ import { delimiter, join } from "node:path";
 import {
   type Access,
   canAnswerPrompt,
+  effectiveDeliveryStatus,
   ensureStateDir,
   loadAccess,
   pairedOwnerId,
@@ -21,7 +22,9 @@ import {
 import { acquireLock, type LockOwner, type Logger, Poller, readLockOwner, releaseLock, startLockHeartbeat, tg, webhookConflictHint } from "./api";
 import { type BridgeHost, ensureControlTopic, handleUpdate, syncBotCommands } from "./bridge";
 import { SpawnController } from "./control";
+import { DeliveryReporter } from "./delivery";
 import { TelegramPromptController } from "./prompts";
+import { SessionCardController } from "./session-status";
 import { isAlive } from "./topics";
 
 export interface DaemonState {
@@ -311,6 +314,12 @@ export async function runDaemon(): Promise<void> {
       }
 
       const callTelegram = <T>(method: string, payload: Record<string, unknown>): Promise<T> => tg<T>(token, method, payload);
+      const deliveries = new DeliveryReporter(callTelegram, () => effectiveDeliveryStatus(loadAccess(log.warn)) === "all", log);
+      const sessionCards = new SessionCardController({
+        getAccess: () => loadAccess(log.warn),
+        callTelegram,
+        warn: log.warn,
+      });
       const spawnController = new SpawnController({ getAccess: () => loadAccess(log.warn), callTelegram, warn: log.warn });
       const promptController = new TelegramPromptController({
         callTelegram,
@@ -329,6 +338,8 @@ export async function runDaemon(): Promise<void> {
         log,
         spawnController,
         promptController,
+        sessionCards,
+        reportDelivery: (message, state, detail) => deliveries.report(message, state, detail),
       };
 
       await syncBotCommands(callTelegram, pairedOwnerId(loadAccess(log.warn))).catch(() => {});

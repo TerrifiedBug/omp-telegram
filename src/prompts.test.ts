@@ -59,6 +59,21 @@ function textMessage(text: string, from = 42): TgMessage {
   };
 }
 
+function attachmentMessage(
+  attachment: Pick<TgMessage, "voice" | "document">,
+  from = 42,
+): TgMessage {
+  return {
+    message_id: 501,
+    date: 1,
+    from: { id: from },
+    chat: { id: 42, type: "private" },
+    is_topic_message: true,
+    message_thread_id: 7,
+    ...attachment,
+  };
+}
+
 function waitForTestPoll(signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   return new Promise<void>((resolve) => {
@@ -175,6 +190,81 @@ describe("TelegramPromptController", () => {
     await expect(pending).resolves.toEqual({
       status: "answered",
       answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "tidy-first, then build" }],
+    });
+  });
+
+  test("uses a resolved voice-note transcript as the pending free-text answer", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: (id) => id === "42", nonce: () => "voice", waitForPoll: waitForTestPoll });
+    let resolutions = 0;
+    const poller = new TelegramPromptController({
+      callTelegram: telegram(),
+      authorize: (id) => id === "42",
+      resolveAnswer: async () => {
+        resolutions += 1;
+        return "transcribed voice answer";
+      },
+    });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("voice");
+
+    const voice = { file_id: "voice-file", file_unique_id: "voice-unique" };
+    expect(await poller.handleMessage(attachmentMessage({ voice }, 99))).toBe(false);
+    expect(resolutions).toBe(0);
+    expect(await poller.handleMessage(attachmentMessage({ voice }))).toBe(true);
+    await advancePromptPoll();
+
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "transcribed voice answer" }],
+    });
+    expect(resolutions).toBe(1);
+  });
+
+  test("keeps the prompt open and gives visible feedback for an unsupported attachment", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "attachment", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({
+      callTelegram: telegram(),
+      authorize: () => true,
+      resolveAnswer: async () => undefined,
+    });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("attachment");
+
+    const document = { file_id: "doc-file", file_unique_id: "doc-unique", file_name: "answer.pdf" };
+    expect(await poller.handleMessage(attachmentMessage({ document }))).toBe(true);
+    const feedback = calls.filter((call) => call.method === "sendMessage").at(-1);
+    expect(feedback?.payload.text).toContain("couldn't use that attachment as an answer");
+    expect(feedback?.payload.reply_parameters).toEqual({ message_id: 501 });
+
+    expect(await poller.handleMessage(textMessage("use the text answer"))).toBe(true);
+    await advancePromptPoll();
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "use the text answer" }],
+    });
+  });
+
+  test("reports voice resolver failures and keeps waiting for a text answer", async () => {
+    const owner = new TelegramPromptController({ callTelegram: telegram(), authorize: () => true, nonce: () => "voice-failure", waitForPoll: waitForTestPoll });
+    const poller = new TelegramPromptController({
+      callTelegram: telegram(),
+      authorize: () => true,
+      resolveAnswer: async () => { throw new Error("transcriber offline"); },
+    });
+    const pending = owner.ask(target, [{ id: "call", question: "What's your call?", options: [] }]);
+    await waitForRequest("voice-failure");
+
+    const voice = { file_id: "voice-file", file_unique_id: "voice-unique" };
+    expect(await poller.handleMessage(attachmentMessage({ voice }))).toBe(true);
+    const feedback = calls.filter((call) => call.method === "sendMessage").at(-1);
+    expect(feedback?.payload.text).toContain("transcriber offline");
+    expect(feedback?.payload.text).toContain("Send text instead");
+
+    expect(await poller.handleMessage(textMessage("fallback answer"))).toBe(true);
+    await advancePromptPoll();
+    await expect(pending).resolves.toEqual({
+      status: "answered",
+      answers: [{ id: "call", question: "What's your call?", selectedOptions: [], customInput: "fallback answer" }],
     });
   });
 

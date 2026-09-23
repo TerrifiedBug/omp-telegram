@@ -9,7 +9,7 @@ import {
   isPairedOwnerDm,
   loadAccess,
   pairedOwnerId,
-  saveAccess,
+  updateAccess,
 } from "./access";
 import { isMissingThreadError, type Logger, type TgCallbackQuery, TgError, type TgMessage, type TgUpdate } from "./api";
 import {
@@ -20,7 +20,9 @@ import {
   resumeOmp,
   sendCommandMessage,
 } from "./control";
+import type { DeliveryState } from "./delivery";
 import type { TelegramPromptController } from "./prompts";
+import { parseSessionCardCallbackId, type SessionCardController } from "./session-status";
 import {
   DM_ROUTE_KEY,
   type StaleTopic,
@@ -77,10 +79,12 @@ const COMMANDS: CommandSpec[] = [
       "/cleanup go [<id>… | never-ran] — skip the preview, optionally for a subset",
     ],
   },
+  { command: "session", description: "Show this omp session", scope: "session", help: ["/session — show and control this omp session"] },
   { command: "stop", description: "Abort this topic's omp task", scope: "session", help: ["/stop — abort this topic’s current task"] },
   { command: "compact", description: "Compact this session's context", scope: "session", help: ["/compact [focus] — compact this session’s context"] },
   { command: "model", description: "Show or change this session's model", scope: "session", help: ["/model [provider/id] — show or change this session’s model"] },
   { command: "thinking", description: "Show or change thinking level", scope: "session", help: ["/thinking [level] — show or change thinking level"] },
+  { command: "retry", description: "Retry failed Telegram delivery", scope: "session", help: ["/retry — retry failed outbound messages for this session"] },
   { command: "status", description: "Bridge and session health", scope: "global", help: ["/status — bridge and session health"] },
   { command: "help", description: "Show available commands", scope: "global" },
   { command: "whoami", description: "Show your Telegram IDs", scope: "global", help: ["/whoami — show Telegram IDs"] },
@@ -155,7 +159,13 @@ export interface BridgeHost {
   sessionIdentity?(): { sessionId?: string; sessionFile?: string };
   /** Liveness probe seam; defaults to isAlive. */
   alive?(pid: number): boolean;
-  handleSessionCommand?(msg: TgMessage, parsed: { name: string; args: string }): Promise<boolean>;
+  handleSessionCommand?(
+    msg: TgMessage,
+    parsed: { name: string; args: string },
+    options?: { cardAction?: boolean },
+  ): Promise<boolean>;
+  sessionCards?: Pick<SessionCardController, "sendList" | "handleMessage" | "handleCallback">;
+  reportDelivery?(msg: TgMessage, state: DeliveryState, detail?: string): Promise<void>;
   deliverLocal?(msg: TgMessage): Promise<void>;
   /** Test seam for the external herdr resume side effect. */
   resumeTopic?(msg: TgMessage, threadId: number, entry: ThreadEntry): Promise<void>;
@@ -224,10 +234,13 @@ export async function ensureControlTopic(host: BridgeHost): Promise<void> {
       chat_id: ownerId,
       name: "omp control",
     });
-    const fresh = loadAccess(host.warn);
-    if (pairedOwnerId(fresh) !== ownerId || fresh.topicsChat !== ownerId || fresh.controlThreadId != null) return;
-    fresh.controlThreadId = topic.message_thread_id;
-    saveAccess(fresh);
+    let claimed = false;
+    updateAccess((fresh) => {
+      if (pairedOwnerId(fresh) !== ownerId || fresh.topicsChat !== ownerId || fresh.controlThreadId != null) return;
+      fresh.controlThreadId = topic.message_thread_id;
+      claimed = true;
+    }, host.warn);
+    if (!claimed) return;
     await host.callTelegram("sendMessage", {
       chat_id: ownerId,
       message_thread_id: topic.message_thread_id,
@@ -584,11 +597,14 @@ export async function handleGlobalCommand(
     if (!owner) {
       await commandReply(host, access, msg, "Pair this DM locally before using control commands.");
     } else {
+      let text: string;
       try {
-        await commandReply(host, access, msg, formatSessions(await listControlSpaces(), loadRegistry(host.warn), isAlive));
+        text = formatSessions(await listControlSpaces(), loadRegistry(host.warn), isAlive);
       } catch (err) {
-        await commandReply(host, access, msg, `Cannot list omp sessions: ${err instanceof Error ? err.message : String(err)}`);
+        text = `Cannot list omp sessions: ${err instanceof Error ? err.message : String(err)}`;
       }
+      if (host.sessionCards) await host.sessionCards.sendList(msg, text);
+      else await commandReply(host, access, msg, text);
     }
   } else if (command === "cleanup") {
     const selection = parseCleanupArgs(args);
@@ -666,9 +682,34 @@ export async function handleGlobalCommand(
   return true;
 }
 
-async function deliverToSession(host: BridgeHost, msg: TgMessage, parsed: { name: string; args: string } | undefined): Promise<void> {
-  if (msg.chat.type === "private" && parsed && host.handleSessionCommand && (await host.handleSessionCommand(msg, parsed))) return;
-  if (host.deliverLocal) await host.deliverLocal(msg);
+async function deliverToSession(
+  host: BridgeHost,
+  msg: TgMessage,
+  parsed: { name: string; args: string } | undefined,
+  cardAction = false,
+): Promise<void> {
+  if (parsed && host.sessionCards && (await host.sessionCards.handleMessage(msg, parsed, host.sessionIdentity?.()))) return;
+  if (
+    parsed &&
+    host.handleSessionCommand &&
+    (await host.handleSessionCommand(msg, parsed, cardAction ? { cardAction: true } : undefined))
+  ) return;
+  if (!host.deliverLocal) return;
+  const directDelivery = !msg.bridge_callback_id && msg.bridge_status_id == null;
+  if (directDelivery) await reportDelivery(host, msg, "received");
+  try {
+    await host.deliverLocal(msg);
+  } catch (err) {
+    if (!msg.bridge_callback_id) {
+      await reportDelivery(
+        host,
+        msg,
+        "failed",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    throw err;
+  }
 }
 
 async function handleDaemonSessionCommand(host: BridgeHost, access: Access, msg: TgMessage, parsed: { name: string }): Promise<boolean> {
@@ -692,36 +733,131 @@ async function handleDaemonSessionCommand(host: BridgeHost, access: Access, msg:
   return true;
 }
 
+async function reportDelivery(host: BridgeHost, msg: TgMessage, state: DeliveryState, detail?: string): Promise<void> {
+  if (!host.reportDelivery) return;
+  try {
+    await host.reportDelivery(msg, state, detail);
+  } catch (err) {
+    host.log.warn(`[telegram] delivery report failed: ${String(err)}`);
+  }
+}
+
+async function spoolMessage(
+  host: BridgeHost,
+  route: number | typeof DM_ROUTE_KEY,
+  msg: TgMessage,
+  trackDelivery: boolean,
+  failureText: string,
+): Promise<boolean> {
+  if (trackDelivery) {
+    await reportDelivery(host, msg, "received");
+    // Publish queued before making the payload visible. A fast consumer in
+    // another process can report accepted as soon as writeRouted returns.
+    await reportDelivery(host, msg, "queued");
+  }
+  try {
+    writeRouted(route, msg);
+  } catch (err) {
+    host.log.warn(`[telegram] route write failed: ${String(err)}`);
+    if (trackDelivery) await reportDelivery(host, msg, "failed", "The bridge could not persist the message.");
+    // When the status message exists, its failed edit is the fail-closed notice;
+    // send a standalone notice only when no editable status was established.
+    if (!trackDelivery || msg.bridge_status_id == null) {
+      await host.callTelegram("sendMessage", {
+        chat_id: String(msg.chat.id),
+        ...(msg.is_topic_message && msg.message_thread_id != null ? { message_thread_id: msg.message_thread_id } : {}),
+        text: failureText,
+      }).catch(() => undefined);
+    }
+    return false;
+  }
+  return true;
+}
+
 /** Route one Bot API update through the shared control/topic bridge. */
-export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<void> {
+export async function handleUpdate(
+  host: BridgeHost,
+  update: TgUpdate,
+  options: { routed?: boolean } = {},
+): Promise<void> {
+  const access = loadAccess(host.warn);
   if (update.callback_query) {
+    // Disabling DMs turns off every private inbound interaction, including
+    // prompt/card buttons, without stopping the poller or affecting groups.
+    if (update.callback_query.message?.chat.type === "private" && access.dmPolicy === "disabled") {
+      // Refuse the action, but answer the query: an unanswered callback leaves
+      // the button spinning in the client until Telegram times it out.
+      await answerCallback(host, update.callback_query.id, "Direct-message handling is disabled.", true);
+      return;
+    }
     if (await host.promptController.handleCallback(update.callback_query)) return;
+    if (host.sessionCards && (await host.sessionCards.handleCallback(update.callback_query))) return;
     if (await handleCleanupCallback(host, update.callback_query)) return;
     await host.spawnController.handleCallback(update.callback_query);
     return;
   }
   const source = update.message ?? update.edited_message;
   if (!source || source.from?.is_bot) return;
+  if (source.chat.type === "private" && access.dmPolicy === "disabled") {
+    if (options.routed) await reportDelivery(host, source, "failed", "Direct-message delivery was disabled before the session accepted it.");
+    return;
+  }
   const edited = update.message == null;
   const msg = edited ? { ...source, edited_flag: true as const } : source;
-  const access = loadAccess(host.warn);
+  let routedCardAction = false;
+  if (options.routed) {
+    const cardTarget = parseSessionCardCallbackId(msg.bridge_callback_id);
+    if (cardTarget) {
+      const identity = host.sessionIdentity?.();
+      const ownerId = pairedOwnerId(access);
+      const chatId = String(msg.chat.id);
+      const exactSession =
+        cardTarget.originPrivate &&
+        access.dmPolicy !== "disabled" &&
+        ownerId != null &&
+        String(msg.from?.id ?? "") === ownerId &&
+        cardTarget.pid === host.selfPid &&
+        identity?.sessionId === cardTarget.sessionId &&
+        chatId === cardTarget.chatId &&
+        msg.message_thread_id === cardTarget.threadId &&
+        (cardTarget.threadId == null || host.ownThreadId() === cardTarget.threadId) &&
+        (cardTarget.threadId == null ? chatId === ownerId : access.topicsChat === chatId) &&
+        (msg.chat.type === "private" ? chatId === ownerId : Object.hasOwn(access.groups, chatId));
+      if (!exactSession) throw new Error("session card target or authorization changed before command dispatch");
+      routedCardAction = true;
+    }
+  }
   if (access.controlThreadId == null && access.topicsChat === pairedOwnerId(access)) {
     await ensureControlTopic(host).catch((err) => host.warn(`could not create control topic: ${String(err)}`));
   }
-  if (await host.promptController.handleMessage(msg)) return;
+  if (!routedCardAction && (await host.promptController.handleMessage(msg))) return;
 
   const parsed = edited ? undefined : parseBotCommand(msg.text ?? "");
-  if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name)) return;
-  if (msg.chat.type === "private" && parsed && Object.hasOwn(GLOBAL_COMMANDS, parsed.name) && (await handleGlobalCommand(host, msg, parsed))) return;
+  if (parsed && consumeOutsidePrivateChat(msg.chat.type, parsed.name) && !routedCardAction) return;
+  if (
+    msg.chat.type === "private" &&
+    parsed &&
+    Object.hasOwn(GLOBAL_COMMANDS, parsed.name) &&
+    (await handleGlobalCommand(host, msg, parsed))
+  ) return;
 
   const aliveFn = host.alive ?? isAlive;
   const registry = loadRegistry(host.warn);
-  const route = access.topicsChat ? decideRoute(msg, access.topicsChat, registry, host.selfPid, aliveFn) : { kind: "untopiced" as const };
+  const route = access.topicsChat
+    ? decideRoute(msg, access.topicsChat, registry, host.selfPid, aliveFn)
+    : { kind: "untopiced" as const };
   if (route.kind !== "untopiced") {
     const threadId = msg.message_thread_id;
-    const result = gate(msg, host.botUsername(), access);
-    if (result.action === "drop") return;
+    const result = routedCardAction ? { action: "allow" as const } : gate(msg, host.botUsername(), access);
+    if (result.action === "drop") {
+      if (options.routed) await reportDelivery(host, msg, "failed", "The message is no longer authorized for this session.");
+      return;
+    }
     if (result.action === "pair") {
+      if (options.routed) {
+        await reportDelivery(host, msg, "failed", "The message is no longer authorized for this session.");
+        return;
+      }
       const lead = result.isResend ? "Still pending" : "Pairing required";
       await host.callTelegram("sendMessage", {
         chat_id: String(msg.chat.id),
@@ -731,28 +867,28 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
       return;
     }
     if (route.kind === "forward") {
-      try {
-        writeRouted(route.threadId, msg);
-      } catch (err) {
-        host.log.warn(`[telegram] route write failed: ${String(err)}`);
-        await deliverToSession(host, msg, parsed);
-      }
+      if (options.routed) throw new Error("session route ownership changed before delivery");
+      await spoolMessage(
+        host,
+        route.threadId,
+        msg,
+        parsed == null,
+        "Could not queue this message for its omp session. It was not delivered; retry after checking the bridge state directory.",
+      );
       return;
     }
     if (route.kind === "unowned") {
+      if (options.routed) throw new Error("session route no longer has a live owner");
       const entry = registry.threads[String(route.threadId)];
       if (canAutoResumeTopic(msg, access, entry, parsed?.name)) {
-        try {
-          writeRouted(route.threadId, msg);
-        } catch (err) {
-          host.log.warn(`[telegram] resume queue write failed: ${String(err)}`);
-          await host.callTelegram("sendMessage", {
-            chat_id: String(msg.chat.id),
-            message_thread_id: route.threadId,
-            text: "Could not queue this message, so the session was not resumed.",
-          }).catch(() => {});
-          return;
-        }
+        const queued = await spoolMessage(
+          host,
+          route.threadId,
+          msg,
+          parsed == null,
+          "Could not queue this message, so the session was not resumed.",
+        );
+        if (!queued) return;
         if (!resumingTopics.has(route.threadId)) {
           resumingTopics.add(route.threadId);
           const resume = host.resumeTopic
@@ -775,8 +911,21 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
       }).catch(() => {});
       return;
     }
-    await deliverToSession(host, msg, parsed);
-    return;
+    if (route.kind === "local") {
+      if (parsed || options.routed) {
+        await deliverToSession(host, msg, parsed, routedCardAction);
+      } else {
+        if (threadId == null) throw new Error("local topic route is missing its thread id");
+        await spoolMessage(
+          host,
+          threadId,
+          msg,
+          true,
+          "Could not queue this message for its omp session. It was not delivered; retry after checking the bridge state directory.",
+        );
+      }
+      return;
+    }
   }
 
   const owner = msg.chat.type === "private" ? loadDmOwner(host.warn) : undefined;
@@ -790,16 +939,24 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
 
   if (msg.chat.type === "private" && parsed && !foreignOwner) {
     if (host.isDaemon && (await handleDaemonSessionCommand(host, access, msg, parsed))) return;
-    if (!host.isDaemon && host.handleSessionCommand && (await host.handleSessionCommand(msg, parsed))) return;
+    if (!host.isDaemon && Object.hasOwn(SESSION_COMMANDS, parsed.name)) {
+      await deliverToSession(host, msg, parsed, routedCardAction);
+      return;
+    }
   }
-  const result = gate(msg, host.botUsername(), access);
+  const result = routedCardAction ? { action: "allow" as const } : gate(msg, host.botUsername(), access);
   if (result.action === "drop") {
+    if (options.routed) await reportDelivery(host, msg, "failed", "The message is no longer authorized for this session.");
     if (msg.chat.type !== "private" && !(String(msg.chat.id) in access.groups)) {
       host.log.debug(`[telegram] ignored message from unconfigured group ${msg.chat.id} (${(msg.chat.title ?? "").replace(/[<>[\]\r\n;"]/g, "_")})`);
     }
     return;
   }
   if (result.action === "pair") {
+    if (options.routed) {
+      await reportDelivery(host, msg, "failed", "The message is no longer authorized for this session.");
+      return;
+    }
     const lead = result.isResend ? "Still pending" : "Pairing required";
     await host.callTelegram("sendMessage", {
       chat_id: String(msg.chat.id),
@@ -808,25 +965,20 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
     return;
   }
   if (foreignOwner) {
+    if (options.routed) throw new Error("DM owner changed before delivery");
     if (aliveFn(foreignOwner.pid)) {
-      try {
-        writeRouted(DM_ROUTE_KEY, msg);
-      } catch (err) {
-        host.log.warn(`[telegram] dm route write failed: ${String(err)}`);
-        await host
-          .callTelegram("sendMessage", {
-            chat_id: String(msg.chat.id),
-            text: "Could not queue this message for the pinned DM owner session — check the bridge state directory.",
-          })
-          .catch(() => {});
-      }
+      await spoolMessage(
+        host,
+        DM_ROUTE_KEY,
+        msg,
+        parsed == null,
+        "Could not queue this message for the pinned DM owner session. It was not delivered; retry after checking the bridge state directory.",
+      );
     } else {
-      await host
-        .callTelegram("sendMessage", {
-          chat_id: String(msg.chat.id),
-          text: `Direct messages are pinned to omp session "${foreignOwner.name}" (${foreignOwner.sessionFile ?? foreignOwner.sessionId ?? `pid ${foreignOwner.pid}`}), which is not running. Resume it, or run /telegram own in the session that should receive DMs.`,
-        })
-        .catch(() => {});
+      await host.callTelegram("sendMessage", {
+        chat_id: String(msg.chat.id),
+        text: `Direct messages are pinned to omp session "${foreignOwner.name}" (${foreignOwner.sessionFile ?? foreignOwner.sessionId ?? `pid ${foreignOwner.pid}`}), which is not running. Resume it, or run /telegram own in the session that should receive DMs.`,
+      }).catch(() => {});
     }
     return;
   }
@@ -840,5 +992,15 @@ export async function handleUpdate(host: BridgeHost, update: TgUpdate): Promise<
     );
     return;
   }
-  if (host.deliverLocal) await host.deliverLocal(msg);
+  if (ownerIsSelf && !options.routed) {
+    await spoolMessage(
+      host,
+      DM_ROUTE_KEY,
+      msg,
+      parsed == null,
+      "Could not queue this message for this omp session. It was not delivered; retry after checking the bridge state directory.",
+    );
+    return;
+  }
+  await deliverToSession(host, msg, parsed, routedCardAction);
 }

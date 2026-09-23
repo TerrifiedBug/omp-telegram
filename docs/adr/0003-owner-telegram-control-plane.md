@@ -1,10 +1,18 @@
 # Owner-only Telegram commands control herdr from the poll-lock holder
 
+## Status
+
+Active, with its standalone-relay decision superseded. Eligible owner-DM topic
+deployments now use a laptop-wide daemon that can poll and auto-resume a saved
+session after every omp session exits. Other configurations still use the
+session poller fallback. ADR 0005 extends the owner control plane with session
+cards.
+
 Telegram exposes a small control plane for the sole paired operator. In an
 owner-DM topics setup, the bridge creates one persistent `omp control` topic;
 global command results and interactive pickers live there instead of inside an
-agent conversation. The poll-lock-holding omp process handles those commands
-before session-topic routing: `/spawn` lists open herdr spaces and starts omp in
+agent conversation. The poll-lock holder handles those commands before
+session-topic routing. `/spawn` lists open herdr spaces and starts omp in
 a new unfocused tab; `/sessions` compares herdr processes with Telegram topic
 claims; `/cleanup` tidies the topics of exited (stale) sessions after an explicit
 `/cleanup go` — deleting them in a DM host, closing them (history kept) in a forum
@@ -33,10 +41,10 @@ natural language as decided in ADR 0001.
 - **Telegram Mini App** — rejected because a short list and confirmation need no
   hosted frontend, web authentication, deployment, or additional state model.
   Reconsider only for large searchable catalogs or rich launch configuration.
-- **Standalone always-on relay** — deferred. Existing sessions retry the poll
-  lock every 30 seconds, so the bridge fails over while any omp process remains.
-  A relay becomes worthwhile only if Telegram must cold-start herdr when zero omp
-  sessions are alive.
+- The original standalone relay option was deferred. The current implementation
+  supersedes that choice with a standalone daemon for enabled owner-DM topic
+  deployments that have no configured groups. The daemon can cold-start an
+  exact saved session through its topic.
 - **Relay arbitrary omp slash commands** — rejected by ADR 0001. Control commands
   operate herdr/bridge state; they do not expand prompts or inject command text.
 
@@ -47,17 +55,20 @@ require both that user's ID and their private-chat ID; group policies never gran
 control authority. Once paired, other DMs cannot mint pairing codes. Historical
 multi-user access state fails closed until repaired locally.
 
-Callback data is short-lived and contains only opaque picker coordinates. Every
-callback is reauthorized, the Telegram message ID is matched, stale selections
-are rejected, and confirmation state is deleted before `herdr tab create` or
-`pane run`. Stale-topic resume similarly requires the paired owner's private DM
+Herdr and cleanup picker callbacks are short lived and contain only opaque
+coordinates. Each picker callback is reauthorized, matched to its Telegram
+message, and rejected when stale. Spawn selection state is consumed before a
+herdr process starts. Session cards use the durable, exact-session binding from
+0005. Stale-topic resume requires the paired owner's private DM
 and revalidates the saved workspace label and terminal identities. Herdr receives
 a single shell command built only from single-quoted local cwd/session metadata;
 Telegram message text is spooled as data and never shell-interpolated.
 
 ## Consequences
 
-- At least one omp session must remain alive to receive commands.
+- The original requirement for one live omp session is superseded for eligible
+  owner-DM topic deployments. Other configurations still need a live session
+  poller.
 - `/spawn` into a space with a live omp session requires a second confirmation;
   the new process claims another Telegram topic.
 - A restarted process first re-adopts the topic for its exact session identity;

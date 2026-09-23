@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { statePath } from "./access";
@@ -19,6 +19,7 @@ import {
   readInboundReceipt,
   releaseThread,
   sessionTopicTitle,
+  saveRegistry,
   staleThreads,
   watchRoute,
   writeRouted,
@@ -45,6 +46,7 @@ const topicMsg = (over: Partial<TgMessage> = {}): TgMessage => ({
   message_thread_id: 7,
   ...over,
 });
+
 
 describe("sessionTopicTitle", () => {
   test("prefers the herdr agent name over everything else", () => {
@@ -256,6 +258,205 @@ describe("writeRouted / watchRoute", () => {
   });
 });
 
+describe("acknowledged routed delivery", () => {
+  const routed = (id: number, overrides: Partial<TgMessage> = {}): TgMessage => ({
+    message_id: id,
+    date: 1_700_000_000,
+    chat: { id: 100, type: "supergroup" },
+    text: `message-${id}`,
+    is_topic_message: true,
+    message_thread_id: 7,
+    ...overrides,
+  });
+
+  test("keeps a rejected handoff and retries it until one submission is accepted", async () => {
+    writeRouted(7, routed(50));
+    let attempts = 0;
+    const states: string[] = [];
+    const accepted = Promise.withResolvers<void>();
+    const stop = watchRoute(
+      7,
+      async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("not submitted");
+      },
+      undefined,
+      undefined,
+      (_msg, state) => {
+        states.push(state);
+        if (state === "accepted") accepted.resolve();
+      },
+    );
+
+    // This integration path intentionally awaits the watcher's real retry
+    // signal: fake timers cannot drive fs.watch plus the retry timer together.
+    await accepted.promise;
+    stop();
+    expect(attempts).toBe(2);
+    expect(states).toEqual(["failed", "accepted"]);
+    expect(readdirSync(statePath("route", "7"))).toEqual([INBOUND_RECEIPT]);
+  });
+
+  test("bounds retries for known pre-accept failures and retains the failed payload", async () => {
+    writeRouted(7, routed(51));
+    let attempts = 0;
+    const states: string[] = [];
+    const exhausted = Promise.withResolvers<void>();
+    const stop = watchRoute(
+      7,
+      async () => {
+        attempts++;
+        throw new Error("still not submitted");
+      },
+      undefined,
+      undefined,
+      (_msg, state) => {
+        states.push(state);
+        if (states.length === 3) exhausted.resolve();
+      },
+    );
+
+    await exhausted.promise;
+    stop();
+    expect(attempts).toBe(3);
+    expect(states).toEqual(["failed", "failed", "failed"]);
+    const payloads = readdirSync(statePath("route", "7")).filter((name) => name !== INBOUND_RECEIPT);
+    expect(payloads).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(statePath("route", "7"), payloads[0]), "utf8")).state).toBe("failed");
+  });
+
+  test("deduplicates active and durably accepted deliveries", () => {
+    const message = routed(52);
+    writeRouted(7, message);
+    writeRouted(7, message);
+    let delivered = 0;
+    const stop = watchRoute(7, () => {
+      delivered++;
+    });
+    expect(delivered).toBe(1);
+
+    writeRouted(7, message);
+    stop();
+    expect(delivered).toBe(1);
+  });
+  test("bounds the durable accepted ledger", () => {
+    for (let id = 1; id <= 270; id++) writeRouted(7, routed(1_000 + id));
+    let delivered = 0;
+    const stop = watchRoute(7, () => {
+      delivered++;
+    });
+    stop();
+
+    const ledger = JSON.parse(readFileSync(statePath("route", "7.accepted.json"), "utf8")) as {
+      entries: Array<{ identity: string }>;
+    };
+    expect(delivered).toBe(270);
+    expect(ledger.entries).toHaveLength(256);
+    expect(ledger.entries[0].identity).toContain(":1015:");
+    expect(ledger.entries.at(-1)?.identity).toContain(":1270:");
+  });
+
+  test("treats each edited version and callback id as its own delivery", () => {
+    writeRouted(7, routed(53));
+    const firstEdit = routed(53, { edited_flag: true, edit_date: 1_700_000_010 });
+    writeRouted(7, firstEdit);
+    writeRouted(7, firstEdit);
+    writeRouted(7, routed(53, { edited_flag: true, edit_date: 1_700_000_010, text: "same-second revision" }));
+    writeRouted(7, routed(53, { edited_flag: true, edit_date: 1_700_000_011 }));
+    writeRouted(7, routed(53, { bridge_callback_id: "callback-a" }));
+    writeRouted(7, routed(53, { bridge_callback_id: "callback-b" }));
+    const versions: string[] = [];
+    const stop = watchRoute(7, (message) => {
+      versions.push(message.bridge_callback_id ?? `${message.edit_date ?? "original"}:${message.text}`);
+    });
+    stop();
+
+    expect(versions).toEqual([
+      "original:message-53",
+      "1700000010:message-53",
+      "1700000010:same-second revision",
+      "1700000011:message-53",
+      "callback-a",
+      "callback-b",
+    ]);
+  });
+
+  test("starts sorted deliveries without awaiting an earlier batching promise", async () => {
+    writeRouted(7, routed(54));
+    writeRouted(7, routed(55));
+    writeRouted(7, routed(56));
+    const started: number[] = [];
+    const resolveSubmissions: Array<() => void> = [];
+    const allAccepted = Promise.withResolvers<void>();
+    let accepted = 0;
+    const stop = watchRoute(
+      7,
+      (message) => {
+        started.push(message.message_id);
+        const completion = Promise.withResolvers<void>();
+        resolveSubmissions.push(() => completion.resolve());
+        return completion.promise;
+      },
+      undefined,
+      undefined,
+      (_msg, state) => {
+        if (state === "accepted" && ++accepted === 3) allAccepted.resolve();
+      },
+    );
+
+    expect(started).toEqual([54, 55, 56]);
+    for (const resolve of resolveSubmissions) resolve();
+    await allAccepted.promise;
+    stop();
+  });
+
+  test("a crashed in-flight handoff becomes uncertain and is never replayed", async () => {
+    writeRouted(7, routed(57));
+    const runner = join(dir, "crash-inflight.ts");
+    writeFileSync(
+      runner,
+      `import { watchRoute } from ${JSON.stringify(join(import.meta.dirname, "topics.ts"))};\n` +
+        `watchRoute(7, () => process.exit(9));\n`,
+    );
+    const exitCode = await Bun.spawn([process.execPath, runner], {
+      env: { ...process.env, OMP_TELEGRAM_STATE_DIR: dir },
+      stdout: "ignore",
+      stderr: "ignore",
+    }).exited;
+    expect(exitCode).toBe(9);
+
+    let replayed = 0;
+    const reports: string[] = [];
+    const stop = watchRoute(
+      7,
+      () => {
+        replayed++;
+      },
+      undefined,
+      undefined,
+      (_msg, state) => {
+        reports.push(state);
+      },
+    );
+    stop();
+
+    const secondReports: string[] = [];
+    watchRoute(
+      7,
+      () => {
+        replayed++;
+      },
+      undefined,
+      undefined,
+      (_msg, state) => secondReports.push(state),
+    )();
+    expect(replayed).toBe(0);
+    expect(reports).toEqual(["uncertain"]);
+    expect(secondReports).toEqual([]);
+    expect(readdirSync(statePath("route", "7")).filter((name) => name !== INBOUND_RECEIPT)).toHaveLength(1);
+  });
+});
+
 describe("staleThreads", () => {
   const reg = (pids: Record<string, number>): ThreadRegistry => ({
     version: 1,
@@ -282,12 +483,16 @@ describe("staleThreads", () => {
 });
 
 describe("purgeRouteDir", () => {
-  test("removes an existing spool dir with contents", () => {
+  test("removes an existing spool, receipt, and accepted ledger", () => {
     writeRouted(7, { message_id: 1, date: 0, chat: { id: 100, type: "supergroup" }, is_topic_message: true, message_thread_id: 7 });
+    watchRoute(7, () => {})();
     const spool = statePath("route", "7");
+    const ledger = statePath("route", "7.accepted.json");
     expect(existsSync(spool)).toBe(true);
+    expect(existsSync(ledger)).toBe(true);
     purgeRouteDir(7);
     expect(existsSync(spool)).toBe(false);
+    expect(existsSync(ledger)).toBe(false);
   });
 
   test("does not throw when the dir does not exist", () => {
@@ -324,6 +529,50 @@ describe("registry writes survive concurrency (#68)", () => {
     expect(got).toEqual(ids);
   });
 
+  test("concurrent claims and releases serialize without resurrecting or dropping entries", async () => {
+    const released = [7101, 7102, 7103, 7104, 7105, 7106];
+    const claimed = [7201, 7202, 7203, 7204, 7205, 7206];
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: Object.fromEntries(released.map((id) => [String(id), entry(id)])),
+    });
+    const runner = join(dir, "mutate-registry.ts");
+    writeFileSync(
+      runner,
+      `import { claimThread, releaseThread } from ${JSON.stringify(join(import.meta.dirname, "topics.ts"))};\n` +
+        `const id = Number(process.argv[3]);\n` +
+        `if (process.argv[2] === "release") releaseThread(id, id);\n` +
+        `else claimThread("42", id, { pid: id, cwd: "/w", name: "conductor", claimedAt: 1 });\n`,
+    );
+    const operations = [
+      ...released.map((id) => ["release", id] as const),
+      ...claimed.map((id) => ["claim", id] as const),
+    ];
+    const codes = await Promise.all(
+      operations.map(([operation, id]) =>
+        Bun.spawn([process.execPath, runner, operation, String(id)], {
+          env: { ...process.env, OMP_TELEGRAM_STATE_DIR: dir },
+          stdout: "ignore",
+          stderr: "ignore",
+        }).exited,
+      ),
+    );
+
+    expect(codes).toEqual(operations.map(() => 0));
+    expect(Object.keys(loadRegistry().threads).map(Number).sort((a, b) => a - b)).toEqual(claimed);
+  });
+
+  test("fresh lock contention rejects release without touching the registry", () => {
+    saveRegistry({ version: 1, chatId: "42", threads: { "7301": entry(7301) } });
+    writeFileSync(`${statePath("threads.json")}.lock`, String(process.pid));
+    const warnings: string[] = [];
+
+    expect(() => releaseThread(7301, 7301, (message) => warnings.push(message))).toThrow("could not acquire state lock");
+    expect(loadRegistry().threads["7301"]).toEqual(entry(7301));
+    expect(warnings).toHaveLength(1);
+  });
+
   test("a lock left by a dead process does not wedge the registry shut", () => {
     // Self-healing by age. A mutation lock is held for microseconds, so one
     // that is seconds old belonged to a process that died holding it.
@@ -335,11 +584,11 @@ describe("registry writes survive concurrency (#68)", () => {
     expect(Object.keys(loadRegistry().threads)).toEqual(["8001"]);
   });
 
-  test("the temp file is per-process, so two writers cannot publish each other's", () => {
-    // It was a shared `threads.json.tmp`: both writers wrote that one path and
-    // both renamed it, so one could publish the other's half-written file.
+  test("each registry save uses a unique temp file and leaves no debris", () => {
+    // A shared `threads.json.tmp` let concurrent writers publish one another's
+    // content. Every save now stages under its own random name.
     claimThread("42", 8002, entry(8002));
-    const leftovers = readdirSync(dir).filter((f) => f.startsWith("threads.json.tmp"));
+    const leftovers = readdirSync(dir).filter((name) => name.startsWith("threads.json.") && name.endsWith(".tmp"));
     expect(leftovers).toEqual([]);
     expect(loadRegistry().threads["8002"]?.pid).toBe(8002);
   });
