@@ -164,9 +164,10 @@ describe("/telegram argument completions", () => {
   });
 
   test("completes nested subcommands past the first token", () => {
-    expect(labels("topics ")).toEqual(["on", "off", "status", "tidy"]);
+    expect(labels("topics ")).toEqual(["on", "off", "status", "tidy", "names"]);
     expect(labels("topics ti")).toEqual(["tidy"]);
     expect(labels("topics tidy ")).toEqual(["on", "off", "status"]);
+    expect(labels("topics names ")).toEqual(["session", "space", "status"]);
     expect(labels("daemon ")).toEqual(["status", "restart", "stop"]);
     expect(labels("policy ")).toEqual(["pairing", "allowlist", "disabled"]);
     expect(labels("notify ")).toEqual(["off", "away", "always", "status", "clear"]);
@@ -175,6 +176,8 @@ describe("/telegram argument completions", () => {
 
   test("completes set keys and their enum values", () => {
     expect(labels("set ")).toContain("replyToMode");
+    expect(labels("set ")).not.toContain("topicNames");
+    expect(labels("set ")).not.toContain("topicsNames");
     const setKey = (telegramArgumentCompletions("set ") ?? []).find((i) => i.label === "replyToMode");
     expect(setKey?.description).toBe("thread replies: off | first | all");
     expect(labels("set replyToMode ")).toEqual(["off", "first", "all"]);

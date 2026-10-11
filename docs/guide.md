@@ -179,6 +179,22 @@ topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
 `/thinking`, and `/retry`. A global command entered elsewhere posts its result
 in omp control and leaves a short redirect notice in the originating topic.
 
+Topic names follow the omp session name by default, falling back to the herdr
+agent name, space label, then directory. Names collapse whitespace and are capped
+at 32 code points including `…`, preferring a word boundary after 20 code points
+and preserving CJK and emoji graphemes. Live collisions use the existing `-pid`
+suffix within the cap. Names sync after claim/adoption, on `agent_end`, and via
+an unref'd 30-second comparison. Failed edits warn once per name and retry;
+`TOPIC_NOT_MODIFIED` is success. Routing and saved resume identities are unchanged.
+
+`/telegram topics names session` is the default. Use
+`/telegram topics names space` to restore each owned topic's 0.14.0 herdr agent,
+space label, or folder-derived name once at the next check. Once restored, space
+mode makes no further edits and runs no sync interval. A settings-file watcher
+reacts to mode switches in every live owning session without a restart.
+Switching back to `session` resumes synchronization. `topics names [status]`
+shows the current mode, also included in topics status beside tidy.
+
 | Command | Effect |
 |---|---|
 | `/spawn [space]` | List open herdr spaces with inline buttons, or confirm an exact label. A space with live omp sessions requires confirmation before starting another. |
@@ -608,8 +624,8 @@ Session shutdown and agent completion clear pending timers.
 When several omp sessions share one bot, a single chat can't tell them apart: the
 poll-lock holder receives every message and its replies land in the chat's main
 view, so you can't address a specific session. **Topics mode** gives each session
-its own Telegram **forum topic**, named after the pane herdr knows it by (falling
-back to its project directory), inside one operator-chosen chat.
+its own Telegram **forum topic**, following the omp session name by default or
+the herdr agent/space/folder name in space mode, inside one operator-chosen chat.
 
 ```
 /telegram topics on           # topics on, auto-hosted in your paired DM; claim this session's topic
@@ -618,10 +634,14 @@ back to its project directory), inside one operator-chosen chat.
 /telegram topics              # show the topics chat, this session's topic, and DM forum-topic mode
 /telegram topics tidy on      # tidy this session's topic on clean exit (delete in DM host, close in group host)
 /telegram topics tidy off     # keep topics after exit for re-adoption (default)
+/telegram topics names session # follow omp session names (default)
+/telegram topics names space   # restore the herdr/space/folder title once; disable ongoing sync
+/telegram topics names status  # show the current naming mode
 ```
 
 - Each session **claims one topic** on start (and when that session runs `/telegram topics on` or `/telegram topics <chat_id>`).
-  The title is the strongest identity available, in this order: the pane's **herdr agent
+  In session mode the omp session name comes first. The fallback, and space-mode
+  title, is the strongest identity available, in this order: the pane's **herdr agent
   name** (what you assigned with `herdr agent start <name>` or `agent rename`, one-to-one
   with the session), then the pane's **herdr space label**, then `basename(cwd)`.
   The space is consulted because the agent lookup is best-effort — it reads herdr over a

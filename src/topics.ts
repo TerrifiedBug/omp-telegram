@@ -53,25 +53,9 @@ export const ROUTED_TTL_MS = 600_000;
 export const DM_ROUTE_KEY = "dm" as const;
 
 /**
- * The title a newly created session topic gets, strongest identity first.
- *
- * 1. **herdr agent name** — operator-assigned and one-to-one with the session,
- *    which is exactly what a per-session topic represents.
- * 2. **herdr space label** — equally one-to-one with the pane, and captured by
- *    a *different* call than the agent name, so it still answers when that
- *    lookup comes back empty.
- * 3. **`basename(cwd)`** — the last resort, and the reason the first two exist:
- *    every pane under one directory tree claims the same useless title.
- *
- * The middle rung is not belt-and-braces. The agent lookup reads herdr over a
- * socket and swallows its own failure, and `tidy` closes a topic on exit so the
- * title is re-derived on every restart rather than once. On a fleet whose panes
- * share a parent directory — `~/.omp/conductor/…` for two projects, say — a
- * single missed lookup is enough to retitle a live project's topic after the
- * shared directory, which is how two projects end up both called "conductor".
- *
- * Blank is treated as absent throughout: Telegram rejects an empty topic name,
- * and a space with no custom name must not consume the fallback chain.
+ * Backward-compatible fallback when omp has not named the session yet.
+ * Prefer the herdr agent name, then space label, then the directory name.
+ * Blank identities do not consume the fallback chain.
  */
 export function sessionTopicTitle(
   agentName: string | undefined,
@@ -139,6 +123,21 @@ export function claimThread(chatId: string, threadId: number, entry: ThreadEntry
     registry.threads[String(threadId)] = entry;
     saveRegistry(registry);
   }, warn);
+}
+
+/** Rename only a still-owned claim, preserving all routing and herdr identities. */
+export function renameThread(chatId: string, threadId: number, pid: number, name: string): boolean {
+  return withRegistryLock(() => {
+    const registry = loadRegistry();
+    const entry = registry.threads[String(threadId)];
+    if (registry.chatId !== chatId || entry?.pid !== pid) return false;
+    if (Object.entries(registry.threads).some(
+      ([id, other]) => Number(id) !== threadId && other.name === name && isAlive(other.pid),
+    )) return false;
+    entry.name = name;
+    saveRegistry(registry);
+    return true;
+  });
 }
 
 /**

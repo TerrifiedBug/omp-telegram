@@ -65,6 +65,7 @@ import { SETTINGS_GRAMMAR, SETTING_HELP } from "./settings";
 import { DeliveryReporter } from "./delivery";
 import { SessionCardController, publishSessionStatus, removeSessionStatus, type SessionStatusSnapshot } from "./session-status";
 import { RunLifecycle } from "./run-lifecycle";
+import { availableTopicName, topicName, TopicNameSync } from "./topic-name";
 
 
 interface SendParams {
@@ -133,7 +134,7 @@ const TELEGRAM_ARGS: CompletionNode = {
   set: SETTINGS_GRAMMAR,
   notify: { off: null, away: null, always: null, status: null, clear: null },
   own: { status: null, clear: null },
-  topics: { on: null, off: null, status: null, tidy: { on: null, off: null, status: null } },
+  topics: { on: null, off: null, status: null, tidy: { on: null, off: null, status: null }, names: { session: null, space: null, status: null } },
 };
 const SUBCOMMANDS = Object.keys(TELEGRAM_ARGS);
 
@@ -501,6 +502,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   let lastCtx: ExtensionContext | undefined;
   let lockRetryTimer: NodeJS.Timeout | undefined;
   let ownTopic: { threadId: number; name: string } | undefined;
+  const topicNameSync = new TopicNameSync();
+  let syncedTopicName: string | undefined;
   let ownSpace: { workspaceId: string; label: string; terminalIds: string[] } | undefined;
   /** herdr agent name for this session, when herdr named this pane. */
   let ownAgentName: string | undefined;
@@ -607,6 +610,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     getToken: () => token || resolveToken(),
     onAccessChanged: (current) => {
       access = current;
+      checkTopicName();
       ensureDaemon(warn);
     },
     onTokenChanged: (nextToken, me) => {
@@ -804,6 +808,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   }
 
   async function stopBot(): Promise<void> {
+    topicNameSync.stop();
+    syncedTopicName = undefined;
     stopLockBeat?.();
     stopLockBeat = undefined;
     stopDmWatch?.();
@@ -881,6 +887,35 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     };
   }
 
+  function desiredTopicName(): string {
+    return topicName(pi.getSessionName(), sessionTopicTitle(ownAgentName, ownSpace?.label, process.cwd()));
+  }
+
+  /** Never hold up routing or agent_end for an optional Telegram title edit. */
+  async function syncTopicName(force = false): Promise<void> {
+    const current = loadAccess(warn);
+    const mode = current.topicsNames ?? "session";
+    if (ownTopic) topicNameSync.configure(mode, checkTopicName);
+    if (!ownTopic || !current.topicsChat || !token || (isDmChat(current.topicsChat) && botHasTopics === false)) return;
+    const desired = mode === "session" ? desiredTopicName() : sessionTopicTitle(ownAgentName, ownSpace?.label, process.cwd());
+    if (mode === "session" && !force && desired === syncedTopicName) return;
+    const topic = ownTopic;
+    const chatId = current.topicsChat;
+    if (!chatId || (isDmChat(chatId) && botHasTopics === false)) return;
+    if (await topicNameSync.check(chatId, topic, desired, (method, payload) => tg(token, method, payload), log)) {
+      if (ownTopic === topic && access.topicsChat === chatId) syncedTopicName = desired;
+    }
+  }
+
+  function checkTopicName(): void {
+    void syncTopicName().catch((err) => warn(`topic name check failed: ${String(err)}`));
+  }
+
+  function startTopicNameSync(): void {
+    topicNameSync.watchSettings(checkTopicName, log);
+    syncedTopicName = undefined;
+    checkTopicName();
+  }
   /** Consume DMs spooled to this session while it owns dm-owner.json. */
   function startDmWatch(): void {
     stopDmWatch?.();
@@ -1028,9 +1063,8 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     let name = basename(cwd);
     try {
       await captureOwnSpace(ctx);
-      // Identity beats the directory name; see `sessionTopicTitle` for why the
-      // herdr space is consulted before falling back to `basename(cwd)`.
-      name = sessionTopicTitle(ownAgentName, ownSpace?.label, cwd);
+      const sessionNames = loadAccess(warn).topicsNames !== "space";
+      name = sessionNames ? desiredTopicName() : sessionTopicTitle(ownAgentName, ownSpace?.label, cwd);
       const r = loadRegistry(warn);
       const sessionId = ctx?.sessionManager.getSessionId();
       const sessionFile = ctx?.sessionManager.getSessionFile();
@@ -1060,10 +1094,11 @@ export default function telegramExtension(pi: ExtensionAPI): void {
           releaseThread(threadId, process.pid, warn);
           warn(`saved topic #${threadId} no longer exists in Telegram; creating a replacement`);
         }
-      } else if (existing) {
+      } else if (existing && !sessionNames) {
         name = `${name}-${process.pid}`;
       }
       if (!ownTopic) {
+        if (sessionNames) name = availableTopicName(desiredTopicName(), loadRegistry(warn));
         const topic = await tg<{ message_thread_id: number }>(token, "createForumTopic", { chat_id: access.topicsChat, name });
         claimThread(access.topicsChat, topic.message_thread_id, threadEntry(ctx, cwd, name), warn);
         ownTopic = { threadId: topic.message_thread_id, name };
@@ -1076,6 +1111,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       stopWatch = watchRoute(ownTopic.threadId, (message) => processLocal(message), log, undefined,
         (message, state, detail) => state === "accepted" ? undefined : deliveries.report(message, state, detail));
       log.info(`[telegram] topic #${ownTopic.threadId} (${ownTopic.name}) claimed in chat ${access.topicsChat}`);
+      startTopicNameSync();
     } catch (err) {
       warn(`could not claim topic: ${String(err)}`);
       ctx?.ui.notify(`telegram: topic claim failed — ${err instanceof TgError ? `${err.code} ${err.message}` : String(err)} (running untopiced)`, "warning");
@@ -1653,6 +1689,20 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const v = arg.trim();
     let a = loadAccess(warn);
     access = a;
+    if (/^names(\s|$)/.test(v)) {
+      const sub = v.slice(5).trim().toLowerCase();
+      if (sub === "session" || sub === "space") {
+        access = a = updateAccess((current) => { current.topicsNames = sub; }, warn);
+        syncedTopicName = undefined;
+        checkTopicName();
+        ctx.ui.notify(`telegram: topics names ${sub}`, "info");
+      } else if (sub === "" || sub === "status") {
+        ctx.ui.notify(`telegram: topics names ${a.topicsNames ?? "session"}`, "info");
+      } else {
+        ctx.ui.notify("usage: /telegram topics names session | space", "warning");
+      }
+      return;
+    }
     if (/^tidy(\s|$)/.test(v)) {
       const sub = v.slice(4).trim().toLowerCase();
       if (sub === "on") {
@@ -1669,6 +1719,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       return;
     }
     if (v === "off") {
+      topicNameSync.stop();
       stopWatch?.();
       stopWatch = undefined;
       if (a.topicsTidy && ownTopic && a.topicsChat && token) {
@@ -1721,9 +1772,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       return;
     }
     const owned = ownTopic ? ` · this session: #${ownTopic.threadId} (${ownTopic.name})` : "";
-    if (!a.topicsChat) return ctx.ui.notify("usage: /telegram topics on | <chat_id> | off | tidy on|off", "info");
+    if (!a.topicsChat) return ctx.ui.notify("usage: /telegram topics on | <chat_id> | off | tidy on|off | names session|space", "info");
     const dmMode = isDmChat(a.topicsChat) ? ` · DM forum-topic mode: ${botHasTopics === undefined ? "unknown" : botHasTopics ? "on" : "off"}` : "";
-    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · tidy: ${a.topicsTidy ? "on" : "off"} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
+    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · tidy: ${a.topicsTidy ? "on" : "off"} · names: ${a.topicsNames ?? "session"} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
   }
 
   // ---- registrations ------------------------------------------------------
@@ -2374,7 +2425,9 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     await runLifecycle.fallbackApplied(event);
   });
   pi.on("agent_end", async (event, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools()) || event.willContinue) return;
+    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    void syncTopicName(true).catch((err) => warn(`topic name check failed: ${String(err)}`));
+    if (event.willContinue) return;
     lastCtx = ctx;
     for (const pending of pendingApprovals.values()) clearTimeout(pending.timer);
     pendingApprovals.clear();
@@ -2420,6 +2473,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     // bridge. Its cleanup would release the parent's poll lock, repoint the DM
     // owner at the ended child, and drop the parent's session status (#83).
     if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    topicNameSync.stop();
     poller.stop();
     stopWatch?.();
     stopDmWatch?.();

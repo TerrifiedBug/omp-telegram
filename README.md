@@ -90,6 +90,24 @@ The bot creates:
 Restart any omp sessions that were already running before you enabled topics so
 they can claim their own topic.
 
+By default (`/telegram topics names session`), topic names follow the omp session
+name, including auto-titles and local `/rename`.
+Without a session name, the herdr agent name, herdr space label, then directory
+name are used. Whitespace is collapsed and `TOPIC_NAME_MAX = 32` code points
+caps the display name (including `…`); truncation prefers a word boundary after
+at least 20 code points and never splits an emoji. Live-name collisions use a
+`-pid` suffix within the same cap. Names synchronize after adoption, on every
+`agent_end`, and within about 30 seconds of an idle rename. Rename failures
+warn once per name and retry on a later check without blocking topic routing.
+The registry format and saved session/herdr resume identities are unchanged.
+
+Set `/telegram topics names space` to restore the 0.14.0 herdr agent, space label,
+or folder-derived name once, at the next check. After restoration, space mode
+does no further topic edits or sync interval work. A settings-file watcher reacts
+to mode switches in all live owning sessions, without a restart. Returning to
+`session` starts synchronization again. `/telegram topics names [status]` shows
+the current mode.
+
 Topics persist and are re-adopted on restart. To tidy them automatically instead,
 run `/telegram topics tidy on` — each session's topic is deleted (DM host) or
 closed and reopened on re-adoption (group host) when it exits. Sweep leftovers from
