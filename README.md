@@ -106,7 +106,13 @@ or folder-derived name once, at the next check. After restoration, space mode
 does no further topic edits or sync interval work. A settings-file watcher reacts
 to mode switches in all live owning sessions, without a restart. Returning to
 `session` starts synchronization again. `/telegram topics names [status]` shows
-the current mode.
+the current mode. `/rename` still changes the omp session in space mode, but its
+reply says the topic keeps the space name and points to the session-mode command.
+
+After updating this plugin, locally exit/resume already-running sessions to load
+the new command. An old daemon can forward `/rename` to an updated live session;
+run `/telegram daemon restart` locally to refresh its command menu, help, and
+control/unowned-topic usage handling.
 
 Topics persist and are re-adopted on restart. To tidy them automatically instead,
 run `/telegram topics tidy on` — each session's topic is deleted (DM host) or
@@ -144,6 +150,11 @@ Inside an owner-DM session topic, the paired owner can:
 - Use `/stop` to stop its current task.
 - Use `/compact [focus]` to compact that session's context.
 - Use `/model` and `/thinking` to change that session with inline pickers.
+- Use `/rename <name>` to persist this session's full name and, in `session` mode,
+  update its topic. In `space` mode the topic keeps its space name.
+  Whitespace is collapsed; only the topic display name is capped at 32 code
+  points. Bare `/rename` shows the current name and usage without changing it.
+  It is owner-only in a session topic, not a group or **omp control** command.
 - Use `/retry` to resend failed reply parts.
   `/retry uncertain` also resends parts that Telegram may already have accepted,
   so it can duplicate a message.

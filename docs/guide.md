@@ -176,7 +176,7 @@ full menu is scoped to the paired owner's DM.
 With owner-DM topics enabled, the bridge creates one persistent **omp control**
 topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
 `/whoami`. Session topics accept `/session`, `/stop`, `/compact`, `/model`,
-`/thinking`, and `/retry`. A global command entered elsewhere posts its result
+`/thinking`, `/rename`, and `/retry`. A global command entered elsewhere posts its result
 in omp control and leaves a short redirect notice in the originating topic.
 
 Topic names follow the omp session name by default, falling back to the herdr
@@ -194,6 +194,8 @@ mode makes no further edits and runs no sync interval. A settings-file watcher
 reacts to mode switches in every live owning session without a restart.
 Switching back to `session` resumes synchronization. `topics names [status]`
 shows the current mode, also included in topics status beside tidy.
+`/rename` still changes the omp session in space mode; its reply says the topic
+keeps the space name and points to `/telegram topics names session`.
 
 | Command | Effect |
 |---|---|
@@ -207,10 +209,18 @@ shows the current mode, also included in topics status beside tidy.
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
 | `/thinking [level]` | Show a thinking-level picker, or set `inherit`, `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
+| `/rename <name>` | Persist this session's full name, with whitespace collapsed, and synchronize its topic in `session` mode (`TOPIC_NAME_MAX = 32` code points, including `…`). In `space` mode, keep the space title and show `/telegram topics names session` in the reply. Bare `/rename` shows the current name and usage. Use it in the paired owner's session topic; control topics and groups cannot rename sessions. Stale topics follow the same auto-resume convention as `/model` and `/thinking`. |
 | `/retry [uncertain]` | Retry failed automatic reply parts for this owner's DM session topic. `uncertain` includes parts Telegram may already have accepted. |
 | `/status` | Show the paired owner, bridge state, topics state, live omp count, and topic-owner count. |
 | `/help` | Show the owner command summary. |
 | `/whoami` | Show Telegram chat and user IDs. |
+
+Both the poller/daemon and session extension parse commands through the shared
+bridge. The owning session calls `pi.setSessionName` for `/rename`, never submits
+the command as an agent prompt. After an upgrade, locally exit/resume existing
+sessions; an old daemon still forwards commands to updated live sessions, but
+run `/telegram daemon restart` locally to load the new menu/help and
+control/unowned-topic usage responses.
 
 A session card shows the session state, ID, directory, model, thinking level,
 context use, pending-message state, and last activity. Refresh updates the card.
