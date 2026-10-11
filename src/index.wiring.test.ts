@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { type Access, defaultAccess, loadAccess } from "./access";
+import { type Access, defaultAccess, loadAccess, saveAccess } from "./access";
 import telegramExtension from "./index";
 import { claimDmOwner, loadDmOwner, loadRegistry, saveRegistry } from "./topics";
 
@@ -21,6 +21,8 @@ type Harness = {
   handlers: Map<string, EventHandler[]>;
   setActiveCalls: string[][];
   active: () => string[];
+  sessionName: () => string | undefined;
+  rename: (name: string) => void;
 };
 
 // A structural fake ExtensionAPI that captures registrations and tool-set
@@ -32,6 +34,7 @@ function harness(initialTools: string[], activateRegisteredTools = false): Harne
   const handlers = new Map<string, EventHandler[]>();
   const setActiveCalls: string[][] = [];
   let active = [...initialTools];
+  let sessionName: string | undefined;
   // Every `T.Xxx(...)` access returns a callable that yields the same stand-in,
   // so schema construction at registration time never throws.
   const anyType: unknown = new Proxy(() => anyType, { get: () => () => anyType });
@@ -72,11 +75,13 @@ function harness(initialTools: string[], activateRegisteredTools = false): Harne
     setModel: async () => true,
     getThinkingLevel: () => undefined,
     setThinkingLevel: () => {},
+    getSessionName: () => sessionName,
+    setSessionName: (name: string) => { sessionName = name; },
   };
   // Structural stand-in for the injected API; the extension only touches the
   // members mocked above during registration and the handlers under test.
   telegramExtension(pi as unknown as ExtensionAPI);
-  return { tools, commands, handlers, setActiveCalls, active: () => active };
+  return { tools, commands, handlers, setActiveCalls, active: () => active, sessionName: () => sessionName, rename: (name) => { sessionName = name; } };
 }
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
@@ -130,6 +135,95 @@ async function startBridge(h: Harness): Promise<void> {
     },
   );
 }
+
+describe("topic-name settings wiring", () => {
+  test.each(["session", "space"] as const)("%s mode controls creation and edits; enabling session works without restart", async (mode) => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42", controlThreadId: 98, topicsNames: mode });
+    const h = harness(["read"]);
+    h.rename("Session title");
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const edited = Promise.withResolvers<Record<string, unknown>>();
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      calls.push({ method, body });
+      if (method === "editForumTopic") edited.resolve(body);
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 7 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      expect(calls.find((call) => call.method === "createForumTopic")?.body.name).toBe(
+        mode === "session" ? "Session title" : basename(process.cwd()),
+      );
+      h.rename("Renamed session");
+      await h.handlers.get("agent_end")?.[0]?.({ type: "agent_end", willContinue: true }, {});
+      if (mode === "space") {
+        expect(calls.filter((call) => call.method === "editForumTopic")).toEqual([]);
+        await h.commands.get("telegram")!.handler("topics names session", { ui: { notify() {} } });
+      }
+      expect(await edited.promise).toMatchObject({ chat_id: "42", message_thread_id: 99, name: "Renamed session" });
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, {});
+      globalThis.fetch = previousFetch;
+    }
+  });
+  test("mode changes from another session restore space once and wake an idle space session", async () => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42", controlThreadId: 98 });
+    const h = harness(["read"]);
+    h.rename("Session title");
+    const restored = Promise.withResolvers<Record<string, unknown>>();
+    const resumed = Promise.withResolvers<Record<string, unknown>>();
+    const edits: Record<string, unknown>[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (method === "editForumTopic") {
+        edits.push(body);
+        if (body.name === basename(process.cwd())) restored.resolve(body);
+        else resumed.resolve(body);
+      }
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 7 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      saveAccess({ ...loadAccess(), topicsNames: "space" });
+      expect((await restored.promise).name).toBe(basename(process.cwd()));
+      h.rename("Changed while in space");
+      await h.handlers.get("agent_end")?.[0]?.({ type: "agent_end", willContinue: true }, {});
+      saveAccess({ ...loadAccess(), topicsNames: "session" });
+      expect((await resumed.promise).name).toBe("Changed while in space");
+      expect(edits.map((edit) => edit.name)).toEqual([basename(process.cwd()), "Changed while in space"]);
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, {});
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  test("topics names validates and persists the mode, reports it beside tidy, and rejects the retired set key", async () => {
+    writeAccess({ topicsChat: "42" });
+    const h = harness(["read"]);
+    const notices: string[] = [];
+    const ctx = { ui: { notify: (text: string) => { notices.push(text); } } };
+    await h.commands.get("telegram")!.handler("topics names", ctx);
+    expect(notices.at(-1)).toBe("telegram: topics names session");
+    await h.commands.get("telegram")!.handler("topics names space", ctx);
+    expect(loadAccess().topicsNames).toBe("space");
+    await h.commands.get("telegram")!.handler("topics status", ctx);
+    expect(notices.at(-1)).toContain("tidy: off · names: space");
+    await h.commands.get("telegram")!.handler("topics names project", ctx);
+    expect(notices.at(-1)).toBe("usage: /telegram topics names session | space");
+    expect(loadAccess().topicsNames).toBe("space");
+    await h.commands.get("telegram")!.handler("set topicNames session", ctx);
+    expect(notices.at(-1)).toContain('set: unknown key "topicNames"');
+    expect(loadAccess().topicsNames).toBe("space");
+    await h.commands.get("telegram")!.handler("topics names session", ctx);
+    expect(loadAccess().topicsNames).toBe("session");
+  });
+});
 
 describe("extension wiring", () => {
   test.each(["on", "off"])("%s preserves settings changed by another session", async (command) => {
