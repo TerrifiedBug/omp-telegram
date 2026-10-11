@@ -66,6 +66,7 @@ import { DeliveryReporter } from "./delivery";
 import { SessionCardController, publishSessionStatus, removeSessionStatus, type SessionStatusSnapshot } from "./session-status";
 import { RunLifecycle } from "./run-lifecycle";
 import { availableTopicName, topicName, TopicNameSync } from "./topic-name";
+import { handleSessionRename } from "./session-rename";
 
 
 interface SendParams {
@@ -1325,7 +1326,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     options: { cardAction?: boolean } = {},
   ): Promise<boolean> {
     const { name: cmd, args } = parsed;
-    if (cmd !== "stop" && cmd !== "compact" && cmd !== "model" && cmd !== "thinking" && cmd !== "retry") return false;
+    if (cmd !== "stop" && cmd !== "compact" && cmd !== "model" && cmd !== "thinking" && cmd !== "retry" && cmd !== "rename") return false;
     access = loadAccess(warn);
     if (access.dmPolicy === "disabled") return true;
 
@@ -1377,6 +1378,16 @@ export default function telegramExtension(pi: ExtensionAPI): void {
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);
       else if (!ctx) await commandReply(msg, "Run /model inside the omp session topic you want to change.", false);
       else startModelChange(msg, args, ctx);
+    } else if (cmd === "rename") {
+      await handleSessionRename(msg, args, {
+        access,
+        ownThreadId: ownTopic?.threadId,
+        hasContext: sessionContextFor(msg) != null,
+        getSessionName: () => pi.getSessionName(),
+        setSessionName: (name) => pi.setSessionName(name),
+        syncTopicName: checkTopicName,
+        reply: (text) => commandReply(msg, text, false),
+      });
     } else {
       const ctx = owner ? sessionContextFor(msg) : undefined;
       if (!owner) await commandReply(msg, "Pair this DM locally before using session commands.", false);

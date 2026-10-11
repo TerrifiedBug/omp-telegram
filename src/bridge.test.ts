@@ -9,6 +9,7 @@ import { type TelegramCall, SpawnController } from "./control";
 import { TelegramPromptController } from "./prompts";
 import { sessionCardCallbackId } from "./session-status";
 import { DM_ROUTE_KEY, type ThreadEntry, claimDmOwner, classifyStale, loadRegistry, saveRegistry, watchRoute } from "./topics";
+import { handleSessionRename } from "./session-rename";
 
 const previousStateDir = process.env.OMP_TELEGRAM_STATE_DIR;
 let dir: string;
@@ -75,6 +76,106 @@ function keyboardOf(call: { payload: Record<string, unknown> } | undefined): Inl
   const rows = markup.inline_keyboard; // unknown after the `in` narrow
   return rows as InlineButton[][]; // known Bot API shape in these tests
 }
+
+describe("/rename", () => {
+  let name: string | undefined;
+  let renamed: string[];
+  let syncChecks: number;
+
+  beforeEach(() => {
+    name = "Current session";
+    renamed = [];
+    syncChecks = 0;
+    saveRegistry({
+      version: 1,
+      chatId: "42",
+      threads: { "7": { pid: process.pid, cwd: "/project", name: "project", claimedAt: 1 } },
+    });
+  });
+
+  function renameHost(): BridgeHost {
+    return makeHost({
+      isDaemon: false,
+      selfPid: process.pid,
+      ownThreadId: () => 7,
+      handleSessionCommand: async (msg, parsed) => {
+        if (parsed.name !== "rename") return false;
+        await handleSessionRename(msg, parsed.args, {
+          access: loadAccess(),
+          ownThreadId: 7,
+          hasContext: true,
+          getSessionName: () => name,
+          setSessionName: (value) => { name = value; renamed.push(value); },
+          syncTopicName: () => { syncChecks++; },
+          reply: async (text) => { calls.push({ method: "sendMessage", payload: { text } }); },
+        });
+        return true;
+      },
+    });
+  }
+
+  test("the paired owner renames its session, preserving the full normalized name", async () => {
+    const fullName = "a".repeat(40) + " new name";
+    await handleUpdate(renameHost(), { update_id: 1, message: message(`/rename  ${fullName.replace(/ /g, "  ")}  `, 7) });
+    expect(renamed).toEqual([fullName]);
+    expect(syncChecks).toBe(1);
+    expect(calls.at(-1)?.payload.text).toBe(`Session renamed: ${fullName}`);
+  });
+
+  test("bare /rename shows the current name and usage without mutation", async () => {
+    await handleUpdate(renameHost(), { update_id: 2, message: message("/rename", 7) });
+    expect(calls.at(-1)?.payload.text).toBe("Current session name: Current session\nUsage: /rename <name>");
+    expect(renamed).toEqual([]);
+    expect(syncChecks).toBe(0);
+  });
+
+  test("a non-owner cannot rename or obtain the session name", async () => {
+    await handleUpdate(renameHost(), { update_id: 3, message: { ...message("/rename hacked", 7), from: { id: 99 } } });
+    expect(renamed).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  test("the control topic and untopiced DM show usage only", async () => {
+    for (const topic of [99, undefined]) {
+      await handleUpdate(renameHost(), { update_id: 4, message: message("/rename wrong", topic) });
+      expect(calls.at(-1)?.payload.text).toBe("Use /rename <name> inside a live omp session topic.");
+    }
+    expect(renamed).toEqual([]);
+    expect(syncChecks).toBe(0);
+  });
+
+  test("an unowned topic shows usage only", async () => {
+    await handleUpdate(renameHost(), { update_id: 5, message: message("/rename wrong", 8) });
+    expect(calls.at(-1)?.payload.text).toBe("Use /rename <name> inside a live omp session topic.");
+    expect(renamed).toEqual([]);
+  });
+
+  test("accepts the @botname suffix", async () => {
+    await handleUpdate(renameHost(), { update_id: 6, message: message("/rename@omp_bot New name", 7) });
+    expect(renamed).toEqual(["New name"]);
+  });
+
+  test("space mode still renames the session and explains how to follow session names", async () => {
+    saveAccess({ ...loadAccess(), topicsNames: "space" });
+    await handleUpdate(renameHost(), { update_id: 8, message: message("/rename New name", 7) });
+    expect(renamed).toEqual(["New name"]);
+    expect(calls.at(-1)?.payload.text).toBe("Session renamed: New name\nTopic keeps the space name. Use /telegram topics names session to follow session names.");
+    expect(loadRegistry().threads["7"].name).toBe("project");
+  });
+
+  test("a daemon forwards /rename unchanged to the live owning session", async () => {
+    const msg = message("/rename@omp_bot New name", 7);
+    await handleUpdate(makeHost(), { update_id: 9, message: msg });
+    const delivered = Promise.withResolvers<TgMessage>();
+    const stop = watchRoute(7, (routed) => { delivered.resolve(routed); }, log);
+    try {
+      expect((await delivered.promise).text).toBe(msg.text);
+      expect(calls).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+});
 
 describe("shared bridge routing", () => {
   test("forwards a live foreign topic through the filesystem spool", async () => {

@@ -84,6 +84,7 @@ const COMMANDS: CommandSpec[] = [
   { command: "compact", description: "Compact this session's context", scope: "session", help: ["/compact [focus] — compact this session’s context"] },
   { command: "model", description: "Show or change this session's model", scope: "session", help: ["/model [provider/id] — show or change this session’s model"] },
   { command: "thinking", description: "Show or change thinking level", scope: "session", help: ["/thinking [level] — show or change thinking level"] },
+  { command: "rename", description: "Rename this omp session", scope: "session", help: ["/rename <name> — rename this session; without a name, show its name and usage"] },
   { command: "retry", description: "Retry failed Telegram delivery", scope: "session", help: ["/retry — retry failed outbound messages for this session"] },
   { command: "status", description: "Bridge and session health", scope: "global", help: ["/status — bridge and session health"] },
   { command: "help", description: "Show available commands", scope: "global" },
@@ -726,7 +727,7 @@ async function handleDaemonSessionCommand(host: BridgeHost, access: Access, msg:
       host,
       access,
       msg,
-      owner ? `Run /${parsed.name} inside a session topic.` : "Pair this DM locally before using session commands.",
+      owner ? parsed.name === "rename" ? "Use /rename <name> inside a live omp session topic." : `Run /${parsed.name} inside a session topic.` : "Pair this DM locally before using session commands.",
       false,
     );
   }
@@ -841,6 +842,15 @@ export async function handleUpdate(
     (await handleGlobalCommand(host, msg, parsed))
   ) return;
 
+  // A rename has no target in the control topic or an untopiced DM, even if a
+  // DM-owner session is pinned. Do not forward it there as a normal prompt.
+  if (parsed?.name === "rename" && msg.chat.type === "private" &&
+    (msg.is_topic_message !== true || msg.message_thread_id == null ||
+      String(msg.chat.id) !== access.topicsChat || msg.message_thread_id === access.controlThreadId)) {
+    await handleDaemonSessionCommand(host, access, msg, parsed);
+    return;
+  }
+
   const aliveFn = host.alive ?? isAlive;
   const registry = loadRegistry(host.warn);
   const route = access.topicsChat
@@ -902,8 +912,8 @@ export async function handleUpdate(
         parsed?.name === "stop"
           ? "No live omp session owns this topic, so there is nothing to stop."
           : entry
-            ? "No live omp session owns this topic. Resume it locally once to refresh its auto-resume identity."
-            : "No saved omp session is attached to this topic.";
+            ? `No live omp session owns this topic. Resume it locally once to refresh its auto-resume identity.${parsed?.name === "rename" ? " Use /rename <name> inside its session topic." : ""}`
+            : parsed?.name === "rename" ? "Use /rename <name> inside a live omp session topic." : "No saved omp session is attached to this topic.";
       await host.callTelegram("sendMessage", {
         chat_id: String(msg.chat.id),
         message_thread_id: route.threadId,

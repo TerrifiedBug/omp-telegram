@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { type Access, defaultAccess, loadAccess, saveAccess } from "./access";
 import telegramExtension from "./index";
-import { claimDmOwner, loadDmOwner, loadRegistry, saveRegistry } from "./topics";
+import { claimDmOwner, loadDmOwner, loadRegistry, saveRegistry, writeRouted } from "./topics";
 
 type EventHandler = (event: unknown, ctx: unknown) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
@@ -222,6 +222,40 @@ describe("topic-name settings wiring", () => {
     expect(loadAccess().topicsNames).toBe("space");
     await h.commands.get("telegram")!.handler("topics names session", ctx);
     expect(loadAccess().topicsNames).toBe("session");
+  });
+});
+
+describe("session rename wiring", () => {
+  test.each(["session", "space"] as const)("/rename in %s mode calls the real session API", async (mode) => {
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42", controlThreadId: 98, topicsNames: mode });
+    const h = harness(["read"]);
+    const replied = Promise.withResolvers<string>();
+    const calls: { method: string; body: Record<string, unknown> }[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const method = String(input).split("/").pop()!;
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      calls.push({ method, body });
+      if (method === "sendMessage" && String(body.text).startsWith("Session renamed:")) replied.resolve(String(body.text));
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 7 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      await startBridge(h);
+      calls.length = 0;
+      writeRouted(99, {
+        message_id: 1, date: 1, from: { id: 42 }, chat: { id: 42, type: "private" },
+        is_topic_message: true, message_thread_id: 99, text: "/rename@omp_bot New session name",
+      });
+      expect(await replied.promise).toBe(
+        `Session renamed: New session name${mode === "space" ? "\nTopic keeps the space name. Use /telegram topics names session to follow session names." : ""}`,
+      );
+      expect(h.sessionName()).toBe("New session name");
+      if (mode === "space") expect(calls.filter((call) => call.method === "editForumTopic")).toEqual([]);
+    } finally {
+      await h.handlers.get("session_shutdown")?.[0]?.({ type: "session_shutdown" }, {});
+      globalThis.fetch = previousFetch;
+    }
   });
 });
 
