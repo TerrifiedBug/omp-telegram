@@ -137,6 +137,7 @@ describe("stale topic auto-resume policy", () => {
   test("allows only normal messages from the paired owner DM with complete resume identity", () => {
     expect(canAutoResumeTopic(ownerMessage, access, entry)).toBe(true);
     expect(canAutoResumeTopic(ownerMessage, access, entry, "stop")).toBe(false);
+    expect(canAutoResumeTopic(ownerMessage, access, entry, "rename")).toBe(false);
     expect(canAutoResumeTopic({ ...ownerMessage, from: { id: 99 } }, access, entry)).toBe(false);
     expect(canAutoResumeTopic({ ...ownerMessage, chat: { id: -1001, type: "supergroup" } }, access, entry)).toBe(false);
     expect(canAutoResumeTopic(ownerMessage, access, { ...entry, workspaceTerminalIds: undefined })).toBe(false);

@@ -100,6 +100,12 @@ describe("topic name synchronization", () => {
     expect(await sync.check("42", topic, desired, callTelegram, log)).toBe(true);
     expect(calls).toHaveLength(1);
   });
+  test("a collision suffix keeps the word-boundary truncation", () => {
+    const desired = "abcdefghijklmnopqrst hello world";
+    const registry = loadRegistry();
+    registry.threads["8"] = { pid: process.pid, cwd: "/other", name: desired, claimedAt: 1 };
+    expect(availableTopicName(desired, registry, 7, 123456, () => true)).toBe("abcdefghijklmnopqrst…-123456");
+  });
   test("never edits a thread owned by another process", async () => {
     expect(await sync.check("99", { threadId: 7, name: "old" }, "new", callTelegram, log)).toBe(false);
     expect(calls).toEqual([]);
@@ -109,10 +115,10 @@ describe("topic name synchronization", () => {
     sync.configure("session", () => {});
     expect(await sync.check("42", topic, "Session title", callTelegram, log)).toBe(true);
     sync.configure("space", () => {});
-    expect(sync.running).toBe(false);
     const legacy = "legacy space name ".repeat(3).trim();
     expect(await sync.check("42", topic, legacy, callTelegram, log)).toBe(true);
     expect(topic.name).toBe(legacy);
+    expect(sync.running).toBe(false);
     expect(await sync.check("42", topic, "later space name", callTelegram, log)).toBe(false);
     expect(calls).toHaveLength(2);
     sync.configure("session", () => {});
@@ -123,17 +129,19 @@ describe("topic name synchronization", () => {
     expect(calls).toHaveLength(4);
     expect(sync.running).toBe(false);
   });
-  test("a failed space restoration retries at the next check", async () => {
+  test("a failed space restoration keeps the interval until a retry lands", async () => {
     const topic = { threadId: 7, name: "old" };
     sync.configure("space", () => {});
+    expect(sync.running).toBe(true);
     expect(await sync.check("42", topic, "space", async () => { throw new TgError("unavailable", 400); }, log)).toBe(false);
+    expect(sync.running).toBe(true);
     expect(await sync.check("42", topic, "space", callTelegram, log)).toBe(true);
     expect(topic.name).toBe("space");
     expect(sync.running).toBe(false);
   });
-  test("persists both naming modes, defaulting to session", () => {
+  test("persists both naming modes, defaulting to space", () => {
     saveAccess(defaultAccess());
-    expect(loadAccess().topicsNames).toBe("session");
+    expect(loadAccess().topicsNames).toBe("space");
     for (const mode of ["space", "session"] as const) {
       saveAccess({ ...loadAccess(), topicsNames: mode });
       expect(loadAccess().topicsNames).toBe(mode);

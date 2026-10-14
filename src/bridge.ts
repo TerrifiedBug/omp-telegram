@@ -190,7 +190,8 @@ export function canAutoResumeTopic(
   entry: ThreadEntry | undefined,
   commandName?: string,
 ): entry is ThreadEntry {
-  if (commandName === "stop" || !entry) return false;
+  // A rename names a live session; it must not start one.
+  if (commandName === "stop" || commandName === "rename" || !entry) return false;
   if (!isPairedOwnerDm(String(msg.from?.id ?? ""), String(msg.chat.id), msg.chat.type, access)) return false;
   const hasSession =
     (typeof entry.sessionFile === "string" && entry.sessionFile.length > 0) ||
@@ -911,9 +912,11 @@ export async function handleUpdate(
       const text =
         parsed?.name === "stop"
           ? "No live omp session owns this topic, so there is nothing to stop."
-          : entry
-            ? `No live omp session owns this topic. Resume it locally once to refresh its auto-resume identity.${parsed?.name === "rename" ? " Use /rename <name> inside its session topic." : ""}`
-            : parsed?.name === "rename" ? "Use /rename <name> inside a live omp session topic." : "No saved omp session is attached to this topic.";
+          : parsed?.name === "rename"
+            ? "Use /rename <name> inside a live omp session topic."
+            : entry
+              ? "No live omp session owns this topic. Resume it locally once to refresh its auto-resume identity."
+              : "No saved omp session is attached to this topic.";
       await host.callTelegram("sendMessage", {
         chat_id: String(msg.chat.id),
         message_thread_id: route.threadId,

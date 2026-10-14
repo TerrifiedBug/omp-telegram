@@ -170,7 +170,7 @@ describe("topic-name settings wiring", () => {
     }
   });
   test("mode changes from another session restore space once and wake an idle space session", async () => {
-    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42", controlThreadId: 98 });
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42", controlThreadId: 98, topicsNames: "session" });
     const h = harness(["read"]);
     h.rename("Session title");
     const restored = Promise.withResolvers<Record<string, unknown>>();
@@ -209,19 +209,19 @@ describe("topic-name settings wiring", () => {
     const notices: string[] = [];
     const ctx = { ui: { notify: (text: string) => { notices.push(text); } } };
     await h.commands.get("telegram")!.handler("topics names", ctx);
-    expect(notices.at(-1)).toBe("telegram: topics names session");
-    await h.commands.get("telegram")!.handler("topics names space", ctx);
-    expect(loadAccess().topicsNames).toBe("space");
-    await h.commands.get("telegram")!.handler("topics status", ctx);
-    expect(notices.at(-1)).toContain("tidy: off · names: space");
-    await h.commands.get("telegram")!.handler("topics names project", ctx);
-    expect(notices.at(-1)).toBe("usage: /telegram topics names session | space");
-    expect(loadAccess().topicsNames).toBe("space");
-    await h.commands.get("telegram")!.handler("set topicNames session", ctx);
-    expect(notices.at(-1)).toContain('set: unknown key "topicNames"');
-    expect(loadAccess().topicsNames).toBe("space");
+    expect(notices.at(-1)).toBe("telegram: topics names space");
     await h.commands.get("telegram")!.handler("topics names session", ctx);
     expect(loadAccess().topicsNames).toBe("session");
+    await h.commands.get("telegram")!.handler("topics status", ctx);
+    expect(notices.at(-1)).toContain("tidy: off · names: session");
+    await h.commands.get("telegram")!.handler("topics names project", ctx);
+    expect(notices.at(-1)).toBe("usage: /telegram topics names session | space");
+    expect(loadAccess().topicsNames).toBe("session");
+    await h.commands.get("telegram")!.handler("set topicNames space", ctx);
+    expect(notices.at(-1)).toContain('set: unknown key "topicNames"');
+    expect(loadAccess().topicsNames).toBe("session");
+    await h.commands.get("telegram")!.handler("topics names space", ctx);
+    expect(loadAccess().topicsNames).toBe("space");
   });
 });
 

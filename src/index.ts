@@ -895,14 +895,13 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   /** Never hold up routing or agent_end for an optional Telegram title edit. */
   async function syncTopicName(force = false): Promise<void> {
     const current = loadAccess(warn);
-    const mode = current.topicsNames ?? "session";
+    const mode = current.topicsNames ?? "space";
     if (ownTopic) topicNameSync.configure(mode, checkTopicName);
     if (!ownTopic || !current.topicsChat || !token || (isDmChat(current.topicsChat) && botHasTopics === false)) return;
     const desired = mode === "session" ? desiredTopicName() : sessionTopicTitle(ownAgentName, ownSpace?.label, process.cwd());
     if (mode === "session" && !force && desired === syncedTopicName) return;
     const topic = ownTopic;
     const chatId = current.topicsChat;
-    if (!chatId || (isDmChat(chatId) && botHasTopics === false)) return;
     if (await topicNameSync.check(chatId, topic, desired, (method, payload) => tg(token, method, payload), log)) {
       if (ownTopic === topic && access.topicsChat === chatId) syncedTopicName = desired;
     }
@@ -1064,7 +1063,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     let name = basename(cwd);
     try {
       await captureOwnSpace(ctx);
-      const sessionNames = loadAccess(warn).topicsNames !== "space";
+      const sessionNames = loadAccess(warn).topicsNames === "session";
       name = sessionNames ? desiredTopicName() : sessionTopicTitle(ownAgentName, ownSpace?.label, cwd);
       const r = loadRegistry(warn);
       const sessionId = ctx?.sessionManager.getSessionId();
@@ -1708,7 +1707,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
         checkTopicName();
         ctx.ui.notify(`telegram: topics names ${sub}`, "info");
       } else if (sub === "" || sub === "status") {
-        ctx.ui.notify(`telegram: topics names ${a.topicsNames ?? "session"}`, "info");
+        ctx.ui.notify(`telegram: topics names ${a.topicsNames ?? "space"}`, "info");
       } else {
         ctx.ui.notify("usage: /telegram topics names session | space", "warning");
       }
@@ -1785,7 +1784,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     const owned = ownTopic ? ` · this session: #${ownTopic.threadId} (${ownTopic.name})` : "";
     if (!a.topicsChat) return ctx.ui.notify("usage: /telegram topics on | <chat_id> | off | tidy on|off | names session|space", "info");
     const dmMode = isDmChat(a.topicsChat) ? ` · DM forum-topic mode: ${botHasTopics === undefined ? "unknown" : botHasTopics ? "on" : "off"}` : "";
-    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · tidy: ${a.topicsTidy ? "on" : "off"} · names: ${a.topicsNames ?? "session"} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
+    ctx.ui.notify(`telegram: topicsChat = ${a.topicsChat}${owned}${dmMode} · tidy: ${a.topicsTidy ? "on" : "off"} · names: ${a.topicsNames ?? "space"} · control: ${a.controlThreadId != null ? `#${a.controlThreadId}` : "not attached"}`, "info");
   }
 
   // ---- registrations ------------------------------------------------------
