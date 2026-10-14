@@ -90,29 +90,28 @@ The bot creates:
 Restart any omp sessions that were already running before you enabled topics so
 they can claim their own topic.
 
-By default (`/telegram topics names session`), topic names follow the omp session
-name, including auto-titles and local `/rename`.
-Without a session name, the herdr agent name, herdr space label, then directory
-name are used. Whitespace is collapsed and `TOPIC_NAME_MAX = 32` code points
-caps the display name (including `…`); truncation prefers a word boundary after
-at least 20 code points and never splits an emoji. Live-name collisions use a
-`-pid` suffix within the same cap. Names synchronize after adoption, on every
-`agent_end`, and within about 30 seconds of an idle rename. Rename failures
-warn once per name and retry on a later check without blocking topic routing.
-The registry format and saved session/herdr resume identities are unchanged.
+Topic names use the herdr agent name, then the herdr space label, then the
+directory name. That's the default, `/telegram topics names space`.
 
-Set `/telegram topics names space` to restore the 0.14.0 herdr agent, space label,
-or folder-derived name once, at the next check. After restoration, space mode
-does no further topic edits or sync interval work. A settings-file watcher reacts
-to mode switches in all live owning sessions, without a restart. Returning to
-`session` starts synchronization again. `/telegram topics names [status]` shows
-the current mode. `/rename` still changes the omp session in space mode, but its
-reply says the topic keeps the space name and points to the session-mode command.
+Run `/telegram topics names session` to name topics after the omp session instead,
+including omp's auto-titles and `/rename`. A session without a name falls back to
+the space name. Whitespace is collapsed and `TOPIC_NAME_MAX = 32` code points caps
+the display name, counting `…` and any `-pid` collision suffix. Truncation prefers
+a word boundary after at least 20 code points and never splits an emoji. Names
+sync after a topic is claimed, on every `agent_end`, and within about 30 seconds
+of an idle rename. A failed rename warns once per name and retries on a later
+check without blocking routing. The registry format and saved session/herdr
+resume identities don't change.
 
-After updating this plugin, locally exit/resume already-running sessions to load
-the new command. An old daemon can forward `/rename` to an updated live session;
-run `/telegram daemon restart` locally to refresh its command menu, help, and
-control/unowned-topic usage handling.
+Switching back to `space` puts each topic's space name back once, then stops
+editing topics. Live sessions pick up a mode switch without a restart.
+`/telegram topics names [status]` shows the current mode. `/rename` still renames
+the omp session in space mode, and its reply says the topic keeps the space name.
+
+After updating the bridge, exit and resume sessions that were already running so
+they load `/rename`. An old daemon still forwards `/rename` to updated sessions;
+run `/telegram daemon restart` to refresh its command menu, help, and usage
+replies in control and unowned topics.
 
 Topics persist and are re-adopted on restart. To tidy them automatically instead,
 run `/telegram topics tidy on` — each session's topic is deleted (DM host) or

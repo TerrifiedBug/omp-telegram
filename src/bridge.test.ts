@@ -115,6 +115,7 @@ describe("/rename", () => {
   }
 
   test("the paired owner renames its session, preserving the full normalized name", async () => {
+    saveAccess({ ...loadAccess(), topicsNames: "session" });
     const fullName = "a".repeat(40) + " new name";
     await handleUpdate(renameHost(), { update_id: 1, message: message(`/rename  ${fullName.replace(/ /g, "  ")}  `, 7) });
     expect(renamed).toEqual([fullName]);
@@ -148,6 +149,28 @@ describe("/rename", () => {
     await handleUpdate(renameHost(), { update_id: 5, message: message("/rename wrong", 8) });
     expect(calls.at(-1)?.payload.text).toBe("Use /rename <name> inside a live omp session topic.");
     expect(renamed).toEqual([]);
+  });
+
+  test("a resumable dead topic shows usage instead of starting the session", async () => {
+    const registry = loadRegistry();
+    registry.threads["8"] = {
+      pid: 2_000_000_000,
+      cwd: "/tmp/project",
+      name: "project",
+      claimedAt: 1,
+      sessionFile: "/tmp/session.jsonl",
+      workspaceId: "workspace-1",
+      workspaceLabel: "project",
+      workspaceTerminalIds: ["pane-1"],
+    };
+    saveRegistry(registry);
+    const resumed: number[] = [];
+    await handleUpdate(makeHost({ resumeTopic: async (_msg, threadId) => void resumed.push(threadId) }), {
+      update_id: 10,
+      message: message("/rename wrong", 8),
+    });
+    expect(resumed).toEqual([]);
+    expect(calls.at(-1)?.payload.text).toBe("Use /rename <name> inside a live omp session topic.");
   });
 
   test("accepts the @botname suffix", async () => {

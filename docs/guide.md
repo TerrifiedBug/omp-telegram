@@ -179,23 +179,25 @@ topic. Use it for `/spawn`, `/sessions`, `/cleanup`, `/status`, `/help`, and
 `/thinking`, `/rename`, and `/retry`. A global command entered elsewhere posts its result
 in omp control and leaves a short redirect notice in the originating topic.
 
-Topic names follow the omp session name by default, falling back to the herdr
-agent name, space label, then directory. Names collapse whitespace and are capped
-at 32 code points including `…`, preferring a word boundary after 20 code points
-and preserving CJK and emoji graphemes. Live collisions use the existing `-pid`
-suffix within the cap. Names sync after claim/adoption, on `agent_end`, and via
-an unref'd 30-second comparison. Failed edits warn once per name and retry;
-`TOPIC_NOT_MODIFIED` is success. Routing and saved resume identities are unchanged.
+Topic names use the herdr agent name, then space label, then directory. That's
+the default, `/telegram topics names space`.
 
-`/telegram topics names session` is the default. Use
-`/telegram topics names space` to restore each owned topic's 0.14.0 herdr agent,
-space label, or folder-derived name once at the next check. Once restored, space
-mode makes no further edits and runs no sync interval. A settings-file watcher
-reacts to mode switches in every live owning session without a restart.
-Switching back to `session` resumes synchronization. `topics names [status]`
-shows the current mode, also included in topics status beside tidy.
-`/rename` still changes the omp session in space mode; its reply says the topic
-keeps the space name and points to `/telegram topics names session`.
+`/telegram topics names session` names topics after the omp session instead,
+falling back to the space name while the session is unnamed. Names collapse
+whitespace and are capped at 32 code points, counting `…` and any `-pid` collision
+suffix. Truncation prefers a word boundary after 20 code points and keeps CJK and
+emoji graphemes whole. Names sync after claim/adoption, on `agent_end`, and via an
+unref'd 30-second comparison. Failed edits warn once per name and retry;
+`TOPIC_NOT_MODIFIED` counts as success. Routing and saved resume identities don't
+change.
+
+Switching back to `space` restores each owned topic's space name once, retrying
+on the 30-second check until it lands. After that, space mode makes no edits and
+runs no sync interval. A settings-file watcher lets every live owning session
+react to a mode switch without a restart. `topics names [status]` shows the
+current mode, which also appears in topics status beside tidy. `/rename` still
+changes the omp session in space mode; its reply says the topic keeps the space
+name and points to `/telegram topics names session`.
 
 | Command | Effect |
 |---|---|
@@ -209,7 +211,7 @@ keeps the space name and points to `/telegram topics names session`.
 | `/compact [focus]` | Compact the owning session's context while it is idle. Optional text focuses the summary. |
 | `/model [provider/id]` | Show a paged model picker, or switch directly to an authenticated model specification. |
 | `/thinking [level]` | Show a thinking-level picker, or set `inherit`, `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
-| `/rename <name>` | Persist this session's full name, with whitespace collapsed, and synchronize its topic in `session` mode (`TOPIC_NAME_MAX = 32` code points, including `…`). In `space` mode, keep the space title and show `/telegram topics names session` in the reply. Bare `/rename` shows the current name and usage. Use it in the paired owner's session topic; control topics and groups cannot rename sessions. Stale topics follow the same auto-resume convention as `/model` and `/thinking`. |
+| `/rename <name>` | Persist this session's full name, with whitespace collapsed, and synchronize its topic in `session` mode (`TOPIC_NAME_MAX = 32` code points, including `…`). In `space` mode, keep the space title and show `/telegram topics names session` in the reply. Bare `/rename` shows the current name and usage. Use it in the paired owner's live session topic; control topics and groups cannot rename sessions, and a stale topic replies with usage instead of auto-resuming. |
 | `/retry [uncertain]` | Retry failed automatic reply parts for this owner's DM session topic. `uncertain` includes parts Telegram may already have accepted. |
 | `/status` | Show the paired owner, bridge state, topics state, live omp count, and topic-owner count. |
 | `/help` | Show the owner command summary. |
@@ -644,8 +646,8 @@ the herdr agent/space/folder name in space mode, inside one operator-chosen chat
 /telegram topics              # show the topics chat, this session's topic, and DM forum-topic mode
 /telegram topics tidy on      # tidy this session's topic on clean exit (delete in DM host, close in group host)
 /telegram topics tidy off     # keep topics after exit for re-adoption (default)
-/telegram topics names session # follow omp session names (default)
-/telegram topics names space   # restore the herdr/space/folder title once; disable ongoing sync
+/telegram topics names session # follow omp session names
+/telegram topics names space   # herdr/space/folder titles, no ongoing sync (default)
 /telegram topics names status  # show the current naming mode
 ```
 

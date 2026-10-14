@@ -28,7 +28,7 @@ export async function handleSessionRename(msg: TgMessage, args: string, host: Se
   try {
     await host.setSessionName(name);
     host.syncTopicName();
-    await host.reply(`Session renamed: ${name}${host.access.topicsNames === "space" ? "\nTopic keeps the space name. Use /telegram topics names session to follow session names." : ""}`);
+    await host.reply(`Session renamed: ${name}${host.access.topicsNames !== "session" ? "\nTopic keeps the space name. Use /telegram topics names session to follow session names." : ""}`);
   } catch (err) {
     await host.reply(`Could not rename this session: ${err instanceof Error ? err.message : String(err)}`);
   }

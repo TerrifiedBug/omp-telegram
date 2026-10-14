@@ -19,14 +19,18 @@ function prefix(value: string, max: number): string {
   return result;
 }
 
-/** Normalize before comparing, so long session titles do not cause repeated edits. */
-export function topicName(sessionName: string | undefined, fallback: string): string {
-  const name = (sessionName?.trim() || fallback).replace(/\s+/gu, " ").trim();
-  if (Array.from(name).length <= TOPIC_NAME_MAX) return name;
-  let shortened = prefix(name, TOPIC_NAME_MAX - 1);
+/** Cap at `max` code points, ending in `…`; prefer a word boundary after at least 20. */
+function fit(name: string, max: number): string {
+  if (Array.from(name).length <= max) return name;
+  let shortened = prefix(name, max - 1);
   const space = shortened.lastIndexOf(" ");
   if (space >= 0 && Array.from(shortened.slice(0, space)).length >= 20) shortened = shortened.slice(0, space);
   return `${shortened.trimEnd()}…`;
+}
+
+/** Normalize before comparing, so long session titles do not cause repeated edits. */
+export function topicName(sessionName: string | undefined, fallback: string): string {
+  return fit((sessionName?.trim() || fallback).replace(/\s+/gu, " ").trim(), TOPIC_NAME_MAX);
 }
 
 /** Keep the existing -pid convention without exceeding the display/Telegram cap. */
@@ -44,7 +48,7 @@ export function availableTopicName(
   if (!occupied(desired)) return desired;
   for (let attempt = 1; ; attempt++) {
     const suffix = `-${pid}${attempt === 1 ? "" : `-${attempt}`}`;
-    const base = Number.isFinite(maxLength) ? prefix(desired, maxLength - Array.from(suffix).length).trimEnd() : desired;
+    const base = Number.isFinite(maxLength) ? fit(desired, maxLength - Array.from(suffix).length) : desired;
     const name = `${base}${suffix}`;
     if (!occupied(name)) return name;
   }
@@ -73,13 +77,18 @@ export class TopicNameSync {
     if (mode !== this.#mode) this.#spaceSettled = false;
     this.#mode = mode;
     this.#check = check;
-    if (mode === "space") {
-      clearInterval(this.#timer);
-      this.#timer = undefined;
-    } else if (!this.#timer) {
+    // Space mode keeps polling until its one restoration lands, so an idle
+    // session still retries a failed edit.
+    if (mode === "space" && this.#spaceSettled) this.#stopTimer();
+    else if (!this.#timer) {
       this.#timer = setInterval(check, 30_000);
       this.#timer.unref();
     }
+  }
+
+  #stopTimer(): void {
+    clearInterval(this.#timer);
+    this.#timer = undefined;
   }
 
   /** Atomic access.json replacements must wake idle space-mode sessions too. */
@@ -96,8 +105,7 @@ export class TopicNameSync {
   }
 
   stop(): void {
-    clearInterval(this.#timer);
-    this.#timer = undefined;
+    this.#stopTimer();
     this.#settingsWatcher?.close();
     this.#settingsWatcher = undefined;
     this.#spaceSettled = false;
@@ -134,7 +142,10 @@ export class TopicNameSync {
         if (!renameThread(chatId, topic.threadId, process.pid, name)) return false;
       }
       topic.name = name;
-      if (mode === "space" && this.#mode === mode) this.#spaceSettled = true;
+      if (mode === "space" && this.#mode === mode) {
+        this.#spaceSettled = true;
+        this.#stopTimer();
+      }
       return true;
     } catch (err) {
       if (!this.#warned.has(name)) {

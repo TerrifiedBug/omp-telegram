@@ -90,7 +90,7 @@ export type Access = {
   topicsChat?: string;
   /** Tidy this session's topic on clean exit: delete it in a DM host, close it in a forum supergroup. Set via /telegram topics tidy. */
   topicsTidy?: boolean;
-  /** Topic naming: session (default) follows omp names; space uses legacy herdr/folder titles. */
+  /** Topic naming: space (default) keeps herdr/folder titles; session follows omp session names. */
   topicsNames?: "session" | "space";
   /** Persistent owner-DM topic used for bridge/herdr control commands. */
   controlThreadId?: number;
@@ -323,7 +323,7 @@ export function loadAccess(warn?: (msg: string) => void): Access {
       notifyChat: parsed.notifyChat,
       topicsChat: parsed.topicsChat,
       topicsTidy: parsed.topicsTidy,
-      topicsNames: parsed.topicsNames === "space" ? "space" : "session",
+      topicsNames: parsed.topicsNames === "session" ? "session" : "space",
       controlThreadId: parsed.controlThreadId,
       notifyMode,
     };
