@@ -28,9 +28,13 @@ function fit(name: string, max: number): string {
   return `${shortened.trimEnd()}…`;
 }
 
-/** Normalize before comparing, so long session titles do not cause repeated edits. */
+/**
+ * Normalize before comparing, so long session titles do not cause repeated edits.
+ * Private-use glyphs (Nerd Font icons in omp auto-titles) render as tofu in Telegram.
+ */
 export function topicName(sessionName: string | undefined, fallback: string): string {
-  return fit((sessionName?.trim() || fallback).replace(/\s+/gu, " ").trim(), TOPIC_NAME_MAX);
+  const name = sessionName?.replace(/\p{Co}/gu, "").trim() || fallback;
+  return fit(name.replace(/\s+/gu, " ").trim(), TOPIC_NAME_MAX);
 }
 
 /** Keep the existing -pid convention without exceeding the display/Telegram cap. */

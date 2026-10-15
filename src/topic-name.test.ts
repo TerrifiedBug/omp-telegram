@@ -39,6 +39,10 @@ describe("topic name normalization", () => {
     expect(topicName("  ", "project")).toBe("project");
     expect(topicName(undefined, "project")).toBe("project");
   });
+  test("drops private-use glyphs Telegram cannot render", () => {
+    expect(topicName("\u{f0455} RENAME: Test topic", "project")).toBe("RENAME: Test topic");
+    expect(topicName("\u{f0455}\ue0a0", "project")).toBe("project");
+  });
   test("prefers a word boundary after at least 20 code points", () => {
     expect(topicName("abcdefghijklmnopqrst hello world again", "")).toBe("abcdefghijklmnopqrst hello…");
     expect(topicName("short " + "x".repeat(40), "")).toBe("short " + "x".repeat(25) + "…");

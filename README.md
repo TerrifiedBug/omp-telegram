@@ -95,8 +95,9 @@ directory name. That's the default, `/telegram topics names space`.
 
 Run `/telegram topics names session` to name topics after the omp session instead,
 including omp's auto-titles and `/rename`. A session without a name falls back to
-the space name. Whitespace is collapsed and `TOPIC_NAME_MAX = 32` code points caps
-the display name, counting `…` and any `-pid` collision suffix. Truncation prefers
+the space name. Icon glyphs (private-use characters) are dropped, whitespace is
+collapsed, and `TOPIC_NAME_MAX = 32` code points caps the display name, counting
+`…` and any `-pid` collision suffix. Truncation prefers
 a word boundary after at least 20 code points and never splits an emoji. Names
 sync after a topic is claimed, on every `agent_end`, and within about 30 seconds
 of an idle rename. A failed rename warns once per name and retries on a later
