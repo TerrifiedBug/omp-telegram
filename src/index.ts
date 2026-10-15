@@ -104,9 +104,18 @@ interface PendingApproval {
   approved?: boolean;
 }
 
-/** Task sessions are headless and always carry the required yield tool. */
-export function isTaskSubagent(hasUI: boolean, activeTools: readonly string[]): boolean {
-  return !hasUI && activeTools.includes("yield");
+/**
+ * Subagent sessions (task tool, eval `agent()`, `/tan` clones) never touch the
+ * bridge: no topic, no DM ownership, no status card. omp >= 18.3.2 says so via
+ * `ctx.agent.kind`. Older hosts lack it; there, task sessions are headless and
+ * always carried the yield tool (omp 18.10.2 later dropped yield from most of them).
+ */
+export function isTaskSubagent(
+  ctx: { hasUI: boolean; agent?: { kind: "main" | "sub" } },
+  activeTools: readonly string[],
+): boolean {
+  if (ctx.agent) return ctx.agent.kind === "sub";
+  return !ctx.hasUI && activeTools.includes("yield");
 }
 
 /**
@@ -631,7 +640,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
 
   async function updateSessionStatus(ctx: ExtensionContext, phase?: SessionStatusSnapshot["state"]): Promise<void> {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     const current = loadAccess(warn);
     if (!bridgeEnabled(current)) return;
     if (phase) sessionPhase = waitingInputs.size > 0 && phase !== "idle" ? "waiting" : phase;
@@ -2170,7 +2179,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_e, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
+    if (isTaskSubagent(ctx, pi.getActiveTools())) {
       await restorePromptTools(true);
       return;
     }
@@ -2205,7 +2214,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     await updateSessionStatus(ctx, "running");
     const telegramTarget = parseTelegramPromptTarget(event.prompt);
     const a = loadAccess(warn);
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) {
+    if (isTaskSubagent(ctx, pi.getActiveTools())) {
       await restorePromptTools(true);
       return;
     }
@@ -2420,22 +2429,22 @@ export default function telegramExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("auto_retry_start", async (event, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     lastCtx = ctx;
     await runLifecycle.retryStarted(event);
   });
   pi.on("auto_retry_end", async (event, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     lastCtx = ctx;
     await runLifecycle.retryEnded(event);
   });
   pi.on("retry_fallback_applied", async (event, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     lastCtx = ctx;
     await runLifecycle.fallbackApplied(event);
   });
   pi.on("agent_end", async (event, ctx) => {
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     void syncTopicName(true).catch((err) => warn(`topic name check failed: ${String(err)}`));
     if (event.willContinue) return;
     lastCtx = ctx;
@@ -2482,7 +2491,7 @@ export default function telegramExtension(pi: ExtensionAPI): void {
     // A task child shares this process's pid and lock nonce but never started a
     // bridge. Its cleanup would release the parent's poll lock, repoint the DM
     // owner at the ended child, and drop the parent's session status (#83).
-    if (isTaskSubagent(ctx.hasUI, pi.getActiveTools())) return;
+    if (isTaskSubagent(ctx, pi.getActiveTools())) return;
     topicNameSync.stop();
     poller.stop();
     stopWatch?.();

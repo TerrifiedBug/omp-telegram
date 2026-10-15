@@ -21,10 +21,14 @@ describe("Telegram bot command scope", () => {
 });
 
 describe("Telegram session ownership", () => {
-  test("does not attach the bridge to task subagents", () => {
-    expect(isTaskSubagent(false, ["read", "yield"])).toBe(true);
-    expect(isTaskSubagent(true, ["read", "yield"])).toBe(false);
-    expect(isTaskSubagent(false, ["read"])).toBe(false);
+  test("does not attach the bridge to subagents", () => {
+    // omp >= 18.10.2 task subagents have no yield tool; ctx.agent is authoritative.
+    expect(isTaskSubagent({ hasUI: false, agent: { kind: "sub" } }, ["read"])).toBe(true);
+    expect(isTaskSubagent({ hasUI: false, agent: { kind: "main" } }, ["read", "yield"])).toBe(false);
+    // Hosts before ctx.agent (< 18.3.2): headless + yield.
+    expect(isTaskSubagent({ hasUI: false }, ["read", "yield"])).toBe(true);
+    expect(isTaskSubagent({ hasUI: true }, ["read", "yield"])).toBe(false);
+    expect(isTaskSubagent({ hasUI: false }, ["read"])).toBe(false);
   });
 });
 

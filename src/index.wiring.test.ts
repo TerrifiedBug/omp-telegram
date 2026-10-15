@@ -456,6 +456,39 @@ describe("extension wiring", () => {
     }
   });
 
+  test("a subagent without the yield tool never claims a topic", async () => {
+    // omp 18.10.2 dropped yield from task subagents; each one got its own topic.
+    writeAccess({ enabled: true, allowFrom: ["42"], topicsChat: "42" });
+    writeFileSync(join(dir, ".env"), "TELEGRAM_BOT_TOKEN=111:wiring-test\n");
+    writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, version: packageVersion, startedAt: Date.now() }));
+    const h = harness(["read", "bash"]);
+    const methods: string[] = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input) => {
+      const method = String(input).split("/").pop()!;
+      methods.push(method);
+      const result = method === "createForumTopic" ? { message_thread_id: 99 } : { message_id: 7 };
+      return new Response(JSON.stringify({ ok: true, result }), { status: 200 });
+    }) as typeof fetch;
+    const childCtx = {
+      hasUI: false,
+      agent: { kind: "sub", id: "0-Explore", name: "explore", depth: 1, parentId: "Main" },
+      ui: { notify() {} },
+      sessionManager: { getSessionId: () => "child-session", getSessionFile: () => "/tmp/child-session.jsonl" },
+    };
+    try {
+      await h.handlers.get("session_start")?.[0]?.({ type: "session_start" }, childCtx);
+      await h.handlers.get("before_agent_start")?.[0]?.(
+        { type: "before_agent_start", prompt: "subagent turn", systemPrompt: [] },
+        childCtx,
+      );
+      expect(methods).not.toContain("createForumTopic");
+      expect(loadRegistry().threads).toEqual({});
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
   test("task subagent shutdown leaves the parent's poll lock and DM owner alone (#83)", async () => {
     // Session-poller path: no topics chat, so no daemon.
     writeAccess({ enabled: true, allowFrom: ["42"] });
